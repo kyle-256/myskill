@@ -95,6 +95,9 @@ ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Pri
 **不排除**（之前排过、后来按用户要求恢复）：
 - `auto_optimize_logs/` —— 用户要看 log，不能排掉。Primus-Turbo 这个目录大概 230M。
 
+**强制排除（硬约束）**：
+- `.git/` —— 排除整个 git state。git 在本地用，远程那一份的 .git 可能跟本地分叉（远程是 stale ref）。**如果不排除**，sync.sh pull 会用 remote 的 .git/refs 覆盖本地，把本地后续的 commit detach（commits 还在 .git/objects 里，但分支 ref 退回到 remote 的旧位置）。修复办法：`git reflog` 找回最新 commit SHA，`git reset --hard <sha>` 回到原位。
+
 **不排除**：`*.csv`、`*.md`、`.git/`（要在本地用 git）、`auto_optimize_logs/`（用户要看）
 
 要改 → 编辑 `/wekafs/kyle/remote_sync/.rsync-exclude`，新增/删除规则后下次同步生效。
