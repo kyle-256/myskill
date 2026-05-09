@@ -28,6 +28,8 @@ description: 一句话说清楚什么时候用、做什么。Claude 靠这行决
 ## 现有 skill
 
 - [`remote-mlperf-gptoss/`](remote-mlperf-gptoss/SKILL.md) —— 连接远程计算节点 chi2811，进入 mlperf_gptoss 容器在 /workspace/code 下操作。
+- [`remote-sync/`](remote-sync/SKILL.md) —— 在本地 `/wekafs/kyle/remote_sync/{Primus-Turbo,HipKittens}` 编辑代码，rsync 推到远程 host 路径再执行（远程无外网用的工作流）。
+- [`gpu-fleet-tuning/`](gpu-fleet-tuning/SKILL.md) —— N 个 GPU + N 个 sub-agent 做 kernel/config 调优的事件驱动调度模式（GPU 永不空闲，状态文件持久化，broad → refine → diversify → done）。
 
 ## 加新 skill
 
