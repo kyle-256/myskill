@@ -24,6 +24,8 @@ description: 在本地 /wekafs/kyle/remote_sync/{Primus-Turbo,HipKittens} 编辑
 - 本地保留完整 `.git/`，所以 `git status / log / diff / commit / branch` 都在本地跑，**不要**通过 ssh 在远程跑 git 命令。
 - 远程那一份只用来执行；远程的工作树可能有未提交修改（已知，参见 `git status`），同步时不要无脑 `--mirror`。
 
+> ⚠️ **本地 `/wekafs/kyle/remote_sync/<repo>` 与远程 `/mnt/shared/kyle/code2/<repo>` 是两个独立存储**(本地是 wekafs,远程是节点 host 上的另一个共享盘)。**不要**因为路径相似或 `wc -l` 偶然相等就以为同一份 —— 真相是 rsync 没跑过 / 上次同步是几天前的旧版。每次远程执行前必须 `sync.sh push`,否则你 build / 跑的就是旧 kernel,白白debug 半天发现"perf 没变"。这条踩过,血的教训。
+
 ## 同步触发原则（重要）
 
 **默认不主动同步**。只在以下情形 push：
@@ -116,3 +118,4 @@ ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Pri
 - 本地 `git status` 跟同步前的远程 `git status` 对比，确认 rsync 没漏文件。
 - 怀疑 rsync 排除规则吃掉了想要的文件 → 看 `.rsync-exclude` 并跑 `rsync -nv --exclude-from=...` 验证。
 - 推完之后远程没看到 → 确认推到的是 host 路径 `/mnt/shared/kyle/code2/<repo>`，**不是**容器内路径（容器路径只能通过 docker exec 访问，rsync 不能直接走）。
+- "我改了文件,远程 build 出来的 .so 行为没变" → 99% 是没 sync。本地 `wc -l file` 跟 `ssh compute_node_new 'wc -l /mnt/shared/kyle/code2/.../file'` 对比;不一致就是没推。立刻 `sync.sh push`,然后 **重新 build**(改的是 cpp / .cu 这种需要重编的文件时)。

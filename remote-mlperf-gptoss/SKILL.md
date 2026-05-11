@@ -1,6 +1,6 @@
 ---
 name: remote-mlperf-gptoss
-description: 连接远程计算节点（chi2811，经 login_node2 跳板机）并在 mlperf_gptoss 容器里执行命令。容器默认工作目录 /workspace/code。当用户在 /wekafs/kyle 下提到"远程主机/计算节点/容器/mlperf_gptoss/workspace/code/MI355X/ROCm/HIP"等相关操作时使用此 skill。配合 remote-sync skill：编辑代码在本地、跑命令在远程。
+description: 连接远程计算节点（当前 chi2761，经 login_node2 跳板机）并在 mlperf_gptoss 容器里执行命令。容器默认工作目录 /workspace/code。当用户在 /wekafs/kyle 下提到"远程主机/计算节点/容器/mlperf_gptoss/workspace/code/MI355X/ROCm/HIP"等相关操作时使用此 skill。配合 remote-sync skill：编辑代码在本地、跑命令在远程。节点不可用/容器没了 → 用 claim-mi355x-node skill 换节点。
 ---
 
 # remote-mlperf-gptoss
@@ -12,7 +12,7 @@ description: 连接远程计算节点（chi2811，经 login_node2 跳板机）�
 ```
 本地 (/wekafs/kyle)              ┐
   └─ ssh login_node2             │  149.28.124.225, root（跳板机）
-       └─ ssh compute_node_new   │  chi2811, root, ProxyJump=login_node2, ForwardAgent
+       └─ ssh compute_node_new   │  chi2761, root, ProxyJump=login_node2, ForwardAgent
             └─ docker exec mlperf_gptoss   ── 镜像: rocm/primus:v26.2 (常驻)
                  └─ /workspace/code        ── 默认 cwd
                       ↑
@@ -23,17 +23,17 @@ description: 连接远程计算节点（chi2811，经 login_node2 跳板机）�
 - 容器是常驻的（`docker exec` 而不是 `docker run`），写入文件下次还在。
 - Host 路径 `/mnt/shared/kyle/code2` 是 `/workspace/code` 的 bind mount —— rsync 直接走 host 路径就行，参见 `../remote-sync/SKILL.md`。
 
-## 远程环境（已确认 2026-05-09）
+## 远程环境（已确认 2026-05-11）
 
 | 项 | 值 |
 |---|---|
-| 主机名 | `chi2811`（容器内外一致） |
+| 主机名 | `chi2761`（容器内外一致） |
 | OS | Linux（容器内 Ubuntu/Debian 系，`/.dockerenv` 存在） |
 | GPU | 8 × AMD Instinct MI355X |
 | Python | 3.12.3 @ `/opt/venv/bin/python`（无须 activate venv，PATH 已就位） |
 | PyTorch | `2.10.0a0+git449b176`，HIP 可用 |
 | 镜像 | `rocm/primus:v26.2` |
-| 同节点其他容器 | `sgl-deepseek-v4-pro-rocm720`、`sgl-dsv4-mi35x` —— **不要动** |
+| 同节点其他容器 | `dev_xb_vllm_20`、`amd_dcdit`、`akharida_docker`、`sgl-deepseek-v4-pro-rocm720` —— **不要动** |
 | 外网 | **无**（远程不能 pip install / git clone / curl 外部资源；这是硬约束，编辑必须在本地，参见 remote-sync skill） |
 
 ## 在容器内执行命令
