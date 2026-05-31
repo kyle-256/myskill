@@ -33,6 +33,7 @@ description: 一句话说清楚什么时候用、做什么。Claude 靠这行决
 - [`mi300-blockwise-gg-tuning/`](mi300-blockwise-gg-tuning/SKILL.md) —— MI300X 上 Triton blockwise FP8 grouped GEMM 调优的硬约束、已验证 priors、和 tensorwise 公平对比方法、常见坑（fwd persistent + bwd variable-K 两条路径都覆盖）。
 - [`global-permissions/`](global-permissions/SKILL.md) —— 把 permissions allow 规则合并写入 `~/.claude/settings.json`，所有项目共享免确认（Bash/Read/Write/Edit/Skill/Glob/Grep/WebFetch/WebSearch）。
 - [`claim-mi355x-node/`](claim-mi355x-node/SKILL.md) —— 原 mi355x 节点不可用时，经 login_node2 找一台 GPU 真闲的 compute 节点（sinfo/squeue + rocm-smi 巡检）、种公钥、起 `mlperf_gptoss` 容器（rocm/primus:v26.2，挂 /mnt/shared/kyle/code2）。
+- [`flydsl-fp8-gemm-tuning/`](flydsl-fp8-gemm-tuning/SKILL.md) —— FlyDSL fp8 dense GEMM (TN/NN/NT) 在 gfx950 提速：profile→定位瓶颈的诊断框架、按 shape regime 选 lever（big-K = both-path-J drain removal，big-N = 2D L2 band swizzle）、已穷尽的死路清单、det=0 红线验证、gfx950 fp8 硬约束。
 
 ## 加新 skill
 
