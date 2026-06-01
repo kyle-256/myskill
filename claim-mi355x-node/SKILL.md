@@ -122,20 +122,30 @@ ssh chiXXXX 'docker exec mlperf_gptoss bash -lc "/opt/venv/bin/pip install --upg
 
 预期最后一行输出 `3.7.0`。装完后任何之前用 triton 3.6 跑的 bench 数字（`v2/Triton` ratio 等）都作废，必须重 bench 立新 baseline。
 
-### 5.5 让 flydsl 可导入（FlyDSL kernel 必做，否则落 stub 分支）
+### 5.5 从源码安装 FlyDSL + 重装 primus_turbo（fresh 容器必做）
 
-fresh 容器里 `primus_turbo` 已装（egg-link 指向 bind-mount 源，跨容器还在），但 **`flydsl` 没装** →
-`from primus_turbo.flydsl.gemm.gemm_fp8_kernel import _compile_dense_tn` 会报
-`ImportError: cannot import name '_compile_dense_tn'`（`flydsl_available()` 返回 False，只定义了 stub）。
-
-FlyDSL 之前已 build 过（`/workspace/code/FlyDSL/build-fly/` 在），**不用重 build**，只要把 python 包上 path：
+fresh 容器里 `flydsl` **没装** → `from primus_turbo.flydsl.gemm.gemm_fp8_kernel import _compile_dense_tn`
+落 stub 分支报 `ImportError: cannot import name '_compile_dense_tn'`（`flydsl_available()` False）。
+**正解是从源码 editable 安装，不要用 PYTHONPATH hack**（PYTHONPATH 只够 `import flydsl`，编译 kernel 还要 `_mlir` 的 LD_LIBRARY_PATH，editable install 会自动 symlink 解决）。
 
 ```bash
-# 验证（应打印 flydsl_available: True）
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && PYTHONPATH=/workspace/code/FlyDSL/python python -c \"import sys; sys.path.insert(0,\".\"); from primus_turbo.flydsl.gemm.gemm_fp8_kernel import flydsl_available; print(flydsl_available())\""'
+# (a) 装 FlyDSL —— build-fly/ 已存在则只 symlink，~30s，不会重 build MLIR
+ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/FlyDSL && /opt/venv/bin/pip install -e . 2>&1 | tail -3"'
+# (b) 重装 primus_turbo（rebuild cpp ext 匹配当前源，~15-25min）
+ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && GPU_ARCHS=gfx950 /opt/venv/bin/pip install --no-build-isolation -e . 2>&1 | tail -5"'
+# 验证（都应成功，big-N 走纯 flydsl）
+ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /tmp && python -c \"import flydsl, torch; import primus_turbo.pytorch as t; from primus_turbo.flydsl.gemm.gemm_fp8_kernel import flydsl_available; print(flydsl_available())\""'
 ```
 
-之后**每条跑 flydsl kernel 的命令都要带** `PYTHONPATH=/workspace/code/FlyDSL/python`（也可考虑 `pip install -e /workspace/code/FlyDSL`，但 setup.py 可能触发 30min+ MLIR 重 build，PYTHONPATH 更稳）。改 flydsl kernel 后 `rm -rf /root/.flydsl/cache` 再跑。详见 remote-mlperf-gptoss skill。
+装完 `import flydsl` / `import primus_turbo.pytorch` 都不再需要 PYTHONPATH。改 flydsl kernel 后 `rm -rf /root/.flydsl/cache` 再跑（改 cpp 才要重跑 (b)）。
+
+**⚠️ 若 (b) 后 `import primus_turbo.pytorch` 报 `undefined symbol: ...hk_gemm_bf16...`**：
+这是 untracked 的 HipKittens dense binding 引用了一个**不存在**的 kernel `.cu`
+(`csrc/kernels/gemm/HipKittens/hk_gemm_gfx950.cu`)。HK 后端已于 2026-06-01 **整体移除**
+（dense+grouped 全是 untracked WIP，无 python 引用）。若残留导致 build 失败，删掉
+`csrc/pytorch/gemm/hk_gemm_hip.cpp`、`csrc/pytorch/grouped_gemm/hk_grouped_gemm_hip*.cpp`、
+`csrc/kernels/grouped_gemm/HipKittens/`，并从 `csrc/pytorch/bindings_pytorch_hip.cpp` +
+`extensions_hip.h` 去掉所有 `hk_gemm*`/`hk_grouped*` 的 def/impl/声明，nuke `build/` + `_C*.so` 重跑 (b)。
 
 ### 6. 验证
 

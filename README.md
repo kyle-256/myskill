@@ -27,7 +27,7 @@ description: 一句话说清楚什么时候用、做什么。Claude 靠这行决
 
 ## 现有 skill
 
-- [`remote-mlperf-gptoss/`](remote-mlperf-gptoss/SKILL.md) —— 连接远程计算节点（当前 chi2774，以 ssh config 为准），进入 mlperf_gptoss 容器在 /workspace/code 下操作。⚠️ 跑 flydsl kernel 要 `PYTHONPATH=/workspace/code/FlyDSL/python`。
+- [`remote-mlperf-gptoss/`](remote-mlperf-gptoss/SKILL.md) —— 连接远程计算节点（当前 chi2774，以 ssh config 为准），进入 mlperf_gptoss 容器在 /workspace/code 下操作。fresh 容器需从源码装 FlyDSL+重装 turbo（见 claim §5.5）；HK 后端已移除。
 - [`remote-sync/`](remote-sync/SKILL.md) —— 在本地 `/wekafs/kyle/code2/remote_sync/{Primus-Turbo,HipKittens}` 编辑代码，rsync 推到远程 host 路径再执行（远程无外网用的工作流）。
 - [`gpu-fleet-tuning/`](gpu-fleet-tuning/SKILL.md) —— N 个 GPU + N 个 sub-agent 做 kernel/config 调优的事件驱动调度模式（GPU 永不空闲，状态文件持久化，broad → refine → diversify → done）。
 - [`mi300-blockwise-gg-tuning/`](mi300-blockwise-gg-tuning/SKILL.md) —— MI300X 上 Triton blockwise FP8 grouped GEMM 调优的硬约束、已验证 priors、和 tensorwise 公平对比方法、常见坑（fwd persistent + bwd variable-K 两条路径都覆盖）。

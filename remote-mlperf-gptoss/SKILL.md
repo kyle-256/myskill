@@ -37,17 +37,17 @@ description: 连接远程计算节点（当前 chi2774，节点名以 ~/.ssh/con
 | 同节点其他容器 | `mlperf_gptoss2`（别人的，**不要碰**） |
 | 外网 | **无**（远程不能 pip install / git clone / curl 外部资源；这是硬约束，编辑必须在本地，参见 remote-sync skill） |
 
-### ⚠️ 跑 FlyDSL kernel 必须设 PYTHONPATH（fresh 容器关键坑）
+### FlyDSL / primus_turbo 从源码安装（fresh 容器一次性 setup）
 
-fresh `rocm/primus:v26.2` 容器里 **`primus_turbo` 已装（egg-link）但 `flydsl` 没装** →
-直接 `from primus_turbo.flydsl.gemm.gemm_fp8_kernel import _compile_dense_tn` 会落到 stub
-分支报 `ImportError: cannot import name '_compile_dense_tn'`（flydsl_available()=False）。
-**修法：所有跑 flydsl kernel 的命令前加 `PYTHONPATH=/workspace/code/FlyDSL/python`**：
+fresh `rocm/primus:v26.2` 容器里 `flydsl` 没装 → 跑 flydsl kernel 前要 **从源码 editable 安装**
+（见 claim-mi355x-node §5.5）：`pip install -e /workspace/code/FlyDSL` + 重装 primus_turbo。
+装完后 `import flydsl` / `import primus_turbo.pytorch` 直接可用，**不需要 PYTHONPATH**，命令照常：
 
 ```bash
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && PYTHONPATH=/workspace/code/FlyDSL/python CUDA_VISIBLE_DEVICES=6 HIP_VISIBLE_DEVICES=6 python scripts2/<probe>.py"'
+ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && CUDA_VISIBLE_DEVICES=6 HIP_VISIBLE_DEVICES=6 python scripts2/<probe>.py"'
 ```
-（FlyDSL 已 build 过，build-fly/ 在；PYTHONPATH 直接生效，不用重 build。改 flydsl kernel 后记得 `rm -rf /root/.flydsl/cache`。）
+- 改 flydsl kernel（.py）后 `rm -rf /root/.flydsl/cache` 再跑；改 cpp 才需重装 primus_turbo。
+- HipKittens 后端已移除（2026-06-01）；`_C` 只剩 hipblaslt/CK/turbo ops。`torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8` 仍可用。
 
 ## 在容器内执行命令
 
@@ -142,7 +142,8 @@ scp local_file compute_node_new:/mnt/shared/kyle/code2/Primus-Turbo/scripts/
 | `docker exec` 报 `No such container` | `ssh compute_node_new 'docker ps -a --filter name=mlperf_gptoss'` 看是 stopped 还是真没了。**不要擅自 docker run 一个新的** —— 镜像、挂载、env 都可能不对。**先停下来问用户**。 |
 | 容器内 `python: command not found` | 没用 `bash -lc`。改成 `bash -lc "..."`。 |
 | compute 节点 host key 变了 | 节点被重装的可能。**不要默默 accept**，告诉用户确认。 |
-| `ImportError: cannot import name '_compile_dense_tn'` | flydsl 没在 path 上 → 命令前加 `PYTHONPATH=/workspace/code/FlyDSL/python`（见上"跑 FlyDSL kernel"节）。 |
+| `ImportError: cannot import name '_compile_dense_tn'` | flydsl 没装 → `pip install -e /workspace/code/FlyDSL`（见 claim §5.5）。 |
+| `import primus_turbo.pytorch` 报 `undefined symbol ...hk_gemm_bf16` | HK dense binding 引用了缺失的 .cu；HK 后端已移除，按 claim §5.5 末尾清掉残留 + 重 build。 |
 | ROCm/HIP 报错 | 先 `rocm-smi` / `rocminfo` 验证 GPU 可见性 + 容器有 `--device=/dev/kfd --device=/dev/dri` 挂载（用 `docker inspect` 看）。 |
 | 同节点其他用户在跑 | `ssh compute_node_new 'docker ps && rocm-smi --showpidgpus'` —— 如果 GPU 被占满，告诉用户，不要无脑跑。 |
 | 文件推上去容器看不到 | 检查 rsync 目标是不是 host 路径 `/mnt/shared/kyle/code2/<repo>/...`，**不是**容器内路径 `/workspace/code/...`。 |
