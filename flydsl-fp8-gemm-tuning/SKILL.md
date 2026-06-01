@@ -79,10 +79,29 @@ grep -c scratch_load 21_final_isa.s   # spill 检测
 - **降 VGPR 提 occupancy**：128 accumulator 是地板, 256×256 tile 到不了 2 WG/CU。
 - **tr8 读优化**：`ds_read_b64_tr_b8` 64-bit 是硬限(无 `b128_tr_b8`)，且已 1读:1frag 最大批，软件无法再减。
 
-## 4. 仍开放 / 下一步候选 (未做)
+## 4. 2900 目标方案 (workflow 2026-06-01 产出, FlyDSL+HK 代码考古)
 
-- **2900 目标**：2D 已榨干 (big-N 2729 / big-K 2799)，都卡 1 WG/CU + 40% MFMA 墙。再上需 **split-K**（尤其 big-K 只 1024 tiles，split-K=2 → grid 翻倍改善 CU 饱和；需加部分和 reduction，big-K 输出仅 134MB 可行）。big-N tiles 已足(3584)，split-K 帮助有限。
-- L2 57.5→66 还有空间但 2D 各 GN/GM 组合已扫遍，GM4×GN14 是峰。
+现状 (chi2774, source-installed, HK 移除后 clean rebuild): big-N ~2730-2750, big-K ~2818。
+**user 否决 split-K + persistent。** 真瓶颈 = issue/latency-bound (Dep-Wait 63%, MFMA Util 40%,
+VMEM 3% 非带宽; occupancy 1 WG/CU 被 128-accumulator VGPR 地板锁死, 不可破)。
+
+排名 (workflow 综合, 见本 session transcript):
+- **#1 (真 lever) 32x32x64 MFMA 替换**: 同 64×128/warp 输出, 用 16× `mfma_scale_f32_32x32x64_f8f6f4`
+  替 32× `mfma_16x16x128`/iter → **MFMA 指令数减半** (issue-bound 直接收益, accumulator 不变=不动
+  occupancy, 与"32x32 flawed premise"不矛盾)。CDNA4 确认支持 (MmaAtom.cpp:157,251; accVec 32x32→16)。
+  估 +2.8% → big-N ~2806 / big-K ~2877。**大改**: 新 `Mfma32x32x64` wrapper (mirror Mfma16x16x128,
+  accum=Vec.make_type(16,Float32)) + 32x32 operand frag loader (tr8 读布局变, 是难点+det 风险) +
+  2-inner-K loop (BLOCK_K=128 = 2×K64) + StoreC 重写 (32x32 输出 frag→global 映射变)。
+  **先做微 probe 复现 +2.8%+det=0 再做 StoreC 大改。** 现有树无 32x32 资产 (RRR 旧的被 supersede 删了)。
+- **#2 sched_group_barrier pacing**: 已实现 (`add_sched_hints` 参数 / `TN_SCHED_HINTS=1` env, 在 7-barrier
+  loop 每 mfma.call 后插 `sched_mfma(N_ACCUMS)/sched_dsrd(2)/sched_vmem(2)`)。**实测仅边际**:
+  big-N +0.7% (2730→2750 det0), big-K -0.3% (噪声)。det 安全 (纯 compiler fence)。留 dormant 待和 #1 叠。
+- **#3 B 侧 graded-lgkmcnt 流水**: 把 `S2RLoaderTr_A.load_pipelined` (utils:1469) 的 depth-2 graded
+  扩到 B loader `S2RLoaderTr` (现在是 4 read + 1 个 trailing lgkmcnt(0) 全drain)。+1-2% 估, 中 det 风险
+  (graded lgkmcnt 是 race-prone 旋钮)。
+- **死路确认**: BTR/LDS2LDS-transpose A (软件转置比 HW tr8 慢 3-30×, 且 A-final +33.8KB → 168.9KB 超 160KB);
+  wider tr8 (fp8 无 b128_tr, CopyAtom.cpp:148 硬上限); tr16_64b/tr6_96b (fp6-only, 不适 fp8)。
+- **诚实天花板**: #1 单独 big-N 到 ~2806 (不够 2900); #1+#2(+#3) 叠加才可能 big-K 破 2900 / big-N 逼近。
 
 ## 5. 教训 (元方法论)
 
