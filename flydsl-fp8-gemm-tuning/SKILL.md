@@ -15,8 +15,25 @@ description: 优化 FlyDSL fp8 dense GEMM (TN/NN/NT) 在 MI355X (gfx950) 上的�
 - **det=0 是硬红线**，不能松。验证必须 **≥500-1000 run** 的 bit-exact diff；**200-run 会假阳性**（vmcnt_hint=4 在 200 run 看 det=0 但 500 run 暴露 1.5e-5 race）。SNR 不掉(55/79/87 dB 看 scale)不代表 det=0。
 - **严禁靠实验扫常数**(vmcnt_hint/lgkmcnt/barrier_mask 等)。必须先 `rocprof-compute` + ISA disasm 做理论分析，再决定调什么。扫 tile-blocking 因子(GROUP_M/group_n)时要**测 L2 命中率**作为机制依据，才算 grounded。
 - **调试期不乱 commit**。只在确认真实进步(超噪声)+ user 认可后合成单个干净 commit。run-to-run 噪声 **~5%**，和很多 lever 的增益同量级 → 用 best-of-3/4 bench + 多次复测区分真假。
-- 编辑只动 `code2/remote_sync/<repo>`，改完 `cd /wekafs/kyle/code2/remote_sync && ./sync.sh push Primus-Turbo <path>`（必须在该目录跑 sync.sh）。**改 kernel 后远程必须 `rm -rf /root/.flydsl/cache`** 再跑，否则用旧 .so。
-- 只用 GPU 6 (`CUDA_VISIBLE_DEVICES=6 HIP_VISIBLE_DEVICES=6`)。
+- 只用 GPU 6。
+
+### 基础设施 (用这套, 别再手搓 sync/cache/ssh — 反复踩坑的根源)
+
+**`/wekafs/kyle/code2/remote_sync/rr.sh`** — 一条命令搞定 sync+清cache+GPU6+无缓冲输出 (自动 `cd` 到 remote_sync 根, 修了 `./sync.sh` cwd bug; FlyDSL+turbo 已源码安装, **无需 PYTHONPATH**):
+```bash
+cd /wekafs/kyle/code2/remote_sync
+./rr.sh run scripts2/_foo.py [args]   # sync 两 repo + 清 /root/.flydsl/cache + GPU6 跑
+./rr.sh py "<python -c 片段>"          # 快速 inline
+./rr.sh sh "<容器内 bash 命令>"         # 任意命令 (带 GPU6 env)
+./rr.sh sync                           # 只同步
+GPU=3 ./rr.sh run ...                  # 换 GPU; NOCLEAN=1 ... 跳过清 cache (复用已编译)
+```
+输出过滤: `... 2>&1 | grep -vE "^Warning|aiter|total size|speedup"`。注意 grep 经 ssh pipe 会缓冲, rr.sh 已加 `stdbuf -oL` + `PYTHONUNBUFFERED`。
+
+**`Primus-Turbo/scripts2/_h.py`** — 复用 harness, probe 脚本首行 `from _h import *` 即得:
+`mk(*shape)` 造 fp8 输入 · `qargs(a,b,out,M,N)` 造 `_compile_dense_*` 的 arg 元组 · `ref_tn/nt/nn(a,b)` 参考 · `bench(fn)`→best-of-3 us · `tflops(M,N,K,us)` · `snr(o,r)` · `detf(fn,runs)`→(max_diff, first_bad) · `detc(c,args,out_view,runs)` · 导出 `G`(kernel 模块)/`FLY`(公共 API)/`BF16/FP8`。
+det0 == race-free; **det 必须 ≥1000 run**(边界值如 vmcnt 阈值要 2000)。
+- 改 cpp(csrc)后要 `GPU_ARCHS=gfx950 pip install --no-build-isolation -e .` 重装 turbo (见 claim §5.5); 改 flydsl .py 只需 rr.sh 自动清的 cache。
 
 ## 1. 诊断框架 (先定位瓶颈类，再选 lever)
 
