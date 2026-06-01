@@ -1,11 +1,13 @@
 ---
 name: claim-mi355x-node
-description: 当原本固定使用的 mi355x 计算节点（如 chi2811）不可用、容器被删、或被别的 slurm job 占满时，从 login_node2 找一台 GPU 实际空闲的 compute 节点，把本机公钥种到节点上，再起一个新的 mlperf_gptoss 容器（rocm/primus:v26.2，挂 /mnt/shared/kyle/code2 → /workspace/code）。当用户说"找台空机器/换节点/容器没了/重建容器/这节点被占了"等场景时使用。配合 remote-mlperf-gptoss 与 remote-sync skill。
+description: 当原本固定使用的 mi355x 计算节点不可用、容器被删、或被别的 slurm job 占满时，从 login_node2 找一台 GPU 实际空闲的 compute 节点，把本机公钥种到节点上，再起一个新的 mlperf_gptoss 容器（rocm/primus:v26.2，挂 /mnt/shared/kyle/code2 → /workspace/code），triton 升到 3.7。当用户说"找台空机器/换节点/容器没了/重建容器/这节点被占了"等场景时使用。配合 remote-mlperf-gptoss 与 remote-sync skill。
 ---
 
 # claim-mi355x-node
 
-集群里 mi355x 分区大半 down，剩下的节点 slurm 都标 `ALLOCATED`，但**实际 GPU 利用率经常是 0%**（别人的容器只占着显存等请求）。这个 skill 的工作流：经登录节点找一台真闲的，授权自己 ssh，起容器。
+集群里 mi355x 分区大半 down，剩下的节点 slurm 都标 `ALLOCATED`，但**实际 GPU 利用率经常是 0%**（别人的容器只占着显存等请求）。这个 skill 的工作流：经登录节点找一台真闲的，授权自己 ssh，起容器，升 triton。
+
+当前用哪台节点看 `~/.ssh/config` 里 `compute_node_new` 的 `HostName`（这是 single source of truth）；不要在本 SKILL 里硬编节点名。
 
 ## 拓扑回顾
 
@@ -77,10 +79,13 @@ ssh login_node2 "ssh -o StrictHostKeyChecking=accept-new $TARGET 'mkdir -p ~/.ss
 立即测直连：
 
 ```bash
-ssh -o ConnectTimeout=15 chiXXXX 'hostname && whoami'
+# 注意：本机直连 `ssh chiXXXX` 通常 **解析不了 hostname**（chi 节点名只在 login_node2 内网可见）。
+# 要么经跳板机测：
+ssh login_node2 'ssh -o ConnectTimeout=15 chiXXXX "hostname && whoami"'
+# 要么先做下面的 config 更新，再用别名测：ssh compute_node_new 'hostname'
 ```
 
-> 如果想后续 `ssh compute_node_new` 还能用旧别名，记得改 `~/.ssh/config` 里 `compute_node_new` 的 `HostName` 指向新节点（默认是 chi2811）。
+> **立刻**改 `~/.ssh/config` 里 `compute_node_new` 的 `HostName` 指向新节点 —— 这是节点的 single source of truth，`ssh compute_node_new` 和 `sync.sh`（用此别名）都靠它。当前 = `chi2774`（2026-06-01）。`compute_node_new` 用 `ProxyJump login_node2`，所以本机直连才能通。改完 `ssh compute_node_new 'hostname'` 应回 chiXXXX。
 
 ### 4. 起 mlperf_gptoss 容器
 
@@ -107,7 +112,32 @@ ssh chiXXXX 'docker run -d \
 - `--network=host` —— 容器直接用 host 网络栈（远程没外网这点不变，但同节点其他服务的端口能直连）。
 - `sleep infinity` —— 容器常驻，靠 `docker exec` 进去干活，不要用 `docker run -it` 跑业务。
 
-### 5. 验证
+### 5. 升级 triton 到 3.7
+
+`rocm/primus:v26.2` 镜像里 triton 默认 3.6.0；user 要求 fp8 grouped GEMM bench 走 triton 3.7（autotune cfg 更全）。每次新起容器都要做一次：
+
+```bash
+ssh chiXXXX 'docker exec mlperf_gptoss bash -lc "/opt/venv/bin/pip install --upgrade triton 2>&1 | tail -2 && /opt/venv/bin/python -c \"import triton; print(triton.__version__)\""'
+```
+
+预期最后一行输出 `3.7.0`。装完后任何之前用 triton 3.6 跑的 bench 数字（`v2/Triton` ratio 等）都作废，必须重 bench 立新 baseline。
+
+### 5.5 让 flydsl 可导入（FlyDSL kernel 必做，否则落 stub 分支）
+
+fresh 容器里 `primus_turbo` 已装（egg-link 指向 bind-mount 源，跨容器还在），但 **`flydsl` 没装** →
+`from primus_turbo.flydsl.gemm.gemm_fp8_kernel import _compile_dense_tn` 会报
+`ImportError: cannot import name '_compile_dense_tn'`（`flydsl_available()` 返回 False，只定义了 stub）。
+
+FlyDSL 之前已 build 过（`/workspace/code/FlyDSL/build-fly/` 在），**不用重 build**，只要把 python 包上 path：
+
+```bash
+# 验证（应打印 flydsl_available: True）
+ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && PYTHONPATH=/workspace/code/FlyDSL/python python -c \"import sys; sys.path.insert(0,\".\"); from primus_turbo.flydsl.gemm.gemm_fp8_kernel import flydsl_available; print(flydsl_available())\""'
+```
+
+之后**每条跑 flydsl kernel 的命令都要带** `PYTHONPATH=/workspace/code/FlyDSL/python`（也可考虑 `pip install -e /workspace/code/FlyDSL`，但 setup.py 可能触发 30min+ MLIR 重 build，PYTHONPATH 更稳）。改 flydsl kernel 后 `rm -rf /root/.flydsl/cache` 再跑。详见 remote-mlperf-gptoss skill。
+
+### 6. 验证
 
 ```bash
 ssh chiXXXX 'docker ps --filter name=mlperf_gptoss && \
@@ -127,9 +157,11 @@ ssh chiXXXX 'docker ps --filter name=mlperf_gptoss && \
 
 成功后做这几件事：
 
-1. **更新 `~/.ssh/config`**：把 `compute_node_new` 的 `HostName` 改成新节点，让旧的 `ssh compute_node_new ...` 命令继续生效。
-2. **更新 `../remote-mlperf-gptoss/SKILL.md`**：第一段拓扑图的"chi2811"和"远程环境"表的"主机名"行换成新节点。日期也更新到当天。
-3. **告诉用户**：新节点 hostname、镜像、GPU 数、bind mount 路径都正常。提示一句"这节点是某 slurm job 的，他可能随时上来跑，长任务前再 `rocm-smi` 复查一下"。
+1. **更新 `~/.ssh/config`**：把 `compute_node_new` 的 `HostName` 改成新节点（这就是 canonical 节点的 single source of truth，**别在 SKILL.md 里再硬编节点名**）。让旧的 `ssh compute_node_new ...` 命令继续生效。
+2. **更新 `../remote-mlperf-gptoss/SKILL.md`**：第一段拓扑图的旧节点名和"远程环境"表的"主机名"行换成新节点。日期也更新到当天。
+3. **如果旧节点的容器是我们起的**：`ssh oldNODE 'docker rm -f mlperf_gptoss'` 清掉，别留垃圾。如果是别人的容器（如 `vllm-gptoss`），**不要碰**。
+4. **`pip install -e .` primus_turbo**：新容器没装，bench 之前要 `cd /workspace/code/Primus-Turbo && GPU_ARCHS=gfx950 pip install --no-build-isolation -e .`，长（~15-30 min），go-grab-coffee 级别。
+5. **告诉用户**：新节点 hostname、镜像、GPU 数、bind mount 路径都正常 + triton 版本 3.7。提示一句"这节点是某 slurm job 的，他可能随时上来跑，长任务前再 `rocm-smi` 复查一下"。
 
 ## 不要做的事
 
