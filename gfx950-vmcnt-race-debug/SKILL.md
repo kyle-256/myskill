@@ -525,9 +525,11 @@ Perf（grouped MoE bench, avg 跨所有 case）：
 
 (2026-06，commit `d7b149a` on `dev/kyle_mxfp8_gg_pr`)
 
+> 验收口径：以**官方 deterministic pytest**(`test_grouped_gemm_fp8_mx_blockwise_deterministic`,rtol=0/atol=0 + empty_cache churn,repeats=10)为准。d7b149a ×100 全过。
+
 ## TL;DR
 
-又一类独立 race。spill 全 0、LDS WAR 也修了（前两类干净），但**第二次调用** kernel 偶发 bit 不一致。
+又一类 race。spill 全 0、LDS WAR 也修了（前两类干净），但**复用 workspace 的后续调用** kernel 偶发 bit 不一致。`d7b149a` split-fence 后官方 deterministic ×100 全过。
 
 **机制**：MI355X 一个 node = **8 个 die (XCD)，每个 die 自己一块 L2**，die 间不自动 coherent。persistent kernel 的 256 个 block 散在 8 个 die 上跑。当 **scale workspace（或任何中间 buffer）跨调用复用**：上一次调用把数据写进 GMEM，留下的副本还缓在某些 die 的 L2 里；这一次 `buffer_load_lds` 命中那个 die 的 stale L2 行 → 读到上一次的数据 → MFMA 污染 → bit 不一致。第一次调用（L2 冷）不出，复用 workspace 的后续调用才出。
 
@@ -604,4 +606,4 @@ reviewer / 用户约束：编辑只改本地再 `sync.sh push`（别在远端改
 |---|---|---|---|---|
 | 1. vmcnt FIFO | scratch_load vs buffer_load_lds（一个 wave 内） | spill>0，单次即 race | 消 VGPR spill（SGPR 化地址 / outer 解析 ptr） | `abd3833` |
 | 2. LDS WAR | ds_read vs buffer_load_lds（同 WG 跨 warp） | spill=0，单次即 race | `wait_lgkmcnt<0>` drain（WAR barrier + prologue） | `bb48d3f` |
-| 3. die L2 | 复用 workspace 跨 die（跨调用） | 前两类干净，第 2+ 次调用 race | `__threadfence()` 入口一次 + per-tile 退化成 lgkmcnt drain | `d7b149a` |
+| 3. die L2 | 复用 workspace 跨 die（跨调用） | 前两类干净，第 2+ 次调用 race | `__threadfence()` 入口一次 + per-tile 退化成 lgkmcnt drain | `d7b149a`（官方 deterministic ×100 全过）|
