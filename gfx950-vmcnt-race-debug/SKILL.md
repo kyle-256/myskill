@@ -258,7 +258,7 @@ a[0:255]    C accumulator (256 fp32)
 
 - gfx950 节点：参见 `claim-mi355x-node` skill 找真闲节点
 - Race + perf 验证：用 `mlperf_gptoss2` 容器（见 `remote-mlperf-gptoss` skill）
-- mxfp8 PR 在 `/workspace/code/code3/Primus-Turbo/`（见 `remote-sync` skill；本地 `mxfp8/Primus-Turbo` 自动映射）
+- mxfp8 PR 在 `/workspace/code/mxfp8/Primus-Turbo/`（见 `remote-sync` skill；本地 mxfp8/Primus-Turbo 直接 1:1 镜像）
 - GPU 选**真闲**的（`rocm-smi --showuse` GPU%=0、`--showmemuse` VRAM% < 50）；race rate 在 noisy GPU 上会被 OOM 干扰
 - bench 用 `scripts/spot_bench_kernel.py`（kernel-only TFLOPS，不算 quant pre-process）
 

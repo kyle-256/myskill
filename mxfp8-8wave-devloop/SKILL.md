@@ -1,13 +1,13 @@
 ---
 name: mxfp8-8wave-devloop
-description: 迭代 PT turbo MXFP8 8-wave grouped GEMM kernel（dev/kyle_mxfp8_gg_pr）时的一条龙 sync+build+ISA+correctness+perf 基建。当在 /wekafs/kyle 下 build/profile/调试 8-wave (turbo_grouped_gemm_mxfp8_*8wave*) 或问"怎么重编/怎么看 ISA/怎么测 MfmaUtil"时用。封装了 chi2865 远程 build 的所有坑（前台 build、ISA 从 gfx950 code object dd 切、KSYM 必须排除 wgrad）。配合 remote-sync / remote-mlperf-gptoss / claim-mi355x-node。
+description: 迭代 PT turbo MXFP8 8-wave grouped GEMM kernel（dev/kyle_mxfp8_gg_pr）时的一条龙 sync+build+ISA+correctness+perf 基建。当在 /wekafs/kyle 下 build/profile/调试 8-wave (turbo_grouped_gemm_mxfp8_*8wave*) 或问"怎么重编/怎么看 ISA/怎么测 MfmaUtil"时用。封装了 chi2811 远程 build 的所有坑（前台 build、ISA 从 gfx950 code object dd 切、KSYM 必须排除 wgrad）。配合 remote-sync / remote-mlperf-gptoss / claim-mi355x-node。
 ---
 
 # mxfp8-8wave-devloop
 
 迭代 8-wave MXFP8 grouped GEMM 的固定工作流。**别再手搓 sync/touch/.o/pip/sleep 轮询/dd ISA**——用 `scripts/dev.sh`。
 
-工作树：本地 `/wekafs/kyle/remote_sync/mxfp8/Primus-Turbo`（= 容器 `/workspace/code/code3/Primus-Turbo`，分支 `dev/kyle_mxfp8_gg_pr`）。节点见 [claim-mi355x-node]（当前 chi2865）。
+工作树：本地 `/wekafs/kyle/remote_sync/mxfp8/Primus-Turbo`（= 容器 `/workspace/code/mxfp8/Primus-Turbo`，分支 `dev/kyle_mxfp8_gg_pr`）。节点见 [claim-mi355x-node]（当前 chi2811）。
 
 ## 一条命令搞定
 
