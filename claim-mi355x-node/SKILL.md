@@ -1,6 +1,6 @@
 ---
 name: claim-mi355x-node
-description: 当原本固定使用的 mi355x 计算节点不可用、容器被删、或被别的 slurm job 占满时，从 login_node2 找一台 GPU 实际空闲的 compute 节点，把本机公钥种到节点上，再起一个新的 mlperf_gptoss 容器（rocm/primus:v26.2，挂 /mnt/shared/kyle/code2 → /workspace/code），triton 升到 3.7。当用户说"找台空机器/换节点/容器没了/重建容器/这节点被占了"等场景时使用。配合 remote-mlperf-gptoss 与 remote-sync skill。
+description: 当原本固定使用的 mi355x 计算节点不可用、容器被删、或被别的 slurm job 占满时，从 login_node2 找一台 GPU 实际空闲的 compute 节点，把本机公钥种到节点上，再起 mlperf_gptoss 容器。首选从共享盘保存的镜像 mlperf_gptoss:saved-*（含 triton 3.7 + flydsl/primus_turbo，开箱即用）恢复；没有才从 fresh rocm/primus:v26.2 起再升级安装。挂 /mnt/vast/kyle/code2 → /workspace/code。当用户说"找台空机器/换节点/容器没了/重建容器/这节点被占了/保存容器/重建保存镜像"等场景时使用。配合 remote-mlperf-gptoss 与 remote-sync skill。
 ---
 
 # claim-mi355x-node
@@ -15,13 +15,14 @@ description: 当原本固定使用的 mi355x 计算节点不可用、容器被�
 本地 (/wekafs/kyle)
   └─ ssh login_node2          149.28.124.225, root, key=/wekafs/kyle/.ssh/id_ed25519
        └─ ssh chiXXXX         登录节点上的 root 可以无密码 ssh 任意 chi 节点（hostbased/共享 known_hosts）
-            └─ docker run mlperf_gptoss   # 挂 /mnt/shared/kyle/code2:/workspace/code
+            └─ docker run mlperf_gptoss   # 挂 /mnt/vast/kyle/code2:/workspace/code
 ```
 
 要点：
 - **本机 → 任意 compute 节点的直连**只有目标节点 `~/.ssh/authorized_keys` 里有我们公钥才行。chi2811 之前已经种过；新节点要自己种。
 - **从 login_node2 → 任意 chi 节点**不需要密码也不需要我们的公钥（root 在登录节点上有别的 trust）。所以"种公钥"这一步必须**经 login_node2 跳过去**做。
-- bind-mount 路径 `/mnt/shared/kyle/code2` 是 **wekafs 上的共享路径**，每个 mi355x 节点都看得到同一份 —— 换节点不丢数据。
+- bind-mount 路径 `/mnt/vast/kyle/code2` 在 **`/mnt/vast`（10.2.123.177:/aac-8634674/aac/shared/data，152T 集群共享 NFS）** 上，**每个节点同源**，写一次全集群可见 —— 换节点不丢数据。
+  **注意**：旧文档用的 `/mnt/shared`（login_node2:/mnt/nvmeraid）在 2026-06-09 实测**空闲节点上是坏/空的 NFS（root 都 Permission denied）**，已弃用，改走 `/mnt/vast`。`sync.sh` 的 `REMOTE_BASE` 也要同步指向 `/mnt/vast/kyle/code2`。
 
 ## 公钥（粘到 authorized_keys 的内容）
 
@@ -66,6 +67,16 @@ done'
 
 GPU%=0 但 `rocm-smi --showpids` 有 vllm/sglang worker 进程占着大额显存（200GB+），意味着是 idle waiting，**显存被锁**：你能起容器但跑大 batch 会 OOM，小任务可以共存。
 
+#### 2026-06-01 血泪教训（节点争抢，反复踩）
+
+- **slurm `sinfo idle` / `squeue` 完全不可信**：大家都在 slurm 之外直接 `docker run` 抢 GPU。一台 slurm 标 `idle` 的节点可能有 9 个 GPU 进程 + 3 个容器。**唯一可信的是直接 ssh 进去 `rocm-smi --showpids` 数进程 + `docker ps`。**
+- **真·可用判据**（鲁棒批量扫，挑出来再复核）：`rocm-smi --showpids 2>/dev/null | grep -cE '^[0-9]'` == 0 **且** `docker ps` 无业务容器。`vram0=0%` 也要,但 pid 数是金标准。
+- **`primus-training` 是多节点训练 job**，会同时铺到一排节点（chi2832/2835/2816/2800...）**每节点吃满 8 卡 ~96% VRAM 真算** → 落在这种节点上，容器会反复 OOM 崩(exit 137)。看到 `primus-training` 容器或某 PID `GPU(s)=8` + 各卡 VRAM 96% → **立刻换**，不可共存。
+- **能共存 vs 不能**：用 `rocm-smi --showmemuse`（per-GPU VRAM%）+ `--showpids`（CU OCCUPANCY 列）。VRAM 28% 且 CU OCCUPANCY=0（idle-waiting worker）→ 小 GEMM 可共存、timing 干净；VRAM 96% 或 CU 在真算 → 不行。
+- **本机 ssh 解析不了 chiXXXX**，必须经 login_node2 跳：`ssh login_node2 "ssh chiXXXX '...'"`。批量扫用 `for n in ...; do ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new $n '...'; done`。
+- **污染环境的 bench 数不可信**：被 primus-training 抢卡时测的 TFLOPS 偏低（结构性的 V/spill/det 来自编译期+正确性，仍可信；但绝对 TFLOPS 必须在干净节点重测）。
+- 镜像 `rocm/primus:v26.2` 在大多数节点都有；user 说不强求该镜像时，任何能跑的镜像都行,但 v26.2 最省事(rr.sh/skill 都按它)。
+
 ### 3. 把公钥种到选中的节点
 
 ```bash
@@ -85,9 +96,39 @@ ssh login_node2 'ssh -o ConnectTimeout=15 chiXXXX "hostname && whoami"'
 # 要么先做下面的 config 更新，再用别名测：ssh compute_node_new 'hostname'
 ```
 
-> **立刻**改 `~/.ssh/config` 里 `compute_node_new` 的 `HostName` 指向新节点 —— 这是节点的 single source of truth，`ssh compute_node_new` 和 `sync.sh`（用此别名）都靠它。当前 = `chi2774`（2026-06-01）。`compute_node_new` 用 `ProxyJump login_node2`，所以本机直连才能通。改完 `ssh compute_node_new 'hostname'` 应回 chiXXXX。
+> **立刻**改 `~/.ssh/config` 里 `compute_node_new` 的 `HostName` 指向新节点 —— 这是节点的 single source of truth，`ssh compute_node_new` 和 `sync.sh`（用此别名）都靠它。当前 = `chi2811`（2026-06-11，从 chi2832 迁出 —— chi2832 被别人的 `sglang` 推理服务器 TP=8 占满 8 卡 100%/各 230GB VRAM 真算,污染 benchmark。chi2811 当时 slurm idle / 0 GPU 进程 / 305G 空闲盘；从保存镜像 `mlperf_gptoss:saved-20260610` 恢复,开箱即用)。**永远避开 yanyuqin 的 hold**`compute_node_new` 用 `ProxyJump login_node2`，所以本机直连才能通。改完 `ssh compute_node_new 'hostname'` 应回 chiXXXX。
 
 ### 4. 起 mlperf_gptoss 容器
+
+#### ★ 首选：从保存的镜像恢复（跳过 §5/§5.5，开箱即用）
+
+已把配好环境的容器（triton 3.7 + flydsl/primus_turbo editable + 全部依赖）commit 并导出到集群共享盘。
+**任何节点直接 load + run 即可，不用再升 triton、不用重装 flydsl/primus_turbo。**
+
+- 保存的镜像 tar：`/mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260610.tar.zst`（zstd 压缩，`/mnt/vast` 全集群同源，每个节点都看得到）
+- 镜像 tag：`mlperf_gptoss:saved-20260610`
+
+```bash
+TARGET=chiXXXX
+# (a) 该节点若还没有这个镜像，先 load（~70GB，zstd 解压，几分钟）
+ssh $TARGET 'docker images | grep -q "mlperf_gptoss.*saved-20260610" \
+  || zstd -dc /mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260610.tar.zst | docker load'
+# (b) 用保存的镜像起容器（flag 与下方固定版本一致，只把 image 换成保存的 tag）
+ssh $TARGET 'docker run -d \
+  --name=mlperf_gptoss \
+  --network=host --ipc=host \
+  --device /dev/dri --device /dev/kfd --group-add video \
+  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  --shm-size=64G \
+  -v /mnt/vast/kyle/code2:/workspace/code \
+  mlperf_gptoss:saved-20260610 sleep infinity'
+```
+
+- editable 安装（flydsl/primus_turbo）的 python 指针在镜像 rootfs 里，源码 + build 产物（`build-fly/`、`_C*.so`）在 bind mount `/mnt/vast/kyle/code2` 上，两者一拼就直接 `import flydsl` / `import primus_turbo.pytorch` 可用 → **§5、§5.5 全跳过**，直接去 §6 验证。
+- 验证里若 `import primus_turbo.pytorch` 仍报缺符号/版本不匹配（极少见，通常是 bind mount 里的 `_C*.so` 被别的分支覆盖），才回退去跑 §5.5 (b) 重 build。
+- 镜像更新了（装了新依赖/升级了包）→ 重新 commit + save 覆盖这个 tar，并把本文件里的日期/文件名同步更新。重 commit 命令见本文件末尾「重建保存镜像」。
+
+#### fallback：从 fresh `rocm/primus:v26.2` 起（没有保存镜像时才用）
 
 固定命令（用户审定的版本，别擅自改 flag）：
 
@@ -102,17 +143,18 @@ ssh chiXXXX 'docker run -d \
   --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
   --shm-size=64G \
-  -v /mnt/shared/kyle/code2:/workspace/code \
+  -v /mnt/vast/kyle/code2:/workspace/code \
   rocm/primus:v26.2 sleep infinity'
 ```
 
 要点：
 - `--name=mlperf_gptoss` 沿用原名 —— `remote-mlperf-gptoss` skill 里所有 `docker exec mlperf_gptoss ...` 不用改。
-- `-v /mnt/shared/kyle/code2:/workspace/code` 是 bind mount —— 等于把同一份 wekafs 共享数据挂进容器，跟原来 chi2811 上的 `/workspace/code` 完全一样。
+- `-v /mnt/vast/kyle/code2:/workspace/code` 是 bind mount —— `/mnt/vast` 是集群共享 NFS，所有节点同源，换节点数据自动可见。
 - `--network=host` —— 容器直接用 host 网络栈（远程没外网这点不变，但同节点其他服务的端口能直连）。
 - `sleep infinity` —— 容器常驻，靠 `docker exec` 进去干活，不要用 `docker run -it` 跑业务。
+- 走 fallback 路径才需要继续做 §5（升 triton）+ §5.5（装 flydsl/primus_turbo）。
 
-### 5. 升级 triton 到 3.7
+### 5. 升级 triton 到 3.7（走 fresh fallback 才需要；从保存镜像恢复可跳过）
 
 `rocm/primus:v26.2` 镜像里 triton 默认 3.6.0；user 要求 fp8 grouped GEMM bench 走 triton 3.7（autotune cfg 更全）。每次新起容器都要做一次：
 
@@ -122,7 +164,7 @@ ssh chiXXXX 'docker exec mlperf_gptoss bash -lc "/opt/venv/bin/pip install --upg
 
 预期最后一行输出 `3.7.0`。装完后任何之前用 triton 3.6 跑的 bench 数字（`v2/Triton` ratio 等）都作废，必须重 bench 立新 baseline。
 
-### 5.5 从源码安装 FlyDSL + 重装 primus_turbo（fresh 容器必做）
+### 5.5 从源码安装 FlyDSL + 重装 primus_turbo（走 fresh fallback 才需要；从保存镜像恢复可跳过）
 
 fresh 容器里 `flydsl` **没装** → `from primus_turbo.flydsl.gemm.gemm_fp8_kernel import _compile_dense_tn`
 落 stub 分支报 `ImportError: cannot import name '_compile_dense_tn'`（`flydsl_available()` False）。
@@ -181,13 +223,33 @@ ssh chiXXXX 'docker ps --filter name=mlperf_gptoss && \
 - **不要**用 `srun` / `salloc` 抢 mi355x —— 全节点已 ALLOCATED，slurm 不会让我们进；正确路径就是 docker。
 - **不要**修改/删除 chi2811（旧节点）上的别人遗留容器(`vllm-gptoss` 等)。
 
+## 重建保存镜像（环境变了就刷新这个 tar）
+
+当容器里装了新依赖、升级了包、或想把一段时间的环境固化，重新 commit + 导出覆盖共享盘上的 tar。
+源码/build 产物在 bind mount 上不进镜像，**只固化容器 rootfs**（pip 包、apt 包、editable 指针、triton 版本）。
+
+```bash
+DATE=$(date +%Y%m%d)   # 本机算好日期填进去，远程别依赖
+# (a) commit 当前容器（--pause=false 不打断容器里在跑的活）
+ssh compute_node_new "docker commit --pause=false mlperf_gptoss mlperf_gptoss:saved-$DATE"
+# (b) 导出 + zstd 并行压缩到共享盘（~70GB，128 线程，几分钟；后台跑）
+ssh compute_node_new "bash -c 'set -o pipefail; cd /mnt/vast/kyle/code2/docker_images && \
+  docker save mlperf_gptoss:saved-$DATE | zstd -T0 -3 -q -o mlperf_gptoss-$DATE.tar.zst && \
+  ls -lh mlperf_gptoss-$DATE.tar.zst'"
+```
+
+刷新后：把上面 §4「首选」里的 tar 文件名 + tag 日期同步改掉；旧 tar 确认新的能 load 后再删，省共享盘空间。
+注意 commit 不保存 bind mount（`/workspace/code` 即 `/mnt/vast/kyle/code2`）—— 那本来就持久在共享盘。
+
 ## 故障排查
 
 | 症状 | 排查 |
 |---|---|
 | `ssh chiXXXX` Permission denied | 公钥没种成，回到步骤 3。检查 `tail -1 ~/.ssh/authorized_keys` 的输出是不是我们的 key。 |
+| 从保存镜像恢复后 `import flydsl` 失败 | bind mount 没挂上或 `/workspace/code/FlyDSL` 不在（editable 指针指向它）。先 §6 验证 `ls /workspace/code`；真缺才回退 §5.5。 |
+| `docker load` 报 no space | 节点 `/` 盘满（镜像解压占 ~70GB）。`docker system df` + `docker image prune`，或换盘大的节点。 |
 | 步骤 3 经 login_node2 也卡在 password prompt | login_node2 → 该节点的免密信任不存在（罕见）。`ssh login_node2 'ssh -v chiXXXX hostname' 2>&1 | grep -E "Authentications|Accepted"` 看用了哪种方法。 |
 | `docker run` 报 name conflict | 已经有同名容器残留：`ssh chiXXXX 'docker rm -f mlperf_gptoss'`，再重跑。 |
 | 容器起来但 `torch.cuda.device_count()=0` | `--device /dev/kfd` 或 `--device /dev/dri` 没挂上。`docker inspect mlperf_gptoss | grep -A2 Devices` 检查。 |
-| `/workspace/code` 是空的 | bind mount 路径错了。本应是 host `/mnt/shared/kyle/code2`（不是 `/mnt/shared/kyle/code`）。 |
+| `/workspace/code` 是空的 | bind mount 路径错了或该节点 `/mnt/vast` 没挂。本应是 host `/mnt/vast/kyle/code2`（`/mnt/shared` 已弃用，常是坏 NFS）。 |
 | `docker images` 里没有 `rocm/primus:v26.2` | 这台节点没拉过镜像。从一个有镜像的节点 `docker save rocm/primus:v26.2 | ssh root@target 'docker load'`，比走外网（没有）靠谱。 |

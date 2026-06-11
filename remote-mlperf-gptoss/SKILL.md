@@ -1,6 +1,6 @@
 ---
 name: remote-mlperf-gptoss
-description: 连接远程计算节点（当前 chi2774，节点名以 ~/.ssh/config 的 compute_node_new HostName 为准，经 login_node2 跳板机）并在 mlperf_gptoss 容器里执行命令。容器默认工作目录 /workspace/code。当用户在 /wekafs/kyle 下提到"远程主机/计算节点/容器/mlperf_gptoss/workspace/code/MI355X/ROCm/HIP"等相关操作时使用此 skill。配合 remote-sync skill：编辑代码在本地、跑命令在远程。节点不可用/容器没了 → 用 claim-mi355x-node skill 换节点。
+description: 连接远程计算节点（当前 chi2811，节点名以 ~/.ssh/config 的 compute_node_new HostName 为准，经 login_node2 跳板机）并在 mlperf_gptoss 容器里执行命令。容器默认工作目录 /workspace/code。当用户在 /wekafs/kyle 下提到"远程主机/计算节点/容器/mlperf_gptoss/workspace/code/MI355X/ROCm/HIP"等相关操作时使用此 skill。配合 remote-sync skill：编辑代码在本地、跑命令在远程。节点不可用/容器没了 → 用 claim-mi355x-node skill 换节点。
 ---
 
 # remote-mlperf-gptoss
@@ -12,22 +12,22 @@ description: 连接远程计算节点（当前 chi2774，节点名以 ~/.ssh/con
 ```
 本地 (/wekafs/kyle)              ┐
   └─ ssh login_node2             │  149.28.124.225, root（跳板机）
-       └─ ssh compute_node_new   │  chi2774 (见 ~/.ssh/config, 是 SoT), root, ProxyJump=login_node2
-            └─ docker exec mlperf_gptoss   ── 镜像: rocm/primus:v26.2 (常驻)
+       └─ ssh compute_node_new   │  chi2811 (见 ~/.ssh/config, 是 SoT), root, ProxyJump=login_node2
+            └─ docker exec mlperf_gptoss   ── 镜像: mlperf_gptoss:saved-20260610 (常驻)
                  └─ /workspace/code        ── 默认 cwd
                       ↑
-                      └── host bind mount: /mnt/shared/kyle/code2
+                      └── host bind mount: /mnt/vast/kyle/code2
 ```
 
 - SSH 配置都在 `~/.ssh/config`，私钥 `~/.ssh/id_ed25519`。
 - 容器是常驻的（`docker exec` 而不是 `docker run`），写入文件下次还在。
-- Host 路径 `/mnt/shared/kyle/code2` 是 `/workspace/code` 的 bind mount —— rsync 直接走 host 路径就行，参见 `../remote-sync/SKILL.md`。
+- Host 路径 `/mnt/vast/kyle/code2` 是 `/workspace/code` 的 bind mount —— rsync 直接走 host 路径就行，参见 `../remote-sync/SKILL.md`。
 
-## 远程环境（已确认 2026-06-01，节点 chi2774）
+## 远程环境（已确认 2026-06-11，节点 chi2811）
 
 | 项 | 值 |
 |---|---|
-| 主机名 | `chi2774`（容器内外一致；当前节点，以 ssh config 为准） |
+| 主机名 | `chi2811`（容器内外一致；当前节点以 ssh config 为准） |
 | OS | Linux（容器内 Ubuntu/Debian 系，`/.dockerenv` 存在） |
 | GPU | 8 × AMD Instinct MI355X |
 | Python | 3.12.3 @ `/opt/venv/bin/python`（无须 activate venv，PATH 已就位） |
@@ -38,6 +38,8 @@ description: 连接远程计算节点（当前 chi2774，节点名以 ~/.ssh/con
 | 外网 | **无**（远程不能 pip install / git clone / curl 外部资源；这是硬约束，编辑必须在本地，参见 remote-sync skill） |
 
 ### FlyDSL / primus_turbo 从源码安装（fresh 容器一次性 setup）
+
+**首选别走这条**：换节点时用 claim-mi355x-node §4「从保存的镜像恢复」（`mlperf_gptoss:saved-*`，已含 triton 3.7 + flydsl/primus_turbo），开箱即用，不用下面这步。只有从 fresh `rocm/primus:v26.2` 起才需要。
 
 fresh `rocm/primus:v26.2` 容器里 `flydsl` 没装 → 跑 flydsl kernel 前要 **从源码 editable 安装**
 （见 claim-mi355x-node §5.5）：`pip install -e /workspace/code/FlyDSL` + 重装 primus_turbo。
@@ -98,7 +100,7 @@ ssh -t compute_node_new 'docker exec -it mlperf_gptoss bash -c "cd /workspace/co
 `scp` 也可以，但要传到 host 路径，不是容器内路径：
 
 ```bash
-scp local_file compute_node_new:/mnt/shared/kyle/code2/Primus-Turbo/scripts/
+scp local_file compute_node_new:/mnt/vast/kyle/code2/Primus-Turbo/scripts/
 # 等价于容器内 /workspace/code/Primus-Turbo/scripts/
 ```
 
@@ -146,4 +148,4 @@ scp local_file compute_node_new:/mnt/shared/kyle/code2/Primus-Turbo/scripts/
 | `import primus_turbo.pytorch` 报 `undefined symbol ...hk_gemm_bf16` | HK dense binding 引用了缺失的 .cu；HK 后端已移除，按 claim §5.5 末尾清掉残留 + 重 build。 |
 | ROCm/HIP 报错 | 先 `rocm-smi` / `rocminfo` 验证 GPU 可见性 + 容器有 `--device=/dev/kfd --device=/dev/dri` 挂载（用 `docker inspect` 看）。 |
 | 同节点其他用户在跑 | `ssh compute_node_new 'docker ps && rocm-smi --showpidgpus'` —— 如果 GPU 被占满，告诉用户，不要无脑跑。 |
-| 文件推上去容器看不到 | 检查 rsync 目标是不是 host 路径 `/mnt/shared/kyle/code2/<repo>/...`，**不是**容器内路径 `/workspace/code/...`。 |
+| 文件推上去容器看不到 | 检查 rsync 目标是不是 host 路径 `/mnt/vast/kyle/code2/<repo>/...`，**不是**容器内路径 `/workspace/code/...`。 |
