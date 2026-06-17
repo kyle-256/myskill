@@ -1,5 +1,8 @@
 # FlyDSL vs HipKittens fp8 GEMM 基准数据（防遗忘存档）
 
+> **2026-06-12 更新（§6）**：FlyDSL grouped 优化完成 —— **fwd 2314 / dgrad 2242 / wgrad 2149**（kernel级，n=12 真实 MoE，SNR全对）。commit cd215bb8 + efe462dd。
+> **fly/hk：fwd 1.063× / wgrad 1.105×**（dgrad HK坏无对照），§5 的「fly/hk≥1.05」目标达成。详见文末 §6。
+
 测于 2026-06-09，节点 **chi2832**（gfx950/MI355X），容器 `mlperf_gptoss`（rocm/primus:v26.2，
 triton 3.7），数据盘 `/mnt/vast/kyle/code2`，GPU6（GPU0-3 被别人 vLLM 占，4-7 空）。
 warm-mean（`torch.utils.benchmark.Timer`，~10 warmup + timeit(50)）。TFLOPS=2·M·N·K/t。
@@ -215,3 +218,43 @@ wgrad kern fly: dsv3 1447/1691/1516/1776, qwen 1487/1814/1588/1775, gpt 1273/129
 
 **任务（user 2026-06-09）：优化 FlyDSL grouped 至 fly/hk ≥ 1.05（绝对快 5%）。** FlyDSL dense fwd 已 2500-3000（>HK），
 说明 grouped body 开销是主攻点。优化驱动器：`scripts2/run_grouped_opt_sessions.sh` + `GROUPED_OPT_PLAN.md`（基线/目标需改为 HK-relative）。
+
+---
+
+## 6. FlyDSL grouped 优化结果（2026-06-12，分支 dev/kyle/flydsl_grp_fwd_swpipe）
+
+`_gg_fwd_wgrad.py GG_BACKEND=FLYDSL BENCH_COOLDOWN=2`，同 §2/§5 协议（kernel级 no-quant，B=8 balanced，SNR56全对），chi2832 GPU6。
+
+### geomean kern TFLOPS 进步链
+| op | §5 原始基线(2026-06-09) | HEAD 231e0f09(autotuned persistent) | **现在(非持久+swizzle-AT)** | vs HEAD | HK(§2) | **fly/hk** |
+|---|---|---|---|---|---|---|
+| **fwd** | 1841 | 2232 | **2315** | **+3.7%** | 2178 | **1.063** |
+| **dgrad** | (HK坏,未测) | 2157 | **2238** | **+3.8%** | (坏) | — |
+| **wgrad** | 1516 | 2138 | **2119** | -0.9% | 1918 | **1.105** |
+
+fwd 比原始基线 **+25.7%**，wgrad **+39.7%**。**§5 目标「fly/hk≥1.05」: fwd(1.063)+wgrad(1.105) 达成。**
+
+### 关键架构（怎么做到的）
+1. **num_cu 路由**：`num_cu=-1`(默认,全device,不留CU给comm) → **非持久 nt8w(fwd)/nn8w(dgrad)**；`num_cu>0`(comm-overlap,留CU) → persistent grid capped 到 num_cu。wgrad 始终 persistent。
+2. **非持久 kernel(nt8w/nn8w)**：官方 8wave 直线 body(无 scf.for tile loop → 省 ~11% 后端调度惩罚)，+G 上界 grid + s_endpgm over-launch guard + per-group m_end store clamp(变组正确)+ K-tail mask(gpt K=2880)。
+3. **决定性教训**：光直线化(非持久)**不够**——全 shape 测它比 persistent 略亏(-1%)，因为赢大K(dsv3 +8%,循环惩罚主导)但**输小K(gpt -13%)**,小K靠的是 persistent 的 L2 调优。**必须把 L2 swizzle(XCD remap + group_m/band)移植进非持久 kernel**,非持久才全面超 persistent。
+4. **非持久 per-shape autotune(≤4候选)**：默认 `(num_xcd=8,group_m=4)` + alts `{(1,0,0)行优先, (8,8,0)宽簇, (8,4,band)2D}`，鲁棒计时(100 warmup+median5)+ 1.5% hysteresis(防噪声 mis-pick)。逐 shape 选最优。
+5. fwd 逐 shape:11/12 清晰超 persistent(dsv3 +8~9%/qwen-up +6~7%/gpt +2~5%),qwen-down M4096 噪声级平手(2010 vs 2014)。
+
+### fwd 逐 shape kern（非持久 swizzle-AT / HEAD persist）
+dsv3-up 2788/2559(+9%),2794/2585; dsv3-down 2266/2254,2285/2268; qwen-up 2657/2495(+6.5%),2681/2497;
+qwen-down 1679/1650,2010/2014(平); gpt-up 2219/2174,2235/2222; gpt-down 2183/2103(+3.8%),2268/2153(+5.3%).
+
+### 坑/注意
+- **非持久 cherry-pick 陷阱**：单看 deepseek(大K)非持久 +7%,会误以为全面赢；必须全 shape 测——小K是反的。
+- **autotune 单次计时噪声**会 mis-pick(naive pick-min 把 gpt-up M2048 选到 -10%);必须强默认+hysteresis+鲁棒计时。
+- nt8w 初版漏了 K-tail(assert K%128==0)→ gpt K=2880 AssertionError;已加 mask_a_tail。
+- e5m2/e4m3 唯一差别=MFMA atom;nt8w/nn8w 都接 cbsz/blgp,走同一快路径。
+- 改动全在 Primus-Turbo(gemm_fp8_grouped_kernel.py + grouped_gemm_fp8_impl.py + 新 gemm_fp8_grouped_nt8w.py/nn8w.py),未 commit。
+
+
+### 6b. source-level 平台期 + 到竞品 B200 2800T 的路（2026-06-12 续）
+竞品 NV **B200** grouped fp8 平均 **2800T**；我们 ~2300（fwd 2314）。MI355X fp8(BF8) **dense 天花板 ~3014-3217**（native 16×16，非 MXFP4 的 5253）。big-K(dsv3 2761)已 ~92% 天花板；小 K(gpt/qwen-down)更低（overhead/load-bound）。
+- **autotune 鲁棒计时(250warmup/5x50)= 真修复**：旧 5-iter-warmup 在短 K mis-pick；修后 qwen-down M2048 fwd 1679→1956(+16.5%)；wgrad 2119→2149。**短 K kernel 计时必须重 warmup 到 boost clock。**
+- **死路（别再试，nt8w 非持久不 transfer persistent 的杠杆）**：sched_barrier(0) before-mfma → -5.5%+SNR掉（非持久 before-mfma s_barrier 是 load-bearing LDS 同步）；cshuffle store → 中性（qwen-down +2.2%/gpt -2.3%）。
+- **2800 只剩两条重路**：①全循环裸汇编抬 BF8 dense 天花板（mxfp4-campaign 式，几 session）②换 MXFP4 microscaling 格式（峰值 5253）——取决于竞品用啥格式。BF8 source-level 已榨干(~2300 平台)。
