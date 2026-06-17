@@ -3,6 +3,8 @@ name: fp8-gemm-bench
 description: Primus-Turbo 的 fp8 GEMM / grouped GEMM kernel TFLOPS 测试方案。用户问 "测一下 fp8 gemm 的 perf / 比较 dense vs grouped / 看 kernel TFLOPS / RCR vs RRR vs CRR 性能" 时使用。覆盖正确的 bench setup（cuda event timing, warmup=20 iter=100, 全部 raw op + quantize_fp8_tensorwise_impl 算正确 scale_inv, 独占 GPU 验证, block-aligned shapes）和已知 pitfalls（triton.do_bench 不可靠 / wrapper 含 quantize overhead 不是纯 kernel TFLOPS / dense 在非对齐 shape silently early-exit / 别的进程占 GPU 出 OOM）。
 ---
 
+> ⚠️ **本机已本地化**：Primus-Turbo 在 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`，bench **本地直接跑**，无 ssh / 无 docker。
+
 # fp8-gemm-bench
 
 测 Primus-Turbo 的 fp8 GEMM kernel 纯 kernel-level TFLOPS。MI355X gfx950, fp8 peak ~5 PFLOPS.
@@ -73,13 +75,13 @@ fn = lambda: torch.ops.primus_turbo_cpp_extension.hk_gemm_fp8(
 测之前 `rocm-smi --showpids` 检查 KFD processes 列表，确认 target GPU 没有别的 vllm/sglang/python process。
 
 ```bash
-ssh compute_node_new "rocm-smi --showpids 2>&1 | grep -A20 KFD"
+rocm-smi --showpids 2>&1 | grep -A20 KFD
 # 输出：PID + PROCESS NAME + GPU(s) + VRAM USED
 ```
 
 如果 default GPU 0 被占，设 `HIP_VISIBLE_DEVICES`:
 ```bash
-docker exec -e HIP_VISIBLE_DEVICES=2 mlperf_gptoss bash -lc '...'
+HIP_VISIBLE_DEVICES=2 python3 ...
 ```
 
 `rocm-smi --showmemuse` 看 `VRAM%` per GPU，0% 才算空。**不要看 `gpu_use=0`** —— vllm with `--gpu_memory_utilization 0.95` 占 95% VRAM 但 `gpu_use=0` (idle waiting requests)。
@@ -158,10 +160,9 @@ TFLOPS 范围:
 ## 复现
 
 ```bash
-ssh compute_node_new "docker exec -e HIP_VISIBLE_DEVICES=<free_gpu> mlperf_gptoss bash -lc '
-  cd /workspace/code/Primus-Turbo
-  PYTHONPATH=/workspace/code/Primus-Turbo:\$PYTHONPATH python3 /tmp/bench_template.py
-'"
+cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && \
+  PYTHONPATH=/workspace/code/gpt_oss_docker/sync/Primus-Turbo:$PYTHONPATH \
+  HIP_VISIBLE_DEVICES=<free_gpu> python3 /tmp/bench_template.py
 ```
 
 模板见同目录 `bench_template.py`. 编辑 SHAPES 列表换 shape, 改 layout block 加更多 case.

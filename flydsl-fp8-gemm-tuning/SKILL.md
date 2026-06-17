@@ -1,11 +1,13 @@
 ---
 name: flydsl-fp8-gemm-tuning
-description: 优化 FlyDSL fp8 dense GEMM (TN/NN/NT) 在 MI355X (gfx950) 上的性能。当用户要给 Primus-Turbo 的 `primus_turbo/flydsl/gemm/gemm_fp8_kernel.py` 提速、调某个 shape regime (big-K / big-N / square)、或问"为什么这个 case 慢/还能不能优化"时使用。覆盖：profile→定位瓶颈的诊断框架、已验证的 WIN lever、det=0 验证方法、和基础设施。配合 remote-sync + claim-mi355x-node skill。
+description: 优化 FlyDSL fp8 dense GEMM (TN/NN/NT) 在 MI355X (gfx950) 上的性能。当用户要给 Primus-Turbo 的 `primus_turbo/flydsl/gemm/gemm_fp8_kernel.py` 提速、调某个 shape regime (big-K / big-N / square)、或问"为什么这个 case 慢/还能不能优化"时使用。覆盖：profile→定位瓶颈的诊断框架、已验证的 WIN lever、det=0 验证方法、和基础设施。本机已本地化 (代码在 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`, 本地直接编辑/运行, 无 rsync/ssh/docker)。
 --- 
+
+> ⚠️ **本机已本地化**：代码在 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`，本地直接编辑/运行，无 rsync / 无 ssh / 无 docker。改 flydsl kernel 后清缓存：`rm -rf /root/.flydsl/cache`。
 
 # FlyDSL fp8 dense GEMM 调优 (MI355X / gfx950)
 
-主文件：`/wekafs/kyle/code2/remote_sync/Primus-Turbo/primus_turbo/flydsl/gemm/gemm_fp8_kernel.py`
+主文件：`/workspace/code/gpt_oss_docker/sync/Primus-Turbo/primus_turbo/flydsl/gemm/gemm_fp8_kernel.py`
 公共 API：`gemm_fp8_tensorwise_flydsl_kernel(a, sa, b, sb, trans_a, trans_b, out_dtype)`
 内部：`_compile_dense_tn/_nn/_nt(...)` + `_autotune_tn_dispatch(args,M,N,K)` (首调 bench 候选, 按 (M,N,K) 缓存)。
 都是模块级 (在 `if flydsl_available():` 下)，probe 脚本可 `from ... import gemm_fp8_kernel as G; G._compile_dense_tn(...)`。
@@ -18,22 +20,21 @@ description: 优化 FlyDSL fp8 dense GEMM (TN/NN/NT) 在 MI355X (gfx950) 上的�
 - run-to-run 噪声 **~5%**，和很多 lever 的增益同量级 → 用 best-of-3/4 bench + 多次复测区分真假。
 - 只用 GPU 6。
 
-### 基础设施 (用这套, 别手搓 sync/cache/ssh)
+### 基础设施 (本地直接跑, 无 sync/ssh/docker)
 
-**`/wekafs/kyle/code2/remote_sync/rr.sh`** — 一条命令搞定 sync+清cache+GPU6+无缓冲输出 (自动 `cd` 到 remote_sync 根; FlyDSL+turbo 已源码安装, 无需 PYTHONPATH):
+本机已本地化, FlyDSL+turbo 已源码安装 (无需 PYTHONPATH)。跑脚本的本地等价 (清cache + 指定GPU + 无缓冲输出):
 ```bash
-cd /wekafs/kyle/code2/remote_sync
-./rr.sh run scripts2/_foo.py [args]   # sync 两 repo + 清 /root/.flydsl/cache + GPU6 跑
-./rr.sh py "<python -c 片段>"          # 快速 inline
-./rr.sh sh "<容器内 bash 命令>"         # 任意命令 (带 GPU6 env)
-./rr.sh sync                           # 只同步
-GPU=3 ./rr.sh run ...                  # 换 GPU; NOCLEAN=1 ... 跳过清 cache (复用已编译)
+cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo
+rm -rf /root/.flydsl/cache    # 改了 flydsl .py 后必清; 复用已编译则跳过此行
+HIP_VISIBLE_DEVICES=6 PYTHONUNBUFFERED=1 python scripts2/_foo.py [args]
+# inline 片段: HIP_VISIBLE_DEVICES=6 PYTHONUNBUFFERED=1 python -c "<片段>"
+# 换 GPU: 改 HIP_VISIBLE_DEVICES (如 =3)
 ```
-输出过滤: `... 2>&1 | grep -vE "^Warning|aiter|total size|speedup"`。grep 经 ssh pipe 会缓冲, rr.sh 已加 `stdbuf -oL` + `PYTHONUNBUFFERED`。
+输出过滤: `... 2>&1 | grep -vE "^Warning|aiter|total size|speedup"`。已加 `PYTHONUNBUFFERED=1`; 如 grep 缓冲可在管道前加 `stdbuf -oL`。
 
 **`Primus-Turbo/scripts2/_h.py`** — 复用 harness, probe 脚本首行 `from _h import *` 即得:
 `mk(*shape)` 造 fp8 输入 · `qargs(a,b,out,M,N)` 造 `_compile_dense_*` 的参数组 · `ref_tn/nt/nn(a,b)` 参考 · `bench(fn)`→best-of-N us · `tflops(M,N,K,us)` · `snr(o,r)` · `detf(fn,runs)`→(max_diff, first_bad) · `detc(c,args,out_view,runs)` · 导出 `G`(kernel 模块)/`FLY`(公共 API)。
-- 改 cpp(csrc)后要 `GPU_ARCHS=gfx950 pip install --no-build-isolation -e .` 重装 (见 claim §5.5); 改 flydsl .py 只需 rr.sh 自动清的 cache。
+- 改 cpp(csrc)后要 `GPU_ARCHS=gfx950 pip install --no-build-isolation -e .` 重装; 改 flydsl .py 只需手动清 cache (`rm -rf /root/.flydsl/cache`)。
 
 ## 1. 诊断框架 (先定位瓶颈类，再选 lever)
 

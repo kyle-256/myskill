@@ -5,6 +5,9 @@ description: 当原本固定使用的 mi355x 计算节点不可用、容器被�
 
 # claim-mi355x-node
 
+> ⚠️ **本机不适用**：此 skill 用于在远程集群（经 login_node2）claim 一台 GPU compute 节点并起 docker 容器，是纯远程基建操作。当前本地机器（smc300x docker 容器）无 docker CLI、不能 claim 远程节点，**此流程在本机跑不了**，仅作参考。
+> 本机的 Primus-Turbo 代码已同步到 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`（从 chi2811:/mnt/vast/kyle/code2/Primus-Turbo 拉取）。
+
 集群里 mi355x 分区大半 down，剩下的节点 slurm 都标 `ALLOCATED`，但**实际 GPU 利用率经常是 0%**（别人的容器只占着显存等请求）。这个 skill 的工作流：经登录节点找一台真闲的，授权自己 ssh，起容器，升 triton。
 
 当前用哪台节点看 `~/.ssh/config` 里 `compute_node_new` 的 `HostName`（这是 single source of truth）；不要在本 SKILL 里硬编节点名。
@@ -165,6 +168,8 @@ ssh chiXXXX 'docker exec mlperf_gptoss bash -lc "/opt/venv/bin/pip install --upg
 预期最后一行输出 `3.7.0`。装完后任何之前用 triton 3.6 跑的 bench 数字（`v2/Triton` ratio 等）都作废，必须重 bench 立新 baseline。
 
 ### 5.5 从源码安装 FlyDSL + 重装 primus_turbo（走 fresh fallback 才需要；从保存镜像恢复可跳过）
+
+> 注：下方命令里的 `/workspace/code/Primus-Turbo` 是**远程节点容器内**的路径（bind mount 自 `/mnt/vast/kyle/code2/Primus-Turbo`）。本机查看 Primus-Turbo 源码请用本地副本 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`（远程命令路径保持原样，勿改）。
 
 fresh 容器里 `flydsl` **没装** → `from primus_turbo.flydsl.gemm.gemm_fp8_kernel import _compile_dense_tn`
 落 stub 分支报 `ImportError: cannot import name '_compile_dense_tn'`（`flydsl_available()` False）。

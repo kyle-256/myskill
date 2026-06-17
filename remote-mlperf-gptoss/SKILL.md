@@ -1,13 +1,36 @@
 ---
 name: remote-mlperf-gptoss
-description: 连接远程计算节点（当前 chi2811，节点名以 ~/.ssh/config 的 compute_node_new HostName 为准，经 login_node2 跳板机）并在 mlperf_gptoss 容器里执行命令。容器默认工作目录 /workspace/code。当用户在 /wekafs/kyle 下提到"远程主机/计算节点/容器/mlperf_gptoss/workspace/code/MI355X/ROCm/HIP"等相关操作时使用此 skill。配合 remote-sync skill：编辑代码在本地、跑命令在远程。节点不可用/容器没了 → 用 claim-mi355x-node skill 换节点。
+description: 本机已本地化：Primus-Turbo 在 /workspace/code/gpt_oss_docker/sync/Primus-Turbo，命令本地直接跑（无 ssh / 无 docker / 无远程容器）。本机只同步了 Primus-Turbo，HipKittens/FlyDSL/其他 repo 未同步。当用户提到 Primus-Turbo / mlperf_gptoss / FP8 grouped GEMM / flydsl / ROCm/HIP 相关操作时使用此 skill。原"经 login_node2 → chi2811 → docker exec mlperf_gptoss"远程链路仅作历史参考（其他带 GPU 的机器用）。
 ---
+
+> ⚠️ **本机已本地化**：Primus-Turbo 在 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`，命令**本地直接跑**，无 ssh / 无 docker / 无远程容器。
+> 下方原"经 login_node2 → chi2811 → docker exec mlperf_gptoss"的远程链路仅作历史参考（其他机器用）。
 
 # remote-mlperf-gptoss
 
-通过登录节点跳转到计算节点，再 `docker exec` 进入 `mlperf_gptoss` 容器执行命令。容器内默认工作目录 `/workspace/code`。
+本机直接在本地跑命令，工作目录 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`。
 
-## 连接链路
+> **注意**：本机只同步了 **Primus-Turbo**。HipKittens / FlyDSL / 其他 repo **未同步到本机**。涉及它们的步骤本机不适用。
+
+## 本地执行命令
+
+进 Primus-Turbo 目录直接跑（环境变量直接前置，无需 ssh / docker exec 包装）：
+
+```bash
+cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && HIP_VISIBLE_DEVICES=6 python scripts2/<probe>.py
+```
+
+- 代码本地直接编辑、本地直接 `git`（分支 `dev/kyle/flydsl_grp_gemm`），不需要 rsync / scp。
+- 改 flydsl kernel（.py）后 `rm -rf /root/.flydsl/cache` 再跑；改 cpp 才需重装 primus_turbo。
+- HipKittens 后端已移除（2026-06-01）；`_C` 只剩 hipblaslt/CK/turbo ops。`torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8` 仍可用。
+
+---
+
+## 原远程流程（参考，本机不用）
+
+下面整段是原来"经跳板机 ssh 到计算节点再 docker exec"的远程链路，仅供其他机器参考。本机已本地化，不需要这套。
+
+### 连接链路
 
 ```
 本地 (/wekafs/kyle)              ┐
@@ -23,7 +46,7 @@ description: 连接远程计算节点（当前 chi2811，节点名以 ~/.ssh/con
 - 容器是常驻的（`docker exec` 而不是 `docker run`），写入文件下次还在。
 - Host 路径 `/mnt/vast/kyle/code2` 是 `/workspace/code` 的 bind mount —— rsync 直接走 host 路径就行，参见 `../remote-sync/SKILL.md`。
 
-## 远程环境（已确认 2026-06-11，节点 chi2811）
+### 远程环境（已确认 2026-06-11，节点 chi2811）
 
 | 项 | 值 |
 |---|---|
@@ -39,113 +62,77 @@ description: 连接远程计算节点（当前 chi2811，节点名以 ~/.ssh/con
 
 ### FlyDSL / primus_turbo 从源码安装（fresh 容器一次性 setup）
 
+> **本机不适用**：这步需要 `/workspace/code/FlyDSL`，而 **FlyDSL 未同步到本机**。本机只有 Primus-Turbo。
+
 **首选别走这条**：换节点时用 claim-mi355x-node §4「从保存的镜像恢复」（`mlperf_gptoss:saved-*`，已含 triton 3.7 + flydsl/primus_turbo），开箱即用，不用下面这步。只有从 fresh `rocm/primus:v26.2` 起才需要。
 
 fresh `rocm/primus:v26.2` 容器里 `flydsl` 没装 → 跑 flydsl kernel 前要 **从源码 editable 安装**
-（见 claim-mi355x-node §5.5）：`pip install -e /workspace/code/FlyDSL` + 重装 primus_turbo。
-装完后 `import flydsl` / `import primus_turbo.pytorch` 直接可用，**不需要 PYTHONPATH**，命令照常：
+（见 claim-mi355x-node §5.5）：`pip install -e /workspace/code/FlyDSL`（本机无此 repo）+ 重装 primus_turbo。
+装完后 `import flydsl` / `import primus_turbo.pytorch` 直接可用，**不需要 PYTHONPATH**。
+
+---
+
+## 本地执行命令（详细）
+
+**单条命令**：
 
 ```bash
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && CUDA_VISIBLE_DEVICES=6 HIP_VISIBLE_DEVICES=6 python scripts2/<probe>.py"'
+cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && <CMD>
 ```
-- 改 flydsl kernel（.py）后 `rm -rf /root/.flydsl/cache` 再跑；改 cpp 才需重装 primus_turbo。
-- HipKittens 后端已移除（2026-06-01）；`_C` 只剩 hipblaslt/CK/turbo ops。`torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8` 仍可用。
 
-## 在容器内执行命令
-
-**单条命令**（默认 cwd `/workspace/code`）：
+**指定工作目录**（多 repo 根，本机只有 Primus-Turbo）：
 
 ```bash
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code && <CMD>"'
+cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && python scripts/foo.py
 ```
 
-**多行脚本**（heredoc，引号不会乱）：
+**指定环境变量**（直接前置）：
 
 ```bash
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "$(cat)"' <<'EOF'
-cd /workspace/code
-<commands>
-EOF
+cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && HIP_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python scripts/foo.py
 ```
 
-**指定工作目录**（常用：进具体 repo）：
-
-```bash
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && python scripts/foo.py"'
-```
-
-**指定环境变量**：放在 `bash -lc` 里就行，不要用 `docker exec -e`（要单独转义）：
-
-```bash
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code && HIP_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python scripts/foo.py"'
-```
-
-**长任务**（Bash 工具用 `run_in_background: true`，**不要**在 SSH 命令里加 `&`）：
+**长任务**（Bash 工具用 `run_in_background: true`）：
 
 ```bash
 # 在 Bash 工具中：run_in_background=true
-ssh compute_node_new 'docker exec mlperf_gptoss bash -lc "cd /workspace/code/Primus-Turbo && python scripts/auto_optimize_gpt_oss_fp8.py 2>&1 | tee /tmp/run.log"'
-```
-
-**交互式 shell**（仅当用户明确要求时用，**不要**在自动化的 tool call 里开 —— 会卡死）：
-
-```bash
-ssh -t compute_node_new 'docker exec -it mlperf_gptoss bash -c "cd /workspace/code && exec bash"'
+cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && python scripts/auto_optimize_gpt_oss_fp8.py 2>&1 | tee /tmp/run.log
 ```
 
 ## 文件传输
 
-**首选**：走 `remote-sync` skill 的 `sync.sh`（rsync over ssh，直接走 host 路径，不穿 docker）。
-
-`scp` 也可以，但要传到 host 路径，不是容器内路径：
-
-```bash
-scp local_file compute_node_new:/mnt/vast/kyle/code2/Primus-Turbo/scripts/
-# 等价于容器内 /workspace/code/Primus-Turbo/scripts/
-```
-
-**不要**用 `docker cp`（要先 ssh 到 host 再跑，慢且容易出错）。
+本机本地化，无需 scp / rsync / docker cp —— 文件本来就在本地 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`。
 
 ## 约定
 
-- 命令一律用 `bash -lc "..."` 包起来 —— 确保 PATH/venv/ROCm env 加载，否则 `python` 都找不到。
-- 除非用户指定别的路径，进容器先 `cd /workspace/code`（或具体 repo 子目录）。
-- 一条命令能搞定就别拆 —— 链式 `ssh ... 'docker exec ... bash -lc "..."'` 比"先 ssh 再 docker exec"快、不留游离会话。
-- 第一次连接慢可加 `-o ConnectTimeout=20`，后续 ControlMaster 热起来不用加。
-- **不要在远程跑 git 命令** —— git 在本地 `/wekafs/kyle/code2/remote_sync/<repo>/` 用。
-- **不要在远程编辑文件** —— 编辑在本地，rsync 推上去。详见 `remote-sync` skill。
-- **不要 `pip install` / `apt install` / `git clone` 外部资源** —— 远程没外网。需要新依赖先问用户怎么搞。
+- 代码本地直接编辑、本地直接 `git`（分支 `dev/kyle/flydsl_grp_gemm`）。
+- 除非用户指定别的路径，先 `cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo`。
+- 本机多 repo 根是 `/workspace/code/gpt_oss_docker/sync`，但目前**只有 Primus-Turbo**。
+- 改 flydsl kernel（.py）后 `rm -rf /root/.flydsl/cache` 再跑；改 cpp 才需重装 primus_turbo。
 
-## /workspace/code 下的子目录
+## 本机的 repo 目录
 
 ```
-/workspace/code/
-├── Primus-Turbo/      # FP8 grouped GEMM 优化主工作目录（dev/kyle_hipkitten_bf16）
-├── HipKittens/         # kernel 侧（save/fp8-progress-20260319-native-layouts）
-├── code2/              # 历史/参考
-├── triton/             # 参考
-└── .codex/             # 工具元数据
+/workspace/code/gpt_oss_docker/sync/
+└── Primus-Turbo/      # FP8 grouped GEMM 优化主工作目录（git 分支 dev/kyle/flydsl_grp_gemm）
 ```
 
-`Primus-Turbo` 和 `HipKittens` 是用户的活跃工作目录，**总是有未提交修改和未跟踪的 probe 脚本/分析笔记**（这是常态，不是问题）。
+> **未同步到本机的 repo**（原远程 `/workspace/code` 下有，本机没有）：HipKittens、FlyDSL、code2、triton 等。涉及这些 repo 的步骤本机无法执行。
 
-## 远程跑命令前的 checklist（自动化场景）
+`Primus-Turbo` 是活跃工作目录，**总是有未提交修改和未跟踪的 probe 脚本/分析笔记**（这是常态，不是问题）。
 
-1. 涉及代码修改 → 改本地，`sync.sh push <repo> [path]` 推上去（参见 remote-sync skill）。
-2. 涉及读 log / 已有产物 → **优先**读本地 `/wekafs/kyle/code2/remote_sync/<repo>/auto_optimize_logs/`（如果已 sync 过来），不要无谓地 ssh。
+## 跑命令前的 checklist
+
+1. 涉及代码修改 → 本地直接改、本地直接 git，无需推送。
+2. 涉及读 log / 已有产物 → 直接读本地 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo/auto_optimize_logs/`。
 3. 长任务 → Bash 工具 `run_in_background: true`，输出写到 `/tmp/<name>.log` 或 `auto_optimize_logs/`。
-4. 短查询（`nvidia-smi`、`rocm-smi`、`docker ps`、`hostname`、查容器进程等） → 直接 ssh，不要前置 sync。
+4. 短查询（`rocm-smi`、`hostname` 等）→ 本地直接跑（本机为 docker 容器，无 GPU / 无 docker CLI，GPU 类命令本机不可用）。
 
-## 故障排查
+## 故障排查（本地）
 
 | 症状 | 排查 |
 |---|---|
-| ssh 卡住 | `ssh -v login_node2 'hostname'` 看是否到跳板机；再 `ssh -v compute_node_new 'hostname'` 看 ProxyJump 是否成功。 |
-| `docker exec` 报 `No such container` | `ssh compute_node_new 'docker ps -a --filter name=mlperf_gptoss'` 看是 stopped 还是真没了。**不要擅自 docker run 一个新的** —— 镜像、挂载、env 都可能不对。**先停下来问用户**。 |
-| 容器内 `python: command not found` | 没用 `bash -lc`。改成 `bash -lc "..."`。 |
-| compute 节点 host key 变了 | 节点被重装的可能。**不要默默 accept**，告诉用户确认。 |
-| `ImportError: cannot import name '_compile_dense_tn'` | flydsl 没装 → `pip install -e /workspace/code/FlyDSL`（见 claim §5.5）。 |
-| `import primus_turbo.pytorch` 报 `undefined symbol ...hk_gemm_bf16` | HK dense binding 引用了缺失的 .cu；HK 后端已移除，按 claim §5.5 末尾清掉残留 + 重 build。 |
-| ROCm/HIP 报错 | 先 `rocm-smi` / `rocminfo` 验证 GPU 可见性 + 容器有 `--device=/dev/kfd --device=/dev/dri` 挂载（用 `docker inspect` 看）。 |
-| 同节点其他用户在跑 | `ssh compute_node_new 'docker ps && rocm-smi --showpidgpus'` —— 如果 GPU 被占满，告诉用户，不要无脑跑。 |
-| 文件推上去容器看不到 | 检查 rsync 目标是不是 host 路径 `/mnt/vast/kyle/code2/<repo>/...`，**不是**容器内路径 `/workspace/code/...`。 |
+| `ImportError: cannot import name '_compile_dense_tn'` | flydsl 没装。**本机 FlyDSL 未同步**，无法 `pip install -e`，需先把 FlyDSL 同步到本机或问用户。 |
+| `import primus_turbo.pytorch` 报 `undefined symbol ...hk_gemm_bf16` | HK dense binding 引用了缺失的 .cu；HK 后端已移除，清掉残留 + 重 build。 |
+| flydsl kernel 改了不生效 | `rm -rf /root/.flydsl/cache` 再跑。 |
+| ROCm/HIP 报错 | 本机为 docker 容器、**无 GPU**，GPU 类命令（`rocm-smi` / `rocminfo`）本机不可用；这类报错说明该步骤需在带 GPU 的机器上跑。 |

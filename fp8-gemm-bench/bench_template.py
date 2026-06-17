@@ -8,20 +8,23 @@
 - HIP_VISIBLE_DEVICES=<free_gpu> on rocm-smi-verified idle GPU
 - set_auto_tune(False)
 
-跑法：
-  docker exec -e HIP_VISIBLE_DEVICES=2 mlperf_gptoss bash -lc '
-    cd /workspace/code/Primus-Turbo
-    PYTHONPATH=/workspace/code/Primus-Turbo:$PYTHONPATH python3 bench_template.py
-  '
+跑法（本机已本地化，本地直接跑，无 ssh / 无 docker）：
+  cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo
+  PYTHONPATH=/workspace/code/gpt_oss_docker/sync/Primus-Turbo:$PYTHONPATH \
+    HIP_VISIBLE_DEVICES=2 python3 bench_template.py
 
 修改 shapes / 切换 layout 在文件下半部分.
 """
 import os, sys, statistics
-sys.path.insert(0, "/workspace/code/Primus-Turbo")
+sys.path.insert(0, "/workspace/code/gpt_oss_docker/sync/Primus-Turbo")
 import torch
-torch.ops.load_library("/workspace/code/Primus-Turbo/primus_turbo/lib/libprimus_turbo_kernels.so")
+# 注意：本机为精简源码同步，未含 build 产物 .so（同步时排除了 build 产物），
+# 下面 load 的 libprimus_turbo_kernels.so 与 primus_turbo/pytorch/{ver} 可能不存在。
+# 需要 bench 须先在本地 build：
+#   cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && MAX_JOBS=64 python setup.py build_ext --inplace
+torch.ops.load_library("/workspace/code/gpt_oss_docker/sync/Primus-Turbo/primus_turbo/lib/libprimus_turbo_kernels.so")
 _pyver = f"_C.cpython-{sys.version_info.major}{sys.version_info.minor}-x86_64-linux-gnu.so"
-torch.ops.load_library(f"/workspace/code/Primus-Turbo/primus_turbo/pytorch/{_pyver}")
+torch.ops.load_library(f"/workspace/code/gpt_oss_docker/sync/Primus-Turbo/primus_turbo/pytorch/{_pyver}")
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
