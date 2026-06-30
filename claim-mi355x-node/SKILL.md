@@ -99,7 +99,9 @@ ssh login_node2 'ssh -o ConnectTimeout=15 chiXXXX "hostname && whoami"'
 # 要么先做下面的 config 更新，再用别名测：ssh compute_node_new 'hostname'
 ```
 
-> **立刻**改 `~/.ssh/config` 里 `compute_node_new` 的 `HostName` 指向新节点 —— 这是节点的 single source of truth，`ssh compute_node_new` 和 `sync.sh`（用此别名）都靠它。当前 = `chi2811`（2026-06-11，从 chi2832 迁出 —— chi2832 被别人的 `sglang` 推理服务器 TP=8 占满 8 卡 100%/各 230GB VRAM 真算,污染 benchmark。chi2811 当时 slurm idle / 0 GPU 进程 / 305G 空闲盘；从保存镜像 `mlperf_gptoss:saved-20260610` 恢复,开箱即用)。**永远避开 yanyuqin 的 hold**`compute_node_new` 用 `ProxyJump login_node2`，所以本机直连才能通。改完 `ssh compute_node_new 'hostname'` 应回 chiXXXX。
+> 节点的 single source of truth：本机走 `sync/.ssh-chi.sh root@chiXXXX`（脚本通用，host 作参数；只硬编跳板机 149.28.124.225），没有 `~/.ssh/config` 别名。当前 = `chi2810`（2026-06-30，从 chi2774 迁出 —— chi2774 在 sinfo 转 `down` 被 drain，容器被反复 reap/调度作业秒删，弃用）。chi2810：sinfo `down` 但实测 **8 卡全空(各 283MB/0 pid)**、aac 共享盘 `/mnt/vast/kyle/code2` 已挂(与 chi2774 同源,代码/tar 无缝可见)、docker 盘清理后 ~94G 空(清理详见下)。**注意**:chi2810 上有别人两个在跑的容器 `pdval-vllm`(Up21h)/`dlrmv3-e2e723`(Up3d)(当前不占 GPU,别动);它是 `down` 节点,可能随时被作业接管,长任务前先 `amd-smi`/`rocm-smi` 复查。历史:chi2774(2026-06-22 从 chi2811)、chi2811(2026-06-11 从 chi2832)。**永远避开 yanyuqin 的 hold**。
+>
+> **2026-06-30 换节点踩坑**：集群多数 mi355x `down*`(维护);`alloc` 节点(chi2761/2762/2811)被别人 `yambda` 容器占 ~200G VRAM(idle-waiting,GPU-pid=0,但显存锁住) 且 **docker 盘满**(13-27G free,装不下 87.4G 镜像,满盘全是别人镜像不能删);**chi2761 根本路由不到 aac NFS 服务器(10.2.123.177 No route to host)**→ 没代码没 tar,弃。最终可用的是 `down` 但实际空的 chi2810/chi2879(都挂 aac、GPU 全空)。**清 docker 盘只清"未被任何容器引用"的镜像**:`docker image prune -a -f` + `docker builder prune -f`(不碰运行/停止容器及其镜像) → chi2810 由此腾出 ~107G。
 
 ### 4. 起 mlperf_gptoss 容器
 
@@ -108,14 +110,15 @@ ssh login_node2 'ssh -o ConnectTimeout=15 chiXXXX "hostname && whoami"'
 已把配好环境的容器（triton 3.7 + flydsl/primus_turbo editable + 全部依赖）commit 并导出到集群共享盘。
 **任何节点直接 load + run 即可，不用再升 triton、不用重装 flydsl/primus_turbo。**
 
-- 保存的镜像 tar：`/mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260610.tar.zst`（zstd 压缩，`/mnt/vast` 全集群同源，每个节点都看得到）
-- 镜像 tag：`mlperf_gptoss:saved-20260610`
+- **最新保存镜像 tar（2026-06-25，用这个）**：`/mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260625b.tar.zst`（21G 压缩 / **87.4G 解压**，triton3.7 + flydsl/primus_turbo(含 tensorwise venv `/opt/venv-tw`)，`/mnt/vast`=aac 共享盘每节点同源可见）
+- 镜像 tag：`mlperf_gptoss:saved-20260625b`（旧 `saved-20260622`/`saved-20260610` tar 仍在，别用）
+- ⚠️ **解压 87.4G**：load 前确认 `df -h /var/lib/docker` 有 **>90G 空闲**（90G 都不够,实测 90G 会中途 no-space）。不够就 `docker image prune -a -f`(只删未被任何容器引用的镜像,不碰别人在跑的容器)。
 
 ```bash
 TARGET=chiXXXX
-# (a) 该节点若还没有这个镜像，先 load（~70GB，zstd 解压，几分钟）
-ssh $TARGET 'docker images | grep -q "mlperf_gptoss.*saved-20260610" \
-  || zstd -dc /mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260610.tar.zst | docker load'
+# (a) 该节点若还没有这个镜像，先 load（~87GB 解压，几分钟；docker 盘需 >90G 空闲，先 df -h /var/lib/docker）
+ssh $TARGET 'docker images | grep -q "mlperf_gptoss.*saved-20260625b" \
+  || zstd -dc /mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260625b.tar.zst | docker load'
 # (b) 用保存的镜像起容器（flag 与下方固定版本一致，只把 image 换成保存的 tag）
 ssh $TARGET 'docker run -d \
   --name=mlperf_gptoss \
@@ -124,7 +127,7 @@ ssh $TARGET 'docker run -d \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   --shm-size=64G \
   -v /mnt/vast/kyle/code2:/workspace/code \
-  mlperf_gptoss:saved-20260610 sleep infinity'
+  mlperf_gptoss:saved-20260625b sleep infinity'
 ```
 
 - editable 安装（flydsl/primus_turbo）的 python 指针在镜像 rootfs 里，源码 + build 产物（`build-fly/`、`_C*.so`）在 bind mount `/mnt/vast/kyle/code2` 上，两者一拼就直接 `import flydsl` / `import primus_turbo.pytorch` 可用 → **§5、§5.5 全跳过**，直接去 §6 验证。

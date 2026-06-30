@@ -35,8 +35,8 @@ cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && HIP_VISIBLE_DEVICES=6 pyt
 ```
 本地 (/wekafs/kyle)              ┐
   └─ ssh login_node2             │  149.28.124.225, root（跳板机）
-       └─ ssh compute_node_new   │  chi2811 (见 ~/.ssh/config, 是 SoT), root, ProxyJump=login_node2
-            └─ docker exec mlperf_gptoss   ── 镜像: mlperf_gptoss:saved-20260610 (常驻)
+       └─ ssh compute_node_new   │  chi2810 (2026-06-30 从 chi2774 迁出; 用 .ssh-chi.sh root@chi2810), root, ProxyJump=login_node2
+            └─ docker exec mlperf_gptoss   ── 镜像: mlperf_gptoss:saved-20260625b (常驻; 8 卡当前全空,长任务前 rocm-smi 复查)
                  └─ /workspace/code        ── 默认 cwd
                       ↑
                       └── host bind mount: /mnt/vast/kyle/code2
@@ -46,18 +46,18 @@ cd /workspace/code/gpt_oss_docker/sync/Primus-Turbo && HIP_VISIBLE_DEVICES=6 pyt
 - 容器是常驻的（`docker exec` 而不是 `docker run`），写入文件下次还在。
 - Host 路径 `/mnt/vast/kyle/code2` 是 `/workspace/code` 的 bind mount —— rsync 直接走 host 路径就行，参见 `../remote-sync/SKILL.md`。
 
-### 远程环境（已确认 2026-06-11，节点 chi2811）
+### 远程环境（已确认 2026-06-30，节点 chi2810）
 
 | 项 | 值 |
 |---|---|
-| 主机名 | `chi2811`（容器内外一致；当前节点以 ssh config 为准） |
+| 主机名 | `chi2810`（容器内外一致；2026-06-30 从 chi2774 迁出，chi2774 转 down 被 drain。chi2810 8 卡当前全空，但有别人 idle 容器 pdval-vllm/dlrmv3，长任务前 rocm-smi 复查） |
 | OS | Linux（容器内 Ubuntu/Debian 系，`/.dockerenv` 存在） |
 | GPU | 8 × AMD Instinct MI355X |
-| Python | 3.12.3 @ `/opt/venv/bin/python`（无须 activate venv，PATH 已就位） |
-| PyTorch | `2.10.0a0+git449b176`，HIP 可用 |
-| Triton | 升级到 `3.7.0`（fresh 容器默认 3.6，claim 时升级） |
-| 镜像 | `rocm/primus:v26.2` |
-| 同节点其他容器 | `mlperf_gptoss2`（别人的，**不要碰**） |
+| Python | 3.12.3；tensorwise venv `/opt/venv-tw/bin/python`（mxfp4 用 `/opt/venv`），saved 镜像已就位无须 activate |
+| PyTorch | `2.10.0`，HIP 可用 |
+| Triton | `3.7.0`（saved 镜像已含） |
+| 镜像 | `mlperf_gptoss:saved-20260625b`（从 tar load，triton3.7 + flydsl/primus_turbo 开箱即用） |
+| 同节点其他容器 | chi2810 上 `pdval-vllm`/`dlrmv3-e2e723`（别人在跑的，**不要碰**） |
 | 外网 | **无**（远程不能 pip install / git clone / curl 外部资源；这是硬约束，编辑必须在本地，参见 remote-sync skill） |
 
 ### FlyDSL / primus_turbo 从源码安装（fresh 容器一次性 setup）

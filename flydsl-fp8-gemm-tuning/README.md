@@ -1,6 +1,6 @@
 # FlyDSL fp8 GEMM 调优经验集
 
-节点 chi2832 / chi2811（gfx950 / MI355X），容器 mlperf_gptoss，rocm 7.2。
+节点 **chi2810**（2026-06-30 当前；历史 chi2774/chi2832/chi2811），gfx950 / MI355X，容器 mlperf_gptoss（镜像 saved-20260625b），rocm 7.2。chi2810 8 卡当前全空（别人 idle 容器 pdval-vllm/dlrmv3，长任务前 rocm-smi 复查）。连接 `sync/.ssh-chi.sh root@chi2810`。
 
 ## 文件索引
 

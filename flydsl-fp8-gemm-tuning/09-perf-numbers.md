@@ -1,6 +1,7 @@
 # 性能数据
 
-节点 chi2811/chi2832，gfx950 / MI355X，容器 mlperf_gptoss，GPU6（单卡稳态）。
+节点 chi2811/chi2832/chi2774（历史；2026-06-30 起当前 = **chi2810**，8 卡当前全空），gfx950 / MI355X，容器 mlperf_gptoss，单卡稳态。
+⚠️ 旧绝对 TFLOPS 多在被争用的节点测的，仅 ratio 趋势可信；干净节点重测见 [[project-flydsl-fwd-opt-baseline]]。
 
 ## vs Triton（kernel 级，B=8 balanced，12 MoE shape geomean）
 
