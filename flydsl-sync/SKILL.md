@@ -5,6 +5,8 @@ description: FlyDSL 仓库(standalone,含 turbo/ fp8 4wave/8wave dense GEMM、ke
 
 # flydsl-sync
 
+> ⚠️ **2026-07-03：当前节点 = chi2811（不是 chi2810）**，chi2810 被别人任务占满 GPU，见 claim-mi355x-node 的换节点记录。下文命令示例里的 `chi2810` 用前先替换成 `chi2811`（或查 claim-mi355x-node 确认最新节点）。
+>
 > FlyDSL kernel 是 GPU kernel,**编译(flyc.compile)就要 GPU** → 不能像 Primus-Turbo 那样纯本地跑。所以 FlyDSL 是 **远端为主**:在远端 chi2810 编译/测/commit,再把 git+文件 rsync 回本地对齐。
 
 ## 拓扑 / 位置

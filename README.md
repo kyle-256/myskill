@@ -1,11 +1,11 @@
 # myskill
 
-`/wekafs/kyle` 下的 skill 集合。每个 skill 一个子目录，里面放一个 `SKILL.md`。
+`/workspace/code/gpt_oss_docker/myskill` 下的 skill 集合。每个 skill 一个子目录，里面放一个 `SKILL.md`。
 
 ## 目录结构
 
 ```
-/wekafs/kyle/myskill/
+/workspace/code/gpt_oss_docker/myskill/
 ├── README.md                          # 本文件
 └── <skill-name>/
     └── SKILL.md                        # 必需：带 frontmatter 的说明
@@ -35,17 +35,18 @@ description: 一句话说清楚什么时候用、做什么。Claude 靠这行决
 - [`global-permissions/`](global-permissions/SKILL.md) —— 把 permissions allow 规则合并写入 `~/.claude/settings.json`，所有项目共享免确认（Bash/Read/Write/Edit/Skill/Glob/Grep/WebFetch/WebSearch）。
 - [`claim-mi355x-node/`](claim-mi355x-node/SKILL.md) —— 原 mi355x 节点不可用时，经 login_node2 找一台 GPU 真闲的 compute 节点（sinfo/squeue + rocm-smi 巡检）、种公钥、起 `mlperf_gptoss` 容器（rocm/primus:v26.2，挂 /mnt/shared/kyle/code2）。
 - [`flydsl-fp8-gemm-tuning/`](flydsl-fp8-gemm-tuning/SKILL.md) —— FlyDSL fp8 dense GEMM (TN/NN/NT) 在 gfx950 提速：profile→定位瓶颈的诊断框架、按 shape regime 选 lever（big-K = both-path-J drain removal，big-N = 2D L2 band swizzle）、已穷尽的死路清单、det=0 红线验证、gfx950 fp8 硬约束。**新增 `01~09` grouped GEMM 经验**（2026-06-17）：三 kernel 架构（fwd NT/dgrad NN/wgrad TN）、非持久 nt8w/nn8w、小-M bm128 M-branch、wgrad skew band-cyclic 修复、per-group M_g gate、i64 SRD rebase 全套、autotune 设计、benchmark 方法论、死路全表、性能数据（fly/Triton 1.14~1.91×，fly/GB200 fwd 1.80× bwd 1.36×）。
-- [`mxfp4-4wave-optim/`](mxfp4-4wave-optim/README.md) —— gfx950 mxfp4 4-wave dense GEMM 调优全知识（prod 5401 med det0，aiter 对标 98%）：race 根因=cross-wave barrier(非vmcnt)、SCVGPR+1BAR=0+GAVOID+MMORD5 关键路径、96-ds_read/256mfma 物理瓶颈、全死路清单+根因、ISA 分析、benchmark 工具。Kyle 2026-06-17。
+- [`flydsl-fp8-gemm-results/`](flydsl-fp8-gemm-results/SKILL.md) —— Primus-Turbo(tensorwise) FlyDSL fp8 **dense + grouped GEMM 的 MI355X 生产实测基线**(TFLOPS/SNR)+ 复现方法。走公开 wrapper 的 per-shape autotune（= 生产实际选中 kernel）。dense(Llama 7B/70B) 稳态 ~2200–3150 TF；**grouped 用真实 MoE 模型 shape(deepseek-v3/qwen235b/gpt-oss, G=8, m=2048/4096) ~1800–2730 TF**，**4-wave 的价值集中在 wgrad(var_k) +6~17%**，fwd/dgrad 与 8-wave-persistent 打平。探针 `_d_dense_bench.py`/`_g_models2.py`。2026-07-01 GPU4。
+- [`mxfp4-4wave-optim/`](mxfp4-4wave-optim/README.md) —— gfx950 mxfp4 4-wave dense GEMM 全知识。**当前出货后端 = Primus-Turbo `mxfp4_gemm_kernel.py`(env 全 hardcode + timed autotune 四轴：swizzle/deep-wl/COOP+TACCW/ksplit)，见 `13-primus-turbo-prod.md`**：2026-07-02 rebase-onto-main + squash(单 commit `74eaadac`) + pr-merge-gate 清理(-233 行)，复现走 `pytest test_gemm_fp4.py`(141 passed)。`01-12` 是 FlyDSL standalone(`turbo/mxfp4_gemm_4wave.py` + `FP4_*` env)的调优史/根因(prod 5401 med det0、aiter 98%、Llama fwd fly/aiter geomean≈0.995)：race 根因=cross-wave barrier(非vmcnt)、SCVGPR+1BAR=0+GAVOID+MMORD5 关键路径、96-ds_read/256mfma 物理瓶颈、全死路+ISA+benchmark。Kyle 2026-06-17 起，2026-07-02 迁生产。
 
 ## 加新 skill
 
 ```bash
-mkdir /wekafs/kyle/myskill/<新名字>
-$EDITOR /wekafs/kyle/myskill/<新名字>/SKILL.md
+mkdir /workspace/code/gpt_oss_docker/myskill/<新名字>
+$EDITOR /workspace/code/gpt_oss_docker/myskill/<新名字>/SKILL.md
 ```
 
 写完之后告诉 Claude 一声，让它在 memory 里加一条指向新 skill 的索引。
 
 ## 为什么不放在 ~/.claude/skills/
 
-放这里是为了跟项目走、能进 git、好分享。代价是 Claude Code 的 `/skill` 菜单不会自动列出来 —— 不过 `/wekafs/kyle` 的 memory 里有索引，进入这个目录的会话会自动加载，效果一样。
+放这里是为了跟项目走、能进 git、好分享（工作区规则也要求 skill 落在 `/workspace/code/gpt_oss_docker/myskill/<skill-name>/SKILL.md`）。代价是 Claude 的 `/skill` 菜单不会自动列出来 —— 不过工作区的 memory 里有索引，进入这个目录的会话会自动加载，效果一样。

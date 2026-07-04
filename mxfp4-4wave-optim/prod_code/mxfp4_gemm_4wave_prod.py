@@ -3,6 +3,11 @@
 
 """MXFP4 dense GEMM — 4-wave (2x2), whole-loop bare-asm INPLACE-DIAG（prod 精简版）。
 
+⚠️ 历史快照：这是 **FlyDSL standalone**(`turbo/mxfp4_gemm_4wave.py` + `FP4_*` env)的 prod 路径
+精简快照，仅供调优史参考。**当前出货后端已迁到 Primus-Turbo `primus_turbo/flydsl/gemm/
+mxfp4_gemm_kernel.py`(env 全 hardcode + timed autotune)——见 ../13-primus-turbo-prod.md**。
+本文件的 import(`turbo.*`/`kernels.fp8_gemm_utils`)是 standalone 仓布局，不适用于 Primus-Turbo。
+
 完整版（含所有实验性分支）见 turbo/mxfp4_gemm_4wave.py。
 本文件只保留 prod 路径：ASMMFMA=6（whole-loop hw-loop）+ SC_VGPR=1（scale 直读 VGPR）。
 

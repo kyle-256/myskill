@@ -1,6 +1,6 @@
 ---
 name: remote-sync
-description: 管理两份 Primus-Turbo（"turbo"）的本地镜像 + 远程 docker 布局（当前节点 chi2810，以 claim-mi355x-node 为准）。mxfp4 与 tensorwise 各一份，各自独立 venv。当用户要"修改/编辑/运行 turbo 代码""同步到远程""在 GPU 上跑 turbo"时使用。注意：turbo = Primus-Turbo，和 FlyDSL 无关。
+description: 管理两份 Primus-Turbo（"turbo"）的本地镜像 + 远程 docker 布局（当前节点 chi2811，以 claim-mi355x-node 为准）。mxfp4 与 tensorwise 各一份，各自独立 venv。当用户要"修改/编辑/运行 turbo 代码""同步到远程""在 GPU 上跑 turbo"时使用。注意：turbo = Primus-Turbo，和 FlyDSL 无关。
 ---
 
 > ⚠️ **现在有两份 turbo（Primus-Turbo）并存**，各自独立 venv：
@@ -9,9 +9,11 @@ description: 管理两份 Primus-Turbo（"turbo"）的本地镜像 + 远程 dock
 >
 > **turbo = Primus-Turbo**（origin `https://github.com/AMD-AGI/Primus-Turbo.git`），**与 FlyDSL 无关**。
 
+> ⚠️ **2026-07-03 节点从 chi2810 切到 chi2811**：chi2810 被别人的 SGLang 服务（`rail-probe`/`xb_sglang`）8 卡全占（100% use），且当时 root 盘一度被我们自己的 `docker commit`/`save` 挤到 0 free（已清理，现在 chi2810 上 `mlperf_gptoss` 容器仍在、镜像已更新到 `saved-20260703`，但 GPU 不可用，别去这台跑东西）。chi2811 经 `sinfo`/`squeue`/`rocm-smi --showpids` 三重核实后确认真正空闲（8 卡 0% use、0 pid），已种公钥 + 从共享盘 tar 恢复容器，`/mnt/vast/kyle/code2` 同源可见（含 tensorwise 3buf 改动，md5 与本地一致）。**当前活跃节点 = chi2811**，下方所有命令已更新指向它；chi2810 的操作示例仅供参考，用前先用 claim-mi355x-node §2 的方法重新核实。
+
 # remote-sync
 
-工作模型：**本地编辑（无 GPU）→ rsync 推到 chi2810 容器 → 用对应 venv 在 GPU 上跑**。每份 turbo 有独立的远程目录 + 独立 venv，互不污染。
+工作模型：**本地编辑（无 GPU）→ rsync 推到 chi2811 容器 → 用对应 venv 在 GPU 上跑**。每份 turbo 有独立的远程目录 + 独立 venv，互不污染。
 
 ## 布局对照表
 
@@ -25,7 +27,7 @@ description: 管理两份 Primus-Turbo（"turbo"）的本地镜像 + 远程 dock
 | editable 指向 | `…/Primus-Turbo/primus_turbo` | `…/Primus-Turbo-tensorwise/primus_turbo` |
 
 - host `/mnt/vast/kyle/code2` 整目录 bind-mount 到容器 `/workspace/code`（所以 host 路径去掉 `/mnt/vast/kyle/code2` 换成 `/workspace/code` 即容器路径）。
-- 远程容器名：`mlperf_gptoss`。chi2810 经跳板机连（见 `.ssh-chi.sh`）。
+- 远程容器名：`mlperf_gptoss`。chi2811 经跳板机连（见 `.ssh-chi.sh`）。
 - 本地 `.git` 完整保留（canonical git 在本地）；远程**不需要** `.git` 即可 import/build（rsync 排除了 `.git`，远程 build_info 的 commit 会显示 `unknown`，纯装饰）。
 
 ## 在 GPU 上运行（选对 venv！）
@@ -33,10 +35,10 @@ description: 管理两份 Primus-Turbo（"turbo"）的本地镜像 + 远程 dock
 ```bash
 cd /workspace/code/gpt_oss_docker/sync
 # mxfp4
-./.ssh-chi.sh root@chi2810 "docker exec -e HIP_VISIBLE_DEVICES=7 mlperf_gptoss bash -lc \
+./.ssh-chi.sh root@chi2811 "docker exec -e HIP_VISIBLE_DEVICES=7 mlperf_gptoss bash -lc \
   'cd /workspace/code/Primus-Turbo && /opt/venv/bin/python <script>'"
 # tensorwise
-./.ssh-chi.sh root@chi2810 "docker exec -e HIP_VISIBLE_DEVICES=7 mlperf_gptoss bash -lc \
+./.ssh-chi.sh root@chi2811 "docker exec -e HIP_VISIBLE_DEVICES=7 mlperf_gptoss bash -lc \
   'cd /workspace/code/Primus-Turbo-tensorwise && /opt/venv-tw/bin/python <script>'"
 ```
 
@@ -47,21 +49,21 @@ cd /workspace/code/gpt_oss_docker/sync
 /opt/venv-tw/bin/python -c "import primus_turbo; print(primus_turbo.__file__)"  # → …/Primus-Turbo-tensorwise/…
 ```
 
-## rsync 同步（本地 ↔ chi2810）
+## rsync 同步（本地 ↔ chi2811）
 
-`-e "$PWD/.ssh-chi.sh"` 用 rsync transport 包装（连 chi2810），`--exclude-from=.rsync-exclude` 排除 `.git`/`*.so`/build/venv 等。**必须从 `sync/` 目录跑**（`$PWD` 解析正确）。注意 trailing `/`（同步目录内容）。
+`-e "$PWD/.ssh-chi.sh"` 用 rsync transport 包装（连 chi2811），`--exclude-from=.rsync-exclude` 排除 `.git`/`*.so`/build/venv 等。**必须从 `sync/` 目录跑**（`$PWD` 解析正确）。注意 trailing `/`（同步目录内容）。
 
 ```bash
 cd /workspace/code/gpt_oss_docker/sync
 
 # 推（本地 → 远程，跑测前同步代码）—— mxfp4
 rsync -azh --exclude-from=.rsync-exclude -e "$PWD/.ssh-chi.sh" \
-  "$PWD/mxfp4/Primus-Turbo/" root@chi2810:/mnt/vast/kyle/code2/Primus-Turbo/
+  "$PWD/mxfp4/Primus-Turbo/" root@chi2811:/mnt/vast/kyle/code2/Primus-Turbo/
 # 推 —— tensorwise
 rsync -azh --exclude-from=.rsync-exclude -e "$PWD/.ssh-chi.sh" \
-  "$PWD/tensorwise/Primus-Turbo/" root@chi2810:/mnt/vast/kyle/code2/Primus-Turbo-tensorwise/
+  "$PWD/tensorwise/Primus-Turbo/" root@chi2811:/mnt/vast/kyle/code2/Primus-Turbo-tensorwise/
 
-# 拉（远程 → 本地，从 chi2810 取最新）—— 把上面 src/dst 对调即可
+# 拉（远程 → 本地，从 chi2811 取最新）—— 把上面 src/dst 对调即可
 ```
 
 校验对齐：`md5sum <file>` 本地 vs 远程相等即同步（`.so`/build 产物只在远程，属正常差异）。
@@ -106,7 +108,7 @@ sed -i "s#/workspace/code/Primus-Turbo/#/workspace/code/Primus-Turbo-tensorwise/
 
 ## 新建 / 重建一份 turbo 的完整流程
 
-1. **本地 clone + checkout 分支**（chi2810 容器无 github 凭证，分支必须从**本机**用 SSH key fetch）：
+1. **本地 clone + checkout 分支**（chi2811 容器无 github 凭证，分支必须从**本机**用 SSH key fetch）：
    ```bash
    cd /workspace/code/gpt_oss_docker/sync/<folder>
    git clone --no-recurse-submodules /…/sync/mxfp4/Primus-Turbo Primus-Turbo   # 复用本地对象，快
@@ -134,7 +136,7 @@ sed -i "s#/workspace/code/Primus-Turbo/#/workspace/code/Primus-Turbo-tensorwise/
 
 要改 → 编辑 `/workspace/code/gpt_oss_docker/sync/.rsync-exclude`。
 
-## Git push（用本机 SSH key，chi2810 容器无凭证）
+## Git push（用本机 SSH key，chi2811 容器无凭证）
 
 origin 是 HTTPS（`AMD-AGI/Primus-Turbo`），本机/容器都无 GitHub HTTPS 凭证。push 用本机的 jump-host SSH key（`/workspace/code/.ssh_docker/id_ed25519`，认证 kyle-256）：
 
@@ -179,18 +181,20 @@ umount /var/lib/docker/tmp && rm -rf /mnt/vast/kyle/code2/docker_tmp        # �
 ```
 注意：`docker save | zstd` 管道退出码取的是 zstd 的，docker save 报错走 stderr 易被误判成功 → 用 `${PIPESTATUS[0]}_${PIPESTATUS[1]}` 或 `zstd -t` 核实。`mlperf_gptoss2` 是另一独立容器/镜像，别动。
 
+**2026-07-03 实测（chi2810）：根盘余量比"~30G"更紧张，可能到个位数 GB**——commit 前只剩 7GB，`docker commit` 一步就吃掉 ~5.2GB 降到 1.8GB；umount 暂存目录后一度显示 `Avail=0`（其他人的具名镜像不能删，214G"可回收"空间全是别人的）。**流程仍然安全**（commit/save 本身没失败，只是走得非常紧），但**commit 前务必先 `df -h /`，<10GB 时要有心理准备可能需要先重建容器换新镜像+删旧镜像才能拿回空间**（见上面"删旧镜像前必须重建容器"）。最新 tar：`mlperf_gptoss-20260703.tar.zst`（20.3G 压缩 / 93G 解压，镜像 tag `mlperf_gptoss:saved-20260703`），已在 chi2810、chi2811 两台验证过 load+run+import 正常。
+
 ## 测试 / 验证两个环境（2026-06-25 实测）
 
 各环境用**自己的 venv** 跑 pytest，挑空闲 GPU（`rocm-smi --showmeminfo vram`，找 Used ~300MB 的卡），MI355X = gfx950。
 
 ```bash
 # mxfp4（代表性：fp4 dense gemm）
-./.ssh-chi.sh root@chi2810 "docker exec -e HIP_VISIBLE_DEVICES=6 mlperf_gptoss bash -lc \
+./.ssh-chi.sh root@chi2811 "docker exec -e HIP_VISIBLE_DEVICES=6 mlperf_gptoss bash -lc \
   'cd /workspace/code/Primus-Turbo && /opt/venv/bin/python -u -m pytest tests/pytorch/ops/test_gemm_fp4.py -q -p no:cacheprovider'"
 # → 实测 133 passed, 0 failed（~34s）
 
 # tensorwise（FlyDSL grouped gemm 后端）
-./.ssh-chi.sh root@chi2810 "docker exec -e HIP_VISIBLE_DEVICES=5 mlperf_gptoss bash -lc \
+./.ssh-chi.sh root@chi2811 "docker exec -e HIP_VISIBLE_DEVICES=5 mlperf_gptoss bash -lc \
   'cd /workspace/code/Primus-Turbo-tensorwise && /opt/venv-tw/bin/python -u -m pytest \
    tests/pytorch/ops/test_grouped_gemm_fp8.py -k FLYDSL -x --tb=long -q -p no:cacheprovider'"
 ```
@@ -228,7 +232,7 @@ GIT_SSH_COMMAND="ssh -i /workspace/code/.ssh_docker/id_ed25519 ..." \
 
 **致命坑（2026-06-25 踩过）：本地 `sync/FlyDSL` 比远程容器 `/workspace/code/FlyDSL` 旧** → 照本地 vendor 会搬到**补丁前**版本。具体：fp8 4wave 的 AGPR 提速（ROCm/FlyDSL **PR #714**，`Mfma16x16x128AGPR` inline-asm `=a,v,v,0` 把 f32x4 累加器钉 AGPR、消 `v_accvgpr_mov`+`s_nop`，+5~13%）只在远程的 `kernels/fp8_gemm_4wave.py`，本地 fork 分支 `dev/fp8-fused-quant` 的 `kernels/` 没有。表现为移植版慢 ~15%。
 - **教训**：移植 playground kernel 前，先 `docker exec ... diff <(cat 本地) <(远程 cat)`，或直接从**远程容器**（bench 实际跑的那份）取源，别只信本地。
-- 取远程文件:host 上没有 FlyDSL（在容器内），`rsync root@host:/workspace/code/FlyDSL/...` 会 No such file。用 `./.ssh-chi.sh root@chi2810 "docker exec mlperf_gptoss cat <容器内路径>" > 本地文件` 落盘。
+- 取远程文件:host 上没有 FlyDSL（在容器内），`rsync root@host:/workspace/code/FlyDSL/...` 会 No such file。用 `./.ssh-chi.sh root@chi2811 "docker exec mlperf_gptoss cat <容器内路径>" > 本地文件` 落盘。
 
 ## 常见坑
 

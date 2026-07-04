@@ -1,5 +1,12 @@
 # Emit 旋钮全收录(成功+失败)
 
+## ⚠️ 头号陷阱:JIT-cache 不含部分 emit 旋钮 → 假阴性(2026-07-01)
+`call_mxfp4_wholeloop` 的 cache-key tuple(mxfp4_gemm_8wave.py ~L960-977)**只含部分旋钮**
+(SS_UNROLL/WLVMCN/INPLACE/PIN/PINBASE/INPLACE_*/FEWOP/NSUBFOLD... 这些换值会自动重编译)。
+**不含** `FP4_MMORD`、`FP4_SINNER`、`FP4_ACC_DIST16`、`FP4_DSRD`、block-dict 等。
+→ 扫这些"不在 key 里"的旋钮时,**不清 cache 会复用上一个已编译 kernel(stale)→ 看似无差异 → 误判**。
+**测这些旋钮必须每次 `rm -rf /root/.flydsl/cache`**。本仓早期"MMORD 变体全判负"就是此坑,实为 mm9 +3~5%(见下)。
+
 ## 基础配置(必须)
 | 旋钮 | 值 | 效果 |
 |---|---|---|
@@ -18,12 +25,17 @@
 _gavoid = int(environ.get("FP4_INPLACE_GAVOID", "0"))
 ```
 
-### FP4_MMORD=5 (+41T med, vs MMORD=3)
-2×4 block traversal(A 2行 × B 4列)→ B operand 复用 4 次 → ds_read/mfma ↓
+### FP4_MMORD=9 (blocked-diagonal 4×8) — Llama 默认新最优,+3~5% 全局
+block dict 已扩展(mxfp4_gemm_8wave.py ~L1396):
 ```
-MMORD=3: 2×2 block  MMORD=4: 4×2 block  MMORD=5: 2×4 block(最优)
+MMORD 3=2×2  4=4×2  5=2×4  6=4×4  7=2×8  8=8×4  9=4×8(默认)  10=8×8
 ```
-**注意**: MMORD=4 在某些配置下 racy(SNR 47),MMORD=6/7 racy。
+- **mm9=(bm4×bn8)** 相对**现 mm5 默认** +~2%(7b-qkv M8192 med 4117→4210,6/6 一致;其余中性),
+  SNR55.6 det0(含 odd-KI 7b-down)。⚠️ 不是"+3~5%全局"——那个数是跟 mm0(从来不是默认)比的假象,见 12 更正。
+- **部署点**:`compile_mxfp4_gemm_4w` 的 PROD `setdefault`(4wave.py L290)`MMORD:"9"`。
+  8wave.py 的 environ 默认被 PROD setdefault 遮蔽,单改它无效。
+- 老 K28672 单-shape 调优里 MMORD=5(2×4)当时最优(+41T vs mm3);6-10 是**本次重定义的新 block 码**,
+  与老笔记"6=1×8/7=4×4 racy"是不同定义(旧码已不存在)。**新 6-10 全 det0 不 racy**。
 
 ### FP4_INPLACE_ALT=0 (+27T med)
 B-side progressive traversal 配合 MMORD=5。默认 ALT=1(A-side)。
@@ -85,8 +97,9 @@ cross-bank acc 顺序杀 A-operand 复用,det race。
 ### FEWOP=1 → 5648 fast 但 SNR garbage
 用单 reg 测 operand 多样性天花板,不是真实 kernel。
 
-### MMORD=6(1×8) / MMORD=7(4×4) → racy(-250T)
-column-first 或 4×4 block 打破 DIAG both-progressive 假设 → SNR 32 race。
+### (已作废)旧 MMORD=6(1×8)/7(4×4) → racy(-250T)
+⚠️ 仅针对**旧 block 定义**。现 dict 已重定义(6=4×4,7=2×8,...,10=8×8),**新 6-10 全 det0 不 racy**。
+旧结论"column-first/4×4 打破 DIAG both-progressive → SNR32"很可能也是没清 cache 的假测,新扫全过。
 
 ### FP4_WLRING=1(4-buffer ring) → VGPR 溢出
 RING 需 4 operand buffer,超出 512 VGPR cap。
@@ -97,7 +110,7 @@ RING 需 4 operand buffer,超出 512 VGPR cap。
 ## 旋钮扫描结果对照表
 | 旋钮 | 最优值 | 范围 | 说明 |
 |---|---|---|---|
-| FP4_MMORD | 5 | 3/4/5 | 更大 block 尺寸 racy |
+| FP4_MMORD | 9(Llama)/5(K28672) | 3-10 | 6-10=新 block 码,全 det0;测前清 cache |
 | FP4_INPLACE_ELGK | 9 | 1-15 | ≥15 racy |
 | FP4_WLVMCN | 10 | 0-16 | ≥20 racy |
 | FP4_WLBARNOP | 1 | 0-8 | 更多 nop 递减收益 |

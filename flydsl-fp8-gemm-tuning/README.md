@@ -15,3 +15,4 @@
 | `07-benchmarking.md` | 正确的 benchmark 方法：rocprof 冷测、graph-replay、僵尸进程 |
 | `08-deadends.md` | 死路全表：测过无用/有害的方向，直接跳过 |
 | `09-perf-numbers.md` | 性能数据：vs Triton、vs GB200、vs HipKittens |
+| `10-grouped-wgrad-4wave-3buf.md` | 4-wave whole-loop grouped wgrad：racing-gap 精确来源、3buf 1池→2池突破（safe 打平/超 racing）、多池 vmcnt 修复、bank-冲突锁死分析 |
