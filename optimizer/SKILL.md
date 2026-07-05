@@ -62,6 +62,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 ## methodology/ — 通用优化 / debug / profiling / FlyDSL 编程
 
 - [01-optimize-loop-benchmark](methodology/01-optimize-loop-benchmark.md) — 优化主循环、robust timing、测量噪声、公平对比、性能基线 regime
+- [14-benchmark-shapes](methodology/14-benchmark-shapes.md) — **canonical 跑分 shape**：dense Llama-2 7B/70B + grouped MoE(gpt_oss-20b/Qwen3-235B/DeepSeek-V3, B=8, M∈{1024,2048,4096})
 - [02-correctness-race-cache](methodology/02-correctness-race-cache.md) — SNR/det 门控、cross-wave LDS-barrier race 诊断、长 K 非确定、JIT 缓存失效
 - [03-profiling-utilization](methodology/03-profiling-utilization.md) — ISA dump 权威、rocprofv3(kernel-trace/PMC)、regime 分类、ATT stall 根因、hotspot 分析
 - [04-occupancy-and-tile](methodology/04-occupancy-and-tile.md) — 512 寄存器共享池、LDS/SGPR limit、256×256 主 tile、小-M BM128、MFMA 数账
