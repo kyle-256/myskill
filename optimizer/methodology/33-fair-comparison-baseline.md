@@ -8,11 +8,7 @@
 - 两边用**同一套 `time_kernel`**:CUDA event + sort + **trim 20%**。
 
 ## 对比改前后必须用同一计时函数
-- grouped-gemm autotune dispatch 场景:测"改动前后差多少"反复测出**看似很大、实际非真回退**的差异,根因是两把不同的计时尺子在比。
-- 两把尺子量级不同,不可混用:
-  - 框架自带 `GK._robust_time`:**250 warmup + 5×50 iters 中位数**,基于 `torch.cuda.Event`。
-  - 随手写的 `time.perf_counter()` + 少量 warmup:测的是**绝对值,把 host 端 Python/launch 开销算进去**,和前者不是一个量级。
-- 规则:对比改前 vs 改后**直接复用 `GK._robust_time`,不要自造**计时。
+- 计时尺子必须统一(不能自造 `time.perf_counter`),否则测出假回退:见 methodology/02（计时尺子必须统一）
 
 ## kernel 移植正确性金标准(gate)
 - 同进程、同 device、同输入:原版 vs 移植版输出**逐元素比对 outdiff=0**(同源 kernel 应 bit-identical),再比 TF(应在 **±1.5%** 噪声内)。

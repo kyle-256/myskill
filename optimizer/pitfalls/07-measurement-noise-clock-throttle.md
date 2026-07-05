@@ -18,7 +18,7 @@
 
 ## autotune 一次性选型赶上坏热态
 - dispatch 只在第一次调用某 shape 时跑候选竞赛并 cache。若 sweep 按固定顺序连测多 shape，某 shape 的选型时刻恰处 GPU 刚从冷启动/低时钟回升阶段，选出的候选可能不是稳态最快的。**不是 dispatch 逻辑错**，是那次选型赶上不具代表性热力状态。
-- 短-K shape 冷/热差异 **>20%**，`warmup=10` 会 mis-pick，`warmup=250` 才稳定。**冷测短-K 是 mis-pick 高发区**。
+- warmup 长度（短-K/occ=1 的头号坑）：见 methodology/02
 
 ## bench 前 set_auto_tune(False)
 - bench 前必须 `set_auto_tune(False)`，否则每个 shape cold-start 跑一遍 autotune 污染 first-iter。

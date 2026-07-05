@@ -9,8 +9,7 @@
 ## det/race 复测协议
 - 固定量化后的输入连跑 `DETRUNS=100`(或 50K-150K)次,逐元素 bit-exact(rtol=0 atol=0)比对 run#0。
 - cross-wave LDS-barrier / SCVGPR race 表现为 run-to-run 漂移 max|d|≠0。
-- 低概率 race(0.005% 量级)需 **50K-150K iters** 才稳定可见;10K iters 看起来像 0/N(假阴性)。
-- 多 GPU 跑确认不是单卡 fluke。
+- 低概率 race 统计量级细节(10K 假阴性/需 50K-150K+ iters/多 GPU 确认)见 pitfalls/28-gfx950-vmcnt-spill-race.md「race harness」。
 
 ## 逐一排除法定位(SCVGPR/vmcnt race)
 | knob | 设置 | 结果 | 排除的假设 |

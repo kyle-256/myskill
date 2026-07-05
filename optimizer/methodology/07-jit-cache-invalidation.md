@@ -3,9 +3,7 @@
 > 类别: 方法论 · 主题标签: jit-cache, correctness-gate, isa-dump, cache-invalidation
 
 ## 金标准:验缓存是否真失效
-- 故意把 kernel 改算错(如 scale×2),**不清缓存**直接跑:
-  - 出 nan / 结果错 = 缓存正常失效,新代码生效。
-  - 仍跑出**旧的正确 SNR** = 缓存陈旧,你验的是旧内核(踩坑)。
+- 金标准验证法完整版见 pitfalls/02-flydsl-jit-cache-stale.md「金标准验证」
 
 ## disk cache 何时自动失效、何时必须手动清
 - FlyDSL JIT disk cache 在 `~/.flydsl/cache`,`FLYDSL_RUNTIME_ENABLE_CACHE` 默认 true。

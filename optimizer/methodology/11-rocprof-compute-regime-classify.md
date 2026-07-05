@@ -49,7 +49,8 @@
 - 采集:`advanced_thread_trace:true` + 单个 target CU + 跳 warmup 的 iteration range + `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`。
 - 主产物 `code.json`(per-instruction asm / source-loc / total / stall / issue cycles)。
 - **按源码行聚合 stall cycles**,按 opcode 前缀分类:VMEM-load、VMEM-wait(s_waitcnt vmcnt)、LDS/SMEM-wait(s_waitcnt lgkmcnt)、barrier(s_barrier)、MFMA/FMA(v_mfma_*)、LDS(ds_read/ds_write)。
-- 映射方向:LDS stall → bank-conflict swizzle;VMEM-wait → 更深 prefetch / async G2S;barrier → ping-pong overlap;**高 MFMA + 低 TFLOPS → 是 barrier/s_waitcnt stall,不是 scheduler 能救的**。
+- 映射方向:LDS stall → bank-conflict swizzle;VMEM-wait → 更深 prefetch / async G2S;barrier → ping-pong overlap。
+- 高MFMA低TFLOPS判据见 12-att-trace-mfma-stall。
 
 ---
 来源: flydsl-fp8-gemm-tuning/SKILL.md, gemm/overview.md, programming-model.md, tool-rocprof/SKILL.md

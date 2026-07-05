@@ -3,9 +3,8 @@
 > 类别: 方法论 · 主题标签: tracer, control-flow, authoring-pattern, code-gen
 
 ## if 分支变量不外泄 → 用普通 Python helper
-- `@flyc.kernel` 体内每个 if 分支被 AST rewriter 包成独立 fn(降为 traced conditional / scf.IfOp)。分支内定义的变量(如 `block_m`)在分支外**不可见** → 后面用会报 `NameError`。
+- if 分支内定义的变量在分支外不可见、运行时分支写法的完整规则见 pitfalls/03-flydsl-tracer-literal-if-for。
 - 纯 side-effect 的 if 可以:`if BR_B1: s_barrier()`(不外泄变量)。
-- 分支内赋值给后续使用会废。凡是 `if mode==...` 选路径、tile→CU 映射的 block helper,**必须写普通 Python 函数**——trace 时被普通 Python 调用,只构建被选中的那条路径,不进 MLIR。
 
 ## 控制流四种形态
 | 写法 | 语义 | 产物 |
@@ -20,8 +19,8 @@
 ## range_constexpr vs range 的选择(关键)
 - `range_constexpr(...)`:编译期展开的 Python 循环,用于固定内层步数(MFMA cluster、tile repeat、`sched_*` emission)。**在其内部构建 register fragment 的 list 合法,正因为循环被展开**。
 - 若把这种循环改成运行时 `scf.for` → fragment list 会被打散、数据落内存,破坏寄存器驻留。
-- `range(start,stop,step,init=[...])`(bound 用 `fx.Index`) 是**唯一**能跨迭代携带 loop state 的方式。
-- loop-carried state 支持类型:f32 标量、vector、i32、i64、index。优先用 FlyDSL 内部类型(`fx.Int32`/`fx.Float32`/`Vector`/`ArithValue`),仅在底层 helper 明确要裸 `ir.Value` 时才 unwrap:`v.ir_value() if hasattr(v,'ir_value') else v`。
+- `range(start,stop,step,init=[...])`(bound 用 `fx.Index`) 是**唯一**能跨迭代携带 loop state 的方式;bound 必须是 `fx.Index` 否则静默 unroll 丢 init= 见 pitfalls/03-flydsl-tracer-literal-if-for。
+- loop-carried state 支持类型与 unwrap 规则见 methodology/17-flydsl-prefetch-software-pipeline。
 
 ## tracer literal-if 要 unwrap
 - 条件直接传给 `scf.IfOp` 时须 unwrap DSL 布尔:

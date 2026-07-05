@@ -21,7 +21,7 @@
 - **XOR mask 值**:
   - gfx942 = `32/(vec*elem_size/4) - 1`
   - gfx950 = `64/(vec*elem_size/4) - 1`
-- **GEMM A tile 专用(16 字节粒度 XOR-with-row)**:`swizzle_xor16(row,col,k_blocks16) = col ^ ((row % k_blocks16)*16)`,其中 `k_blocks16 = tile_k_bytes // a_elem_vec_pack // 16`。**write 和 read 两路径都要用**,零 LDS 开销、约 1 SALU/地址。
+- **GEMM A tile 专用(16 字节粒度 XOR-with-row)**:`swizzle_xor16(row,col,k_blocks16) = col ^ ((row % k_blocks16)*16)`,其中 `k_blocks16 = tile_k_bytes // a_elem_vec_pack // 16`。零 LDS 开销、约 1 SALU/地址。write/read 必须一致:见 pitfalls/20-lds-bank-conflict-swizzle(swizzle 写读路径必须完全一致,否则静默读错行)。
 
 ## 向量化(每 vec 覆盖 4 bank = 16 字节)
 | dtype | 推荐 vec |
@@ -47,7 +47,7 @@
 ## 验证清单(优化后)
 - 正确性:fp32 累加须 **bit-for-bit**,fp8/bf16 容差内。
 - 重 profile:`ds_read`/`ds_write` 与 ds_write 后 `lgkmcnt(0)` stall 下降、且无新 bank 冲突。
-- LDS 用量上限:**gfx942 ≤ 65536 bytes**,**gfx950 ≤ 163840 bytes**(gfx950 分配 **1280 字节粒度**)。
+- LDS 容量上限与 gfx950 1280 字节分配粒度:见 pitfalls/19-lds-capacity-3stage-deadend、pitfalls/20-lds-bank-conflict-swizzle(1280B 分配粒度)。
 - 确认 `waves_per_eu` 占用率没掉。
 
 ---

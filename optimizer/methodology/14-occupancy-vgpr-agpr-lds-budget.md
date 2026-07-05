@@ -35,8 +35,7 @@
 
 - **tile 数 < CU 数** = occupancy-starved 的直接信号。
 - 实例(dgrad B=1 grok-up M=512):fwd(N=32768)=**2793TF 满载**;dgrad(N=8192)=**923TF 欠载**。output tile 数 = `G × ceil(M/BM) × ceil(K_fwd/BN)` = **64 tile 只填 64/256 CU**。
-- 修法:dgrad 小-M 用 **BLOCK_M=128 M-branch**,M-tile 数翻倍(M=512:64→128 tile)填满 CU;gate 通过时 bm128 **永远赢(+5.3~30.6%)**,单 config 直接 return 不需 autotune。BLOCK_M 要求 **>=128 且 %128==0**(kernel 有 assert)。
-- 常规 tile:GEMM 用 **256×256 主 tile**(BLOCK_M=256/BLOCK_N=256);**只有** dgrad 小-M occupancy 欠载才降到 BLOCK_M=128。
+- 修法(tile 尺寸选择/BM128 gate 细节):见 methodology/20-tile-size-selection.md。
 
 ---
 来源: 08-att-root-cause.md, kernel-trace-analysis/SKILL.md, gfx950/kernel-implementation-notes.md, agpr_phase5_lds.md, diag_4w_vs_8w.md, 03-nn-dgrad-kernel.md

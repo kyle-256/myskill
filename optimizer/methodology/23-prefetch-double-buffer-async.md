@@ -7,7 +7,7 @@
 - 每次主循环迭代处理 2 个 K-tile(pong + ping)。
 - LDS 预算:`lds_tile_bytes = tile_m × tile_k × elem_bytes`。2-stage 需 `2 × lds_tile_bytes`;CShuffle epilogue 另加 `tile_m × tile_n × 2` bytes。
   - 例:64×128 FP8 = 16KB;128×128 FP8 = 32KB。
-  - 上限:gfx942 64KB / gfx950 160KB。
+  - LDS 容量上限:见 pitfalls/19-lds-capacity-3stage-deadend。
 
 ## A 矩阵入 LDS 两条路
 | 路径 | 机制 | 特点 |

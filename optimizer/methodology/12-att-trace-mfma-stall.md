@@ -32,20 +32,11 @@
 | `att_buffer_size` | `"0x6000000"`(96MB/SE) | 被截断则升到 `0xC000000`=192MB |
 
 ## 产物与验证
-- 目录含:`code.json` / `occupancy.json` / `filenames.json` / `wstates*.json` / `se*_*.json`。
 - 主产物 `code.json`:per-instruction asm / source-loc / total / stall / issue cycles。
-- 另需单独下 `out_kernel_trace.csv`(timing + VGPR 信息)。
-- 验证下载:读 code.json 数指令数、有源映射的指令占比。
+- 输出目录结构/下载细节(ui_output_agent_* 命名、含哪些文件、out_kernel_trace.csv)见 13-kernel-trace-analysis-hotspot。
 
-## stall 分类学(按 source line 聚合 stall cycles,按 opcode 前缀分类)
-| 类别 | opcode | 优化方向 |
-|---|---|---|
-| VMEM-load | | |
-| VMEM-wait | `s_waitcnt vmcnt` | 更深预取 / async G2S |
-| LDS/SMEM-wait | `s_waitcnt lgkmcnt` | |
-| barrier | `s_barrier` | ping-pong overlap |
-| MFMA/FMA | `v_mfma_*` | (operand bubble,见上) |
-| LDS | `ds_read`/`ds_write` | bank-conflict swizzle |
+## stall 分类学
+- stall 类型分类表(VMEM-load/VMEM-wait/LDS-SMEM-wait/barrier/MFMA/LDS 及优化方向)见 13-kernel-trace-analysis-hotspot。
 - 判据:**high MFMA + low TFLOPS** → 是 barrier/`s_waitcnt` stall,不是 scheduler 能救的。
 
 ---

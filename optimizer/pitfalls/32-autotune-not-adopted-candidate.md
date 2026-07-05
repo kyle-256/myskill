@@ -6,10 +6,7 @@
 - **grouped NT 4w-persistent 实测被否**：对真实 8w-best 仅 ~3%（<4% 门槛），且在它本该赢的**短-K 区又输给 4w-np**→已撤销，净改动为零。（pr-merge-gate/SKILL.md）
 - **fwd/dgrad 上 4-wave ≈ 8-wave-persistent**：打平（±2% 噪声内），autotuner 多数选 8-wave-persistent；dense/grouped 的 4w-persistent NT 候选几乎不被采纳。4-wave 的价值集中在 **wgrad（variable-K）**：早期生产 autotune 对比（auto vs 8w-only）**+6~17%**；后续修复 dispatch bug 并用 `PT_WARMUP=250` 校正后的 A/B（`c846d954` vs main）全 7 shape × 2 m 无一回归，大 contraction / 宽-N **+9~19%**，qwen/synth +3~9%。（flydsl-fp8-gemm-results/SKILL.md）
 
-- **持久 vs 非持久（各形状归属不同）**：
-  - fwd/dgrad **非持久**（每 WG 做一 tile 后 `s_endpgm`，无 `scf.for`）优于持久，省 `scf.for` 调度惩罚 ~11%。
-  - wgrad 小-M（per-group contraction ≤1536）**持久**优于 masked，省 over-run chunk 的废循环。
-  - big-K 的 drain-removal lever **不迁移**到 big-N：短 K 摊不开循环调度惩罚（语境：dense TN wgrad 在 big-K/big-N 两种 shape regime 该选哪个 lever，非上面 fwd/dgrad 持久性讨论的延伸）。（flydsl-fp8-gemm-tuning/SKILL.md）
+- **持久 vs 非持久（各形状归属不同）**：见 pitfalls/33-persistent-vs-nonpersistent-vmcnt.md
 
 - ❌ **别再试**：非持久 nt kernel 不移植 L2 swizzle。小-K shape 会**反输**（gpt-down −13%）。非持久优势只在大-K（循环调度惩罚主导）；小-K 靠 swizzle（L2 reuse）补回，缺了就崩。（02-nt-fwd-kernel.md）
 

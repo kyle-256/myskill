@@ -11,9 +11,8 @@
 
 ## ❌ 别再试（HW-walled 死坑）
 
-- ❌ **gfx950 dwordx4-lds 直写 LDS 期望 vmcnt 同步**：`buffer_load_dwordx2...lds` 不支持（gfx950 只有 dword 和 dwordx4）；dwordx4-lds 直写 LDS 的完成**不被 vmcnt / 隔-phase barrier 可靠同步** → det≠0。只有 `vmcnt(0)` + 紧跟 `s_barrier` 能 det0，但序列化后 **4803 < 5176**（更慢）。SCVGPR 的 SCV2AHEAD / SCPF prefetch 也 racy（vmcnt 乱序退役，不保证特定时刻落地）。
-
-- ❌ **BK128 SCVGPR scale VGPR WAR race，靠 vmcnt(0) 修**：K=256（0 main iter）SNR 55.6，但 K=384（1 iter）SNR **-inf**。phase-B 的 `emit_sc_vgpr(0) → v[8:9]` 覆写 phase-A mfma 还在读的 scale VGPR。`vmcnt(0)` **不能修**——vmcnt 乱序退役，不保证特定 load 落地。与 BK256 SCVGPR 同一机制。
+- dwordx4-lds 直写 LDS 同步死路 + SCVGPR prefetch racy 完整版：见 pitfalls/45-gfx950-hw-walled-races.md「❌ 别再试」
+- BK128 SCVGPR scale VGPR WAR race 完整机制：见 pitfalls/45-gfx950-hw-walled-races.md「BK128 SCVGPR scale VGPR WAR race」
 
 ---
 来源: 10-grouped-wgrad-4wave-3buf.md, 05-dead-ends.md

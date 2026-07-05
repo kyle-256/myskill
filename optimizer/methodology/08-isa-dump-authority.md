@@ -15,7 +15,7 @@
   - `accum_offset`、`next_free_vgpr`
   - `group_segment_fixed_size`(LDS 字节数)
   - `private_seg_size`(Scratch/spill 字节)、`.vgpr_spill_count`
-- **rocprof PMC 的 VGPR_Count 会误报**:实测 8w wholeloop rocprof 报 128,但 ISA 是真 **256**。扫寄存器/spill 前一律先 dump ISA,别信 PMC。
+- rocprof PMC 的 VGPR_Count 误报细节见 methodology/10-rocprofv3-pmc-counters;扫寄存器/spill 前一律先 dump ISA,别信 PMC。
 
 ## 指令直方图(快速体检)
 ```

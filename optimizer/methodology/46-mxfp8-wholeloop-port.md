@@ -3,7 +3,7 @@
 > 类别: 方法论 · 主题标签: mxfp8, whole-loop, MFMA-format, fp8-operand, swizzle, store统一, asm_mma, WL-swizzle
 
 ## 合理对标(先定标尺)
-- mxfp8 是 **scaled-MFMA**(`v_mfma_scale_f32` 每条多读 2 scale 操作数),合理对标是 **scaled 的 aiter mxfp8**(mxfp4 达 98%),**不是非-scaled per-tensor**(per-tensor 用 `v_mfma_f32` 非-scaled)。
+- mxfp8 scaled-MFMA 对标口径：见 methodology/50-mxfp8-grouped-fair-compare-occ-ceiling.md「MX vs TW 唯一公平口径」。
 
 ## MFMA 格式切换(fp4 → fp8)
 - asm 从 fp4 的 `cbsz:4 blgp:4` → **`cbsz:0 blgp:0`**(E4M3)。

@@ -48,12 +48,10 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
 - `__half(float)` 是单条硬件 `v_cvt_f16_f32` 但 bf16 无对应；gfx950 有 `v_cvt_pk_bf16_f32`（pack 2 fp32→2 bf16 硬件 round）。
 - truncate vs round-to-even 半位精度差、SNR 不变。
 
-## 三类 race 速查表
+## 三类 race 速查表（本卡是类 1；类 2/3 详情见 pitfalls/45-gfx950-hw-walled-races.md「三类 race 速查表」）
 | 类 | 冲突指令对 | 触发 | 修法 | commit |
 |---|---|---|---|---|
 | (1) vmcnt FIFO | scratch_load vs buffer_load_lds（wave 内） | spill>0 单次即 race | 消 VGPR spill（SGPR 化地址 / outer 解析 ptr） | abd3833 |
-| (2) LDS WAR | ds_read vs buffer_load_lds（同 WG 跨 warp） | spill=0 单次即 race | `wait_lgkmcnt<0>` drain | bb48d3f |
-| (3) die L2 | 复用 workspace 跨 die 跨调用 | 前两类干净、第 2+ 次调用 race | `__threadfence()` 入口一次 + per-tile 退化成 lgkmcnt drain | d7b149a |
 
 ## 死胡同（不能同时拿 0 race + PR HEAD perf，reviewer rejected 列表）
 - ❌ 别再试：`__noinline__ compute_tile` → **-25%**（args 通过 scratch 传，反而制造更多 spill）

@@ -4,13 +4,7 @@
 
 ## 1. 按 5 类模式选骨架
 
-| 模式 | 例子 | 骨架原语 |
-|---|---|---|
-| Elementwise | vecadd / scale / relu | `logical_divide` + copy_atom_call |
-| Reduction | sum / max / softmax / layernorm | `buffer_load` + warp shuffle + LDS |
-| Tiled Copy | transpose / permute / gather | `zipped_divide` + TiledCopy |
-| GEMM | matmul | TiledMma + TiledCopy + LDS |
-| Fused | fused attention / GEMM+epilogue | 组合 GEMM + elementwise |
+5类骨架分类表见 methodology/15-flydsl-authoring-spine-layout.md
 
 ## 2. debug 症状分类(先看错哪、错多少)
 
@@ -51,7 +45,7 @@
 
 - 检查 tid 前先 `torch.cuda.synchronize()`。
 - `torch.allclose(atol=1e-5)` 对比参考。
-- 确认 `VEC_WIDTH * sizeof(elem) <= copy atom bits`。
+- 确认 copy atom 宽度合法(完整规则见 pitfalls/04-flydsl-frontend-authoring-traps.md)。
 - 编译期常量用 `Constexpr[int]`,运行时值用 `Int32`。
 - GEMM tile size 必须匹配 MFMA 指令形状。
 - 加新 atom 后:**先跑 FileCheck,再跑 1-wave 端到端 Python kernel**,才能信 layout。

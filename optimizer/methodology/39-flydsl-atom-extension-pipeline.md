@@ -28,12 +28,7 @@
 - lowering 时 `LLVM::ExtractValueOp` 按 `getFieldIndex` 读回。**新字段种类要扩后端 `Atom.td` 的 `AtomStateField` 枚举**。
 
 ## getThrLayout(发一条指令的线程组线程数 layout)
-| 场景 | ThrLayout |
-|---|---|
-| AMD wave64 MFMA | `(64):(1)` |
-| AMD wave32 WMMA | `(32):(1)` |
-| 单线程 | `(1):(1)` |
-| NVIDIA WGMMA warpgroup | `(128):(1)` |
+- 各硬件协作线程数表见 pitfalls/05-flydsl-thrval-layout-atom.md
 - CopyOp 的 `getThrLayout` 是**一次 atom call 参与线程数**:per-thread load=1,AMD `ds_read_tr16_b64`=16。
 - 用 `FxLayout/FxShape/FxStride/FxThr/FxVal/FxC` 宏(`ThrValLayoutMacro.h.inc`)构造 `LayoutAttr`。
 

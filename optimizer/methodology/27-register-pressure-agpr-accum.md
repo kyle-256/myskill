@@ -20,8 +20,7 @@
 - **gfx950 barrier 语义**:`wait_barrier(cnt)` = `s_waitcnt vmcnt(cnt)` + `s_barrier`;operand(`ds_read`)的 LDS 可见性依赖 g2s(`buffer_load_lds`,VMEM)vmcnt 落地 + `s_barrier` 跨波同步。读 8 波协作填充的 LDS 必须在某 barrier 之后。  (agpr_phase5_mono)
 
 ## wgrad 4-wave whole-loop 结构(AGPR 累加实战)
-- **occ=1**:512 VGPR = 256 操作数 + 256 AGPR 累加器(`accum_offset=256`),256×256 tile,2×2-wave,两操作数都 transpose-read,whole-loop 裸 asm,AGPR 累加,CShuffle store。
-- **根因瓶颈** = LDS 转置读 feed 带宽(非占用率/延迟/bank),即使 racing 也只有 fp8 峰值约 **44%**。  (10-grouped-wgrad-4wave-3buf)
+- 详见 methodology/28-whole-loop-asm-lds-feed-bound.md（4-wave whole-loop 结构小节）。
 
 ## GEMM VGPR 估算(算 arch_vgpr,判是否 spill)
 | 组成 | 公式 |

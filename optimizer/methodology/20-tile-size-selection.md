@@ -47,9 +47,7 @@
 
 ## 方形大 tile 提算术强度(4-wave 长 K 领先 8-wave 核心机制)
 - 强度定义 = 每 K-step 的 MAC / (A行 + B列 operand-elem)。
-- **4-wave 128×128 方形 = 强度 64**;**8-wave 128×64 长条 = 强度 42.7**。强度高 **1.5×**。
-- WHY:强度高 1.5× → 单位计算的 LDS `ds_read` 少 1.5×(rocprofv3 实测 8w/4w LDS insts = **1.49×** 精确匹配)→ LDS 延迟更易藏。
-- 效果:4-wave 长 K 领先 8-wave,**6.4%@K8192 → 10.5%@K28672**,单调随 K 增。
+- 具体数据(算术强度对比、LDS insts 实测比值、随 K 的领先幅度):见 methodology/28-whole-loop-asm-lds-feed-bound.md（算术强度小节）
 
 ---
 来源: 03-nn-dgrad-kernel.md, gemm-optimization/SKILL.md, diag_4w_vs_8w.md

@@ -12,8 +12,7 @@
 - **CDNA vs RDNA 判定的单一真相是 `is_rdna_arch()`**（`python/flydsl/runtime/device.py`）。❌ 别再试硬编码 `gfx*` 条件。
   - `wave32-true` 只匹配 `gfx10*`/`gfx11*`/`gfx120*` 前缀，**不匹配 `gfx1250`**。
   - wave size 共享逻辑：`get_warp_size(arch) = 32 if is_rdna_arch else 64`，因此 **gfx1250 返回 64**——gfx1250 kernel 须自己显式设 wave32，否则 wave size 错。
-- **硬件 stochastic-round FP8 转换（`V_CVT_SR_*`）须由 kernel 用 per-lane PRNG（Philox/LCG/threefry）驱动 seed，并每次调用推进它**，否则 'stochastic' rounding 退化成有偏的 deterministic rounding。
-  - gfx950 上 `V_PRNG_B32` 用一条 VALU op 推进 per-lane LFSR；multipass SR converters 只**读**不**写** PRNG VGPR，所以必须自己推进。
+- 硬件 stochastic-round FP8 转换（`V_CVT_SR_*`）须自己驱动 PRNG：见 37-cdna4-no-fallback-porting.md #硬件 stochastic-round FP8 转换必须自己推进 PRNG
 
 ---
 来源: optimization-directions.md, FlyDSL/CLAUDE.md, gfx942/kernel-implementation-notes.md

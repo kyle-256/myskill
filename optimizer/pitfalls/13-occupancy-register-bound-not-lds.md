@@ -4,9 +4,7 @@
 
 ## 核心模型：gfx942/gfx950 是 512 合并池，不是 256/max
 
-- **占用率公式**：`occupancy = min(512 // (arch_vgpr + accum_vgpr), lds_limit, 800 // sgpr, 8)`。VGPR 占用率由 **arch_vgpr + accum_vgpr 的合并 512-entry/SIMD 预算**共同决定（两物理文件共享一个占用预算，每个各自 cap 256）。
-- **绝对不是** `256 / max(arch_vgpr, accum_vgpr)`——那只适用于 gfx908/CDNA1。CDNA2/gfx90a 起把 256 arch + 256 accum 合并成单一 512 预算/SIMD，gfx942/gfx950 继承。
-- **WHY 误判危险**：把它当两个独立 256 池计算，在 AccVGPR 用量重时会**高估** occupancy（例：128V+128A 按两独立池看似各占一半仍宽裕，实则 256/512 已锁死 2 wave）。
+- 512 合并寄存器池公式与 co-saturation 方法论：见 methodology/14-occupancy-vgpr-agpr-lds-budget.md，本卡只保留该模型下的踩坑细节与反直觉数字。
 - gfx942 waves/SIMD 阶梯（`512 // (arch+accum)`）：≤128→4wave、≤170→3wave、≤256→2wave、≤512→1wave、**>512 SPILL 严重回退**。
   - 例：arch=148/accum=148→296→1wave；再加 32 arch→328 仍 1wave；要 2wave 需**合并** ≤256。
 - gfx942 分级（另一维度视角）：≤128/≤128 得 2 wave（好）；129-256/≤256 得 1 wave（compute-bound 可接受）；>256 SPILL（严重回退）。
