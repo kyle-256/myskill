@@ -1,0 +1,100 @@
+# grouped MXFP8:var-K wgrad 瓶颈 / quant 融合 / 公平对标口径 / e2e 计时与节点结果
+
+> 类别: 方法论 · 主题标签: mxfp8, grouped, wgrad, variable-K, scale-prefetch, chunk-SSA, AST-rewrite, occ2, quant, meta-prologue, batched-quant, HIP契约, 公平对标, autotune, occ=1, PMC, scaled-MFMA对标, e2e-timing, compile-once, GB200对标, 节点检查, gfx950
+
+## grouped MXFP8 var-K wgrad:瓶颈定位 / scale-prefetch 真因 / 软流水 / AST-rewrite 绕坑 / occ=2 ROI
+
+### bwd 追 dense 的主战场 = var-K wgrad
+- 逐组件对标(total_M=32768,dense→grouped):**dgrad(grad_a)已追平** dense 1.05-1.18×(同一 NT kernel);**wgrad(grad_b)最大结构性缺口 1.16-1.35×**(绝对 +200~270us),根因 dense wgrad 是普通 NT gemm,grouped wgrad 是 **variable-K kernel**(按组收缩 M);grad_out 量化 grouped 慢 1.2-1.6× 但绝对占比 <10% ROI 低。
+
+### PMC 根因(非访存、非占用)
+- var-K vs dense NT wgrad(4096×7168)`rocprofv3 --pmc`:两者 **MemStall≈0**、**occ 相同**(~20-23%,LDS=128KB→1WG/CU occ=1 结构上限)、VGPR/LDS 几乎相同;缺口纯在 **MFMA 利用率 dense 61% vs var-K 45.5%(-16pp)**。var-K grid 恰好 8×(每 group 一套 blocks 448×8),per-group prologue/epilogue + 4-buf 软流水在组边界重启占比大 → MMA 间空隙(组边界依赖/barrier bubble,不是等访存)。
+
+### 提速真因 = scale 载入时机(不是 memref 累加器)
+- baseline body 顶部**当拍**载入 sa0/sa1/sb → scale ds_read 延迟压在 MMA 关键路径;dense NT **预取下一拍** scale(sa0n)用上拍已到的 scale 做 MMA。
+- 只加 scale 软流水吃到全部 ~9%(单独 SSA 累加=0 提速,单独 scale-prefetch ≈ 全部收益)。
+- 落地 = **chunk-local 结构**(通用零判断):`for _c in range(k_iters//chunk)` 调 module-level `_wgrad_ssa_chunk`(chunk 内累加器进 SSA、scale 逐拍预取,只在 chunk 边界读写一次 memref),尾部 `range_constexpr(chunk)+k_abs<k_iters` guard 收余数。成绩 930/1047/530/307 → 851/936/478/274,方阵追平 grad_a NT 兄弟核。
+
+### 4-buffer 软流水移植(优化1,前置)
+- MX wgrad 单缓冲串行 → chunked 4-buffer distance-2 软流水(移植 tensorwise `_wgrad_body_4buf`)。LDS 2→4 缓冲(cur0/1+next0/1,A/B 各一套);外层运行时 `scf.for over ceildiv(k_iters,chunk)`,内层 `range_constexpr(chunk=8)` 展开 distance-2,trace 期 swap cur↔next;**偶数 chunk 在边界重置 ping-pong 身份**(scf.for 不能 loop-carry Python 变量);accum 用 rmem in-place(`_wgrad_mx_accum`)。结果:M=2048 全反超快 4-26%。
+
+### 绕开 AST-rewrite state-variable 报错(动态 scf.for)
+- 主循环体不能有 `obj.method()` 调用、不能有 list 状态变量。做法:body 是**单个 module-level fn 调用** + 只对 buffer 引用做 tuple-unpack 重赋值,动态 `scf.for` 只 loop-carry buffer 引用。
+
+### 用户硬约束:禁 balance 判断
+- 严禁任何地方判断是否 balance(host per-call 判 uniform、once-cache、核内 per-WG 分派全禁);不能特化 uniform-K,只能让**单一变长-K kernel** 对所有分布都用上 scale 预取。host wrapper 里彻底没有 D2H/offs 读取,eager/capture 同一条 kernel 无 sync 税。
+
+### 生产内核 vs WL 对象
+- 生产 = `_build_grouped_mxfp8_wgrad_kernel`(8-wave / occ=2 / packed-preshuffle scale / chunk-SSA 软流水)。
+- 对象 WL = `_build_grouped_mxfp8_wgrad_wl_kernel`(occ=1 / 4-wave 单块 bare-asm hw-loop,NT 布局 `[OUT,m_total]`,per-1x32 E8M0 折进 `v_mfma_scale_f32_16x16x128_f8f6f4`)。
+- 基准(chi2811 gfx950 B=8 M=4096 N×K=4096×4096 清缓存):baseline 479us / WL-scaled 811-813us(1.7× 慢)/ WL-unscaled 445us(0.93× 反超);SNR 28.1 全对。**WL scale 折进 MMA 是 1.7× 慢的真凶**。
+- WL scale-prefetch 修法(收益仅 ~4%,845→811):删 phase-top emit_scale + 阻塞 vmcnt(0),改成在 emit_inplace 里每个 scale VGPR 最后消费 MFMA 之后重载下一 phase scale(藏进 MFMA shadow),prologue 只留一次 emit_scale。瓶颈是吞吐非延迟。真正修复(未做)= packed/preshuffle scale(4 个 E8M0 打进 1 i32 op_sel 选),预期边际 ~5%。
+
+### 下一刀 ROI
+- 生产 var-K wgrad 上 **occ=2**(LDS 128KB→≤80KB:**削流水缓冲 4→2 而非缩 tile**,让第二 wave 填 barrier/依赖气泡,唯一能真正抬 MfmaUtil 45→61% 的 lever)。不是 WL、不是 cross-group persistent(均已证伪)。风险:fwd/dgrad occ=2 曾证伪(bm=128 坏),wgrad 削缓冲是新尝试。dense NT 自己也只 61%@occ=1,现实目标是逼近 61% 吃掉 16pp。
+
+## grouped MXFP8 quant:融合 meta prologue / batched 权重 quant / HIP 输出契约
+
+### 融合 meta prologue(优化4,已落地)
+- 问题:grouped quant 主 kernel 每 WG 都跑一遍 O(G) 组搜索(读 GO/GR/GC 三个 int32-view offs ~40 copy-atom load,select 链 gate 住整 tile),memory-bound 短 kernel 里延迟全暴露占 ~42us。
+- 正解:写融合 prologue kernel `meta`(NBM 线程/256 一 block,每线程对 `base_m` 做一次 O(G) 搜索写 RB/RO/RE[bt]),与主 kernel **背靠背在同一 `@flyc.jit` stub 里 `.launch()`**。搜索从 `512×(NBM×NBK)` 个 WG 各做一遍 → NBM 线程一次。
+- 结果:kernel 155、wrapper 181,grouped-FLY **首次快过 grouped-HIP**。`RB=go_orig_g+mrel`、`RO=go_row_g+mrel`、`RE=go_col_g+M_g`。
+
+### batched FLY 权重 quant(compile_qdual_batched,默认 ON)
+- 把 dense `compile_qdual` 加 batch 维,一次 launch(`grid=B*NBM*NBK`)量化整块 `[B,N,K]` 权重全部 B 个 expert,替旧 Python 逐 group 循环(逐 group `quant_mxfp8_raw`+`torch.stack`,8× launch,比 HIP 慢 2.7-4.3×)。
+- 核心:`batch=pid//NPB`,输入 band 与 4 条输出 band 各按 batch 重定位;**per-batch scale byte base**(`base_row_b/base_col_b`,dword 对齐)保证相邻 batch scale dword-packing 不互踩(`_store_scale` 加 `base_byte` 形参)。等 group 尺寸无需 per-tile 组搜索。
+- 性能:快 HIP **1.3-1.54×**(275→207 / 344→239 / 152→116 / 94→61),方向同 dense-FLY ~1.6×。`PT_MXGG_FLYDSL_QUANT=0` 退回 HIP。
+
+### HIP grouped_quantize_mxfp8_dual 输出契约(新 kernel 须 bit-兼容)
+- 位置 `quantization.cpp:829`。输入 `x[total_M,N]` + `group_lens/group_offs`(int64 GPU),`ROW_ALIGN=64/COL_ALIGN=128`,`M_pad_row=cdiv(total_M+G*64,64)*64`、`M_pad_col=cdiv(total_M+G*128,128)*128`、`N_pad=cdiv(N,128)*128`。
+- 返回 **8 个固定顺序**:0 `rowwise_output[M_pad_row,N_pad]` fp8、1 `rowwise_scale` e8m0、2 `colwise_output[N,M_pad_col]` fp8(已转置)、3 `colwise_scale`、4-7 `group_lens/offs_padded_rowwise(64)/colwise(128)`。
+- raw 行/列主 E8M0 **不 preshuffle**(gemm 侧 in-launch preshuffle);组边界 scale 独立不跨组;**padding 行 scale 填 127(=1.0)/ 数据填 0**;padded-layout offs 由 `compute_padded_layout_gpu` 在 GPU 上算(无 D2H)。
+
+## grouped MXFP8:公平对标口径 / dense 目标水平 / fwd-dgrad autotune / occ=1 结构上限 PMC
+
+### MX vs TW 唯一公平口径(否则灌水)
+1. TW 和 MX 都用**同一 gemm backend FLYDSL**(`GlobalBackendManager.set_gemm_backend/set_grouped_gemm_backend(FLYDSL,FP8)`),别拿 TW=HIPBLASLT/Triton 对 MX=FLYDSL。
+2. **force-nt OFF**(monkeypatch `_deter_use_nt_layout_gemm_in_bwd→False`),否则 TW fwd 白背 `a.t()+b.t()` 转置税。
+3. 带量化(fresh `turbo.ops.*gemm_fp8` 每步重量化)+ `torch.utils.benchmark.Timer` + `retain_graph`。
+- mxfp8 是 scaled-MFMA,合理对标是 **scaled 的 aiter mxfp8**(mxfp4 达 98%),不是非-scaled per-tensor。
+
+### dense 目标水平(both FLYDSL,force-nt off,含量化)
+- fwd MX/TW 打平 ~1.0×(0.98-1.01×);**bwd MX 真反超 TW 0.67-0.82×**(4096×4096×4096 bwd 0.67× 最好)。这是 FlyDSL quant+FlyDSL gemm 真实力(TW 也放 FLYDSL 后 dense MX bwd 依旧 0.67-0.82×)。grouped 目标就是追这个。
+
+### fwd/dgrad 按-shape autotune(优化3,已落地)
+- 参考 **pertensor grouped gemm** 的 `_autotune_np_dispatch`(不是 dense mxfp8 gemm)。
+- 要点:① 均衡分布计时(`_balanced_mx_targs`,group_offs 换成 M_total/G 均衡切分),选出 config 只依赖静态 shape 与运行时分布无关;② 数值护栏 rel-RMSE<2e-2 且 finite 才采纳;③ 扁平候选+base+1.5% 迟滞(`cand[0]=base(256,4,4,0)`,≥1.5% 才切);④ 计时用 `_robust_time`(一次 sync 内背靠背 launch iters 次再除)——早期每次 launch event.record+sync 把 per-call ~20us 气泡计入导致选错回退。
+- 候选:`(256,4,4,0)base`、`(256,8,4,0)`、`(256,1,4,0)`、`(256,8,8,0)`、`(256,4,8,0)` + 2D band `(256,8,4,{8,16})`。缓存键 `(M_pad,N,K,G,cbsz,blgp,out_fp16,persistent)`。`PT_MXGG_AUTOTUNE=0` 退回固定 base。收益 0-4% 无回退。
+
+### fwd/dgrad occ=1 结构上限(PMC)
+- M2048 4096×7168:MX `kernel_grouped_mxfp8_nt` MfmaUtil 60.2%/Occ 21.8%/MemStall 0.1%/VGPR128 LDS128KB vs TW `kernel_grouped_nt_persistent` 65.2%/21.2%/0.1%/同。
+- MemStall≈0 非访存瓶颈;MfmaUtil 只 60-65% 是 **occ=1(LDS=128KB→1WG/CU)** 下 barrier/依赖 stall 没第二 wave 填;MX 60 vs TW 65 的 5pp 是喂 scale 给 scaled-MMA 的操作数开销(**scaled-MMA 本身税≈0**)。persistent 假设证伪(vs 非 persistent 无差别)。
+- 剩余 40% MMA 空闲要动只能上 **occ=2**(LDS 128KB→≤80KB:削流水缓冲 4→2 或缩 tile),TW 同卡 occ=1 是共有结构上限。
+
+### benchmark shape 表(源 benchmark/ops/training/config.py)
+- 3 模型 ×2 GEMM(GateUP/Down),B=8(experts),M∈{2048,4096},trans_b=True。GateUP=(N=2*moe_int,K=hidden),Down=(N=hidden,K=moe_int)。
+- deepseekv3(2048/7168):GateUP 4096×7168、Down 7168×2048;qwen3-235b(4096/4096):8192×4096、4096×4096;gpt-oss-20b(2880/2880):5760×2880、2880×2880。
+
+## MXFP8 e2e 计时口径 / 节点占用检查 / vs GB200 结果
+
+### 测量真实 GPU 时间(compile-once)
+- FlyDSL `flyc.jit` launch 每次调用有 **~40us Python 派发开销**,cuda-event 会量成派发延迟。正确:先 `comp=flyc.compile(launch, ...)` 编译一次,再 `comp(...)` 直进 GPU stream 用 cuda-event 计时(warmup 30、iter 300)。
+
+### 官方 e2e benchmark 口径(与 TE GB200 一致)
+- `torch.utils.benchmark.Timer(stmt="fn()").timeit(100).mean*1e3`;`tflops=2*M*N*K/(ms*1e-3)/1e12`。
+- **禁止手搓 cuda-event 计 bwd**(把 autograd dispatch 算进去,bwd 低估 ~10-18%)。
+
+### 节点 / GPU 占用检查
+- gpt_oss2 用 **GPU 4 或 5**(用 `mem_get_info` 现查占用)。检查:
+  ```
+  docker exec mlperf_gptoss2 bash -c "rocm-smi --showuse | grep 'GPU\[4\]\|GPU\[5\]'"
+  ```
+- 节点 chi2810 = gfx950 ×8,HBM3e ~8 TB/s 峰值,实测 1R:1W copy 上限 ~6.3 TB/s。
+
+### LDS-合并转置写 vs GB200 结果
+- fwd geomean ~0.99×(≈对齐)、bwd ~1.10×(反超)。
+- e2e(Timer 口径,9 Llama shape,SNR 全 28dB)新(LDS-合并转置写)vs 旧 BM=32:**fwd 1710→1824 TFLOPS(+6.7%)、bwd 1839→1878(+2%)**。提升集中在 quant-heavy K=11008 fwd(4096×4096×11008 +21%、8192 +13%、16384 +10%)。
+- fwd 差距根因 = B200 硬件 MX cast **近免费** vs MI355X **软件 dual-cast**;fwd 稳过 1.0× 仍需 in-gemm fusion(**用户否决**)。
+
+---
+来源: mxfp8-grouped-gg-devloop/SKILL.md(优化1/优化6/var-K PMC/真因&已修复/优化4/batched FLY 权重 quant/HIP 输出契约/总目标/优化3/rocprof PMC/shape 表); project_mxfp8_grouped_wgrad_wl.md; project_mxfp8_wholeloop_port.md; mxfp8-8wave-devloop/SKILL.md

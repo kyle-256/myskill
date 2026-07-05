@@ -1,0 +1,65 @@
+# 同步与构建：rsync/git 远端同步陷阱 + build/环境坑
+
+> 类别: 踩过的坑 · 主题标签: rsync, git, docker, remote-sync, build, 移植, 节点礼仪, pytest/OOM
+
+## 远端同步陷阱：rsync --delete / 锚定规则 / git dubious-ownership / docker 重定向
+
+- **[rsync] ❌ 别再试 给 rsync 加 `--delete`。** 本地是全新 checkout，`--delete` 会删掉远程一堆不能删的东西：
+  - `primus_turbo/_build_info.py`（build 生成、运行时被 import，删了直接挂）
+  - hipify 生成的中间件 `*_hip.cpp` / `.h` / `.cuh`（远程编译产物）
+  - `3rdparty/` 子模块源码（本地是空 gitlink、远程才有实体，build 必需）
+  - WHY：本地镜像根本没有这些文件，`--delete` 会以本地为准把远程抹掉 → 远端 build 直接崩。用**增量 rsync（不 delete）**即可。
+- **[rsync] 排除规则必须用 `/` 开头锚定到 repo 根。** rsync 排除规则默认匹配**任意深度**同名目录 → 直接写 `build/`、`dist/` 会误伤同名的 Python 模块目录。要写 `/build/`、`/dist/` 锚定到 repo 根。
+- **[rsync] `*.so` 被排除是正常的。** 远程 `primus_turbo/lib/libprimus_turbo_kernels.so` 是远程 build 产物，不会被本地空目录覆盖；本地镜像里没有它属正常现象，别去补。
+- **[git] `safe.directory '*'` 一劳永逸解 dubious ownership。** JuiceFS 挂载 uid 错配 → git 到处报 dubious ownership；`git clone` 本地路径报 "SSH access rights" 其实也是源 repo `.git` 的 dubious-ownership（**不是真要 SSH**，别去查 key）。解法：`git config --global --add safe.directory '*'`。
+- **[git] 显式 URL push 不更新本地 tracking ref**（源自 gpt_oss2 项目，非本环境实测）**。** 用显式 URL（`git push git@github.com:...`）推，GitHub 端会更新，但**不更新本地 `origin/<branch>` tracking ref** → `git status` 仍显示 `[ahead N]`、Cursor 面板误显示待推送。修法：`git fetch origin <branch>` 刷新，之后 `git rev-list --left-right --count origin/<branch>...HEAD` 应为 `0 0`。始终用 `git push origin <branch>`。
+- **[git] 本地必设 `core.fileMode false`。** `git config core.fileMode false` —— JuiceFS + rsync 翻动权限位会假报一堆 `M`（modified）。
+- **[redirect] ❌ 别再试 在 `docker exec` 外层重定向想写容器内文件。** `docker exec '... > /tmp/x'` 的重定向落在 **host** 不在容器。要写容器内文件必须在 `bash -lc` **内部**重定向（`docker exec ... bash -lc '... > /tmp/x'`）。
+
+## build/环境坑：陈旧源移植慢、HK 残留 undefined symbol、节点礼仪、LLVM OOM
+
+### 陈旧源移植（stale-source）
+- 本地 sync/FlyDSL 比远程容器 /workspace/code/FlyDSL 旧 → 照本地 vendor 会搬到**补丁前**版本，表现为移植版慢 ~15%。
+- 实例：fp8 4wave AGPR 提速（ROCm/FlyDSL PR #714，`Mfma16x16x128AGPR` inline-asm `=a,v,v,0` 把 f32x4 累加器钉 AGPR、消 `v_accvgpr_mov`+`s_nop`，+5~13%）**只在远程有**。
+- 教训：移植前先 `diff <(本地) <(远程 cat)`，或直接从远程容器取源。host 上没 FlyDSL 时：
+  `./.ssh-chi.sh root@chi2811 "docker exec mlperf_gptoss cat <容器内路径>" > 本地文件` 落盘。
+
+### vendor helper 为何不复用 gemm_helper.py（vendor-reuse）
+- turbo 产品化的 8-wave 把原语分叉了，4-wave 直接 import 会崩：
+  - `Mfma16x16x128` 去掉 `call_one`
+  - `G2S`/`S2RLoader` 去掉 `load_one`
+  - `StoreC` → `StoreCPerTensor`（per-tensor 标量 scale，非 row/col-wise）
+- 因此 4-wave 单独 vendor 一份，保证 bench-identical 且不碰 8-wave。❌ 别再试直接复用 gemm_helper.py。
+
+### HipKittens 残留 undefined symbol（build-hipkittens）
+- `import primus_turbo.pytorch` 报 `undefined symbol ...hk_gemm_bf16`：untracked HK dense binding 引用不存在的 kernel .cu。
+- HK 后端已于 **2026-06-01** 整体移除（dense+grouped 全 untracked WIP，无 python 引用）。
+- 残留导致 build 失败的清理步骤：
+  1. 删 `csrc/pytorch/gemm/hk_gemm_hip.cpp`、`csrc/pytorch/grouped_gemm/hk_grouped_gemm_hip*.cpp`、`csrc/kernels/grouped_gemm/HipKittens/`
+  2. 从 `bindings_pytorch_hip.cpp` + `extensions_hip.h` 去掉所有 `hk_gemm*`/`hk_grouped*` 的 def/impl/声明
+  3. nuke `build/` + `_C*.so` 重 build
+
+### 节点礼仪（etiquette）
+- 节点不是我们的，是某 slurm job 拥有者的。
+- ❌ 别再试：清别人容器 / 停别人进程 / 删别人镜像（即使 GPU 空）。
+- 不要在 idle 节点起容器立刻跑满 8 卡 → 先小任务跑通再上量。
+- ❌ 别再试用 `srun`/`salloc` 抢 mi355x：全 ALLOCATED，slurm 不让进；正确路径是 docker。
+- 被 primus-training 抢卡（污染环境）时测的**绝对 TFLOPS 不可信**，必须干净节点重测；但结构性的 V/spill/det 来自编译期、正确性仍可信。
+
+### FlyDSL build（build）
+- 报 `std::gcd not found` 或 redeclaration = 拿错了 LLVM。解法：`unset MLIR_PATH` 让 build.sh 自动探测。❌ 别再试手动硬设不匹配的 MLIR_PATH。
+- MLIR .so 加载报错 = `LD_LIBRARY_PATH` 没含 `build-fly/python_packages/flydsl/_mlir/_mlir_libs/`。
+- `No module named flydsl` = 没 `pip install -e .` 或没设 PYTHONPATH。
+- LLVM 构建 OOM 时降并行度：`-j64` 而非 `-j128`（128 核并行编译 LLVM 内存压力大）。
+- 结果陈旧/不对：清 kernel 缓存 `rm -rf ~/.flydsl/cache`；或 `export FLYDSL_RUNTIME_ENABLE_CACHE=0` 禁磁盘缓存（内存缓存仍生效）。改了内核但结果没变，先怀疑缓存。
+
+### pytest 远端坑（pytest）
+- `-u` 必须加，否则 stdout 块缓冲看不到进度；尤其 ❌ 别 `|tail -N`（tail 等 EOF 才输出，像卡死）。
+- ssh 中断 ≠ 杀远程：本地 Ctrl-C 只断 ssh，远程 `docker exec` 里 pytest 仍在跑。多次中断重跑 → 僵尸 pytest 抢同块 GPU 越来越慢。重跑前先 `docker exec mlperf_gptoss pkill -9 -f "pytest <file>"`。
+- 参数爆炸：`test_grouped_gemm_fp8.py -k FLYDSL` 选中 ~2.3 万 case（大多运行时 skip，但跑到的每个做 per-shape autotune 编译极慢，全量几百分钟）。只跑有界子集：`-x` 停首个失败，或定死 shape（`-k "FLYDSL and Format.E4M3-..."`）。deterministic 版对 flydsl 全 skip，没用。
+
+### bench OOM（oom）
+- bench 每个 shape 后必须 `del` + `torch.cuda.empty_cache()`，否则累积 fp8 tensor（grouped 的 b 是 3D 大）把 300GB HBM 撑爆 OOM。
+
+---
+来源: remote-sync/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, flydsl-sync/SKILL.md, gpt_oss2/myskill/remote-sync/SKILL.md, claim-mi355x-node/SKILL.md, build-flydsl/SKILL.md, fp8-gemm-bench/SKILL.md
