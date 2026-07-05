@@ -15,6 +15,13 @@ description: 管理两份 Primus-Turbo（"turbo"）的本地镜像 + 远程 dock
 
 工作模型：**本地编辑（无 GPU）→ rsync 推到 chi2811 容器 → 用对应 venv 在 GPU 上跑**。每份 turbo 有独立的远程目录 + 独立 venv，互不污染。
 
+## 改 turbo 代码前必读的风格约定（2026-07-04 定下）
+
+- **注释一律英文**，禁止中文/日文注释（哪怕是给自己看的临时笔记）。已有文件里历史遗留的中文/`続`日文批注（多是 project_wgrad_occ_feed_bound.md 关联的旧会话产物）不用倒着去翻译，但凡是新写/新改的代码，注释必须英文。
+- **函数命名跟 turbo 现有风格走**，别自造缩写。这个文件里的既有模式是 `_grouped_<noun>`（如 `_grouped_block_mn`、`_grouped_compile_cfg`）和 `_wgrad_<verb_or_noun>_<variant>`（如 `_wgrad_wholeloop_asm_3buf`、`_wgrad_do_tile_3buf`）——新加的共享 helper 要套进这套命名，而不是拍脑袋缩写（例如 `_wl3buf_fused_tail_split` 这种缩写就不对，应该是 `_wholeloop_tail_split_3buf`）。
+- **能复用 `gemm_helper.py` 就必须复用**，别在 `gemm_fp8_grouped_kernel.py` 里重新实现已有的通用算子/loader（`ceildiv`、`_readfirstlane_i32`、`xcd_remap_pid`、`make_fp8_buffer_tensor_rebased`、`S2RLoader`/`S2RLoaderTr`、`_robust_time` 等都在 `gemm_helper.py`，先 grep 一遍确认没有再动手写）。
+- **FlyDSL tracer 的一个坑**：`@flyc.kernel`/`@flyc.jit` 装饰的函数体（含其内部嵌套 `def`，比如 `_do_tile`）源码里字面出现的 `if`/`for` 会被 AST-rewriter 转成设备侧控制流（`scf.if`/`scf.for`），哪怕分支条件是纯 Python 编译期常量（如 `trans_b`）。所以想按编译期常量分叉行为，必须在**外层未被追踪的 Python 作用域**先选好分支（生成不同的闭包/直接调用不同的模块级函数），内核体内部只做函数调用，不能写字面 `if trans_b: ...`。踩过的坑：把 NN/NT 两个 4-wave 编译函数硬合并、在 `_do_tile` 里写 `if trans_b`，先是 `NameError`（变量只在某个 `scf.if` 分支里可见），改了闭包写法后又在重复调用同一个已编译 `@flyc.jit` 函数时触发 FlyDSL 的全局漂移检测报错（`_WL_ASM_CACHE_3BUF` 在 trace 期间被 mutate，和"首次编译时快照"对不上）。最终方案是拆成两个独立编译函数，只共享跟 `trans_b` 无关的辅助函数（如 `_grouped_4wave_tile_scan`）。
+
 ## 布局对照表
 
 | | **mxfp4** | **tensorwise** |
@@ -204,6 +211,40 @@ umount /var/lib/docker/tmp && rm -rf /mnt/vast/kyle/code2/docker_tmp        # �
 - **ssh 中断 ≠ 杀远程**：本地 Ctrl-C/中断 `./.ssh-chi.sh` 只断 ssh，**远程 `docker exec` 里的 pytest 仍在跑**。多次中断重跑 → 一堆僵尸 pytest **抢同一块 GPU**，越来越慢。重跑前先 `docker exec mlperf_gptoss pkill -9 -f "pytest <file>"`。
 - **FlyDSL 测试参数爆炸**：`test_grouped_gemm_fp8.py -k FLYDSL` 选中 **~2.3 万** case（大多运行时 skip，但跑到的每个做 per-shape autotune 编译，极慢，全量几百分钟）。**只跑有界子集**（`-x` 停首个失败，或定死 shape：`-k "FLYDSL and Format.E4M3-ori_dtype0-NK3-2048-1"`）。`deterministic` 版对 flydsl 全 skip，没用。
 - **E4M3 tensorwise grouped gemm 的 SNR 失败是预存的、与后端无关**：同一 shape 下 `backend=None`(默认 **TRITON**，非 CK！op 层 `default_backend=BackendType.TRITON.value`)与 `FLYDSL` 的 `Out-SNR` **一致到小数点后 9 位（11.976079940795898）** → 误差在二者共用的 **量化/参考路径**，不是 kernel/后端问题，也不是 rebase 引入。flydsl 大多数 shape 通过（114 passed）。判断"是不是自己改坏"的捷径：**同 shape 跑两个后端比 SNR，一样就是上游量化精度问题**。
+
+## grouped-gemm autotune dispatch 的性能测量坑（反复踩过，2026-07-05 系统整理）
+
+在 `gemm_fp8_grouped_kernel.py` 这类**带 autotune dispatch**（编译时/首次调用时在多个候选 kernel 里挑最快、结果按 shape cache）的代码上量"改动前后差多少",经常测出**看起来很大、其实不是真回退**的差异。踩过不止一次，教训按严重程度排：
+
+1. **两把不同的计时尺子不能比**。框架自带 `_robust_time`(250 warmup + 5×50 iters 中位数、`torch.cuda.Event`)和随手写的 `time.perf_counter()`+少量 warmup/iters 测出来的绝对值完全不是一个量级——前者数值通常更小更稳，后者会把 host 端 Python/launch 开销也算进去。**对比"改前 vs 改后"必须用同一个计时函数**,理想情况下直接复用 `GK._robust_time`,不要自己拿 `time.time()`/`perf_counter()` 现造一个。
+2. **小 shape 的"kernel-only"测量会被 host 端开销淹没**。像 `m=1024` 这种单次 kernel 只有 0.05~0.1us 的极小 shape,如果测量脚本是"每次调用都走一遍完整公开入口"(`gg(lhs, rhs, ...)`,每次都 `torch.empty`/`.view`/`.reshape`/dispatch-cache 查表),这些 host 端固定开销可能比 kernel 本身还大,测出来的"TFLOPS"波动 5~15% 都不奇怪,和实际 GPU 计算吞吐关系不大。**验证到底是 kernel 变慢还是 host 开销波动**：绕过公开入口,直接编译目标 kernel(如 `GK._compile_grouped_tn_wgrad_persistent(...)`)、把 `targs` 建好只建一次,再反复 `_robust_time(launch, targs)`——如果这样测出来两版本一致,那之前测到的差异就是 host/调度层的噪声,不是 kernel 真的变慢。
+3. **单次跑量不够,重复几次结果自己就能打自己脸**。同一份代码、同一个 shape,连续跑 3 遍完整 sweep,数值本身就能有 4% 上下的波动(GPU 时钟/温度状态不是每次都一样)。**只看一次对比就下"回归了 X%"的结论不可靠**，至少跑 3 轮取范围,如果新旧两个版本的波动范围有重叠,大概率是噪声不是真回归。
+4. **autotune 的"一次性选型决策"本身对测量顺序敏感**（这条是老坑，memory `project_flydsl_grouped_hipblaslt_gap.md` 里的"热节流陷阱"记过一次）：dispatch 只在**第一次**调用某个 shape 时跑候选竞赛并把结果 cache 住，如果一次 sweep 脚本按固定顺序连续测多个 shape，某个 shape 的"选型时刻"处在 GPU 刚从冷启动/低时钟状态回升的阶段，选出来的候选可能不是稳态下最快的那个——这不是 dispatch 逻辑错了，是那一次选型恰好赶上了不具代表性的热力状态。
+5. **想知道 A/B 两个版本谁更快**，最稳的办法是：两份代码都能在同一个远端跑（不用重新 build，只要 csrc/cmake 没变，直接把两个 python 文件互相替换、原地跑），同一个脚本、同一个 GPU、紧挨着跑两次，而不是分别在不同时间/不同 session 里测——降低"两次测量之间 GPU 热力状态已经飘走"的概率。
+
+**结论**：只要发现"改动后掉点 X%"这种结果，先怀疑是不是踩了上面 1~4 条，尤其是 shape 很小、时间尺度在 0.1us 附近的情况——先用第 2 条的隔离测量法把 host 开销剥离掉，再下结论。
+
+## 自动化 FlyDSL kernel 优化循环（2026-07-05，一键跑若干轮+review+commit）
+
+`sync/flydsl_kernel_optimizer.py`：无人值守跑 N 轮"提议改动 → 远端编译+correctness+benchmark → 达标就 commit 否则 revert"的循环，最后跑 `claude ultrareview` 再把所有轮次 squash 成一个 commit。设计抄的是 AutoKernel（RightNow AI）/ Meta KernelAgent / AMD AgentKernelArena 这类"AI kernel 优化 agent"项目的公共模式：**每轮实验都能落成一个 git commit，没达标的直接 `git checkout` 干净地丢掉**；correctness+性能判定永远是脚本自己跑一个固定的 harness 说了算，不采信 agent 自己嘴上说"变快了"。
+
+用法（示例，wgrad kernel）：
+```bash
+cd /workspace/code/gpt_oss_docker/sync
+python3 flydsl_kernel_optimizer.py \
+  --repo tensorwise/Primus-Turbo \
+  --target primus_turbo/flydsl/grouped_gemm/gemm_fp8_grouped_kernel.py \
+  --goal "优化 wgrad 4-wave whole-loop 在 gpt_oss-down 这类 shape 上的性能" \
+  --bench-cmd "primus_turbo/_opt_harness.py" \
+  --remote-container-path /workspace/code/Primus-Turbo-tensorwise \
+  --rounds 5
+# 后台跑（脚本本身不 daemonize）：
+nohup python3 flydsl_kernel_optimizer.py ... > /tmp/flydsl_opt.log 2>&1 &
+```
+
+- `--bench-cmd` 指向的脚本必须在远端 venv 里跑、最后一行 stdout 打印 `{"ok": bool, "tflops": number}` 这样的 JSON——`ok=false` 直接判 revert，数值没有比当前最优高出 `--min-gain`(默认 1%)也 revert。模板/参考实现在 `tensorwise/Primus-Turbo/primus_turbo/_opt_harness.py`（跑 wgrad 几个固定 shape，correctness 用 SNR、性能用跟生产 dispatch 同一把尺子 `_robust_time`——上面那节"性能测量坑"里的教训在这里已经落地）。
+- 安全约束:启动前 `git status --porcelain --untracked-files=no` 检查干净树(只看 tracked 文件,不会被 `_ow.py`/`_op.py` 这类刻意保留的 untracked 探针脚本挡住);revert 时只删"这一轮新产生的 untracked 文件"，不会碰运行前就存在的 untracked 文件；全程不 push，commit 都留在本地等你审。
+- `claude -p` 调用用 `--permission-mode bypassPermissions`(无人值守必须的)+ `--add-dir` 限制到目标 repo + `--max-budget-usd` 按轮限额，每轮 prompt 里带前几轮"保留/回退"的历史，让 agent 别重复踩已经验证过没用的点子。
 
 ## tensorwise 分支 rebase 到 main（单 commit 历史）
 
