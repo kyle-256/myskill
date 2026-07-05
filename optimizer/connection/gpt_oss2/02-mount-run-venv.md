@@ -32,7 +32,7 @@
   - **mxfp4**：树 `/workspace/code/mxfp4/Primus-Turbo`（即 mxfp4 树），解释器 `/opt/venv-mxfp4/bin/python`。
 - **改 kernel 必清 flydsl 缓存**：改 kernel 后远端必须 `rm -rf /root/.flydsl/cache` 再跑（WHY:否则加载旧 .so，测的是旧内核）。
 - **改 csrc/triton 必重 build**：改了 csrc/triton kernel 必须远端重 build（`setup.py build_ext --inplace`）后再跑（WHY:否则测的是旧 .so）。
-- 镜像 gpt_oss 的 `09-docker-exec-run-format`（同一套 docker exec + HIP_VISIBLE_DEVICES 跑法）。
+- 跑法与 gpt_oss 环境同构（同一套 docker exec + HIP_VISIBLE_DEVICES），差别仅容器名/挂载/venv，见 connection/gpt_oss/02-run-and-venv.md。
 
 ## gpt_oss2 两份 Primus-Turbo checkout 与 venv 隔离
 
@@ -44,11 +44,13 @@
   - mxfp4 用 `/opt/venv-mxfp4`。
 - **editable(PEP 660) 安装机制**：每个 venv 的 `site-packages/__editable___primus_turbo_0_0_0_finder.py` 里的 `MAPPING` dict 指向某 repo 的 `primus_turbo`，共 3 条映射：`libprimus_turbo_kernels` / `primus_turbo` / `tools`。两 venv 各指各 repo → 实现隔离。WHY：editable finder 用 MAPPING 把 import 路由到源码树，改路径即改所指 repo，无需重装。
 - **各 repo 自 build 自己的 .so**：`primus_turbo/lib/libprimus_turbo_kernels.so` 在 vast 上各自编译（rsync 排除 `*.so`，故本地不同步二进制）。
+- **⚠️ 坑A（setuptools.pth 泄漏）**：`cp -a /opt/venv /opt/venv-mxfp4` 克隆后，新 venv 的 `setuptools.pth` 仍绝对自引用老 venv 的 `site-packages` → 新 venv 会 fallback 到老 venv（假隔离）。必须 `sed` 把 `setuptools.pth` 里 `/opt/venv/lib` 改成 `/opt/venv-mxfp4/lib`，并验证 `sys.path` 不含 `/opt/venv/lib/...`（打印 `ISOLATED_OK`）。
+- **⚠️ 坑B（`pip install -e .` 跨-venv 污染 finder，2026-06-25 实测必现）**：即使修好坑A、`sys.path` 已隔离，在 `/opt/venv-mxfp4` 里跑 `pip install -e .` 仍会把 mxfp4 的 MAPPING **写进 `/opt/venv`** → 两个 finder 的 repo 路径**互换**（venv→mxfp4、venv-mxfp4→mxfp8）。故**重编 csrc 用 `setup.py build_ext --inplace` 而非 `pip install -e .`**；万一跑过 `pip install -e .`，立即校验+`sed` 修两个 finder 的 MAPPING（无需重 build）。
 - **验证隔离走对 repo**：
   - `/opt/venv/bin/python -c "import primus_turbo; print(primus_turbo.__file__)"` 应指 `…/mxfp8/…`
   - `/opt/venv-mxfp4/bin/python` 同命令应指 `…/mxfp4/…`
 
-（mirrors gpt_oss 的 10-venv-isolation。）
+（与 gpt_oss 的 venv 隔离机制同构，见 connection/gpt_oss/02-run-and-venv.md；差别在 venv 名 mxfp8 用 /opt/venv、mxfp4 用 /opt/venv-mxfp4。）
 
 ## gpt_oss2 venv 新建/重建 与 csrc build 规则
 

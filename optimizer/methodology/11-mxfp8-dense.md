@@ -78,7 +78,7 @@
 - dual-cast quant 流量 = `4.0625*M*K` bytes(读 2MK bf16 + 写 2MK fp8 + scale)。
 - 分相探针:读+行写 ~7.5 TB/s;转置**列写**散写崩到 ~1.5 TB/s → 唯一瓶颈是 `AtQd[K,M]` 转置写的**合并度**(每 K-行的 M-run 太短)。
 - 判断带宽受限的判据:移除 barrier / 占用 / 计算(SK env)均无效 ⇒ 计算非瓶颈。
-- 节点/HBM 带宽上限数据：见 51-mxfp8-e2e-timing-node-results.md「节点/GPU占用检查」;dual-cast 达 3.2-4.6 TB/s = 真上限的 55-73%。
+- 节点/HBM 带宽上限数据：见 methodology/12-mxfp8-grouped.md「e2e 计时/节点占用检查」;dual-cast 达 3.2-4.6 TB/s = 真上限的 55-73%。
 
 ### LDS-合并转置写(制胜招)
 - 根因:列写 run 长度 = `bm`(每 K-行 tile 内连续 M 字节)。旧 `BM=32` 列写 run 仅 32B。
@@ -97,7 +97,7 @@
 - 只需 M/N 是 **64 的倍数**即可安全,**256 倍数约束已解除**。
 
 ### 节点 GPU 占用检查
-- 见 51-mxfp8-e2e-timing-node-results.md「节点/GPU占用检查」
+- 见 methodology/12-mxfp8-grouped.md「e2e 计时/节点占用检查」
 
 ## MXFP8 scale_pack(MFMA op_sel)+ 大-K scale group 预取:闭合 per-tensor gap
 

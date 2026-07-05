@@ -68,7 +68,7 @@
 ## FlyDSL tracer 编译期-vs-设备控制流:range_constexpr vs range、if 分支变量不外泄
 
 ### if 分支变量不外泄 → 用普通 Python helper
-- if 分支内定义的变量在分支外不可见、运行时分支写法的完整规则见 pitfalls/03-flydsl-tracer-literal-if-for。
+- if 分支内定义的变量在分支外不可见、运行时分支写法的完整规则见 pitfalls/07-flydsl-frontend-tracer.md。
 - 纯 side-effect 的 if 可以:`if BR_B1: s_barrier()`(不外泄变量)。
 
 ### 控制流四种形态
@@ -84,7 +84,7 @@
 ### range_constexpr vs range 的选择(关键)
 - `range_constexpr(...)`:编译期展开的 Python 循环,用于固定内层步数(MFMA cluster、tile repeat、`sched_*` emission)。**在其内部构建 register fragment 的 list 合法,正因为循环被展开**。
 - 若把这种循环改成运行时 `scf.for` → fragment list 会被打散、数据落内存,破坏寄存器驻留。
-- `range(start,stop,step,init=[...])`(bound 用 `fx.Index`) 是**唯一**能跨迭代携带 loop state 的方式;bound 必须是 `fx.Index` 否则静默 unroll 丢 init= 见 pitfalls/03-flydsl-tracer-literal-if-for。
+- `range(start,stop,step,init=[...])`(bound 用 `fx.Index`) 是**唯一**能跨迭代携带 loop state 的方式;bound 必须是 `fx.Index` 否则静默 unroll 丢 init= 见 pitfalls/07-flydsl-frontend-tracer.md。
 - loop-carried state 支持类型与 unwrap 规则见本文"FlyDSL 软件流水预取"一节。
 
 ### tracer literal-if 要 unwrap

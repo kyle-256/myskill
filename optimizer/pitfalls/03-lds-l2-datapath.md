@@ -1,6 +1,6 @@
 # LDS/L2 数据通路：容量、bank、带宽、预取与直读的边界
 
-> 类别: 踩过的坑 · 主题标签: LDS-vs-L2, occupancy, direct-load, mxfp4-8wave, LDS容量, prefetch双缓, blockwise-vs-tensorwise, L2-thrash, LDS-swizzle, bank-conflict, gfx950-vs-gfx942, ping-pong, 8-wave, LDS-bandwidth, ds_read, register-ceiling, decode, paged-KV, L2/HBM, gfx1250-TDM, DRAM带宽, copy_, 宽向量, quant天花板, prefetch, s_waitcnt, 软流水, latency-hiding
+> 类别: 踩过的坑 · 主题标签: LDS-vs-L2, occupancy, direct-load, mxfp4-8wave, LDS容量, prefetch双缓, blockwise-vs-tensorwise, L2-thrash, LDS-swizzle, bank-conflict, gfx950-vs-gfx942, ping-pong, 8-wave, LDS-bandwidth, ds_read, register-ceiling, decode, paged-KV, L2/HBM, DRAM带宽, copy_, 宽向量, quant天花板, prefetch, s_waitcnt, 软流水, latency-hiding
 
 ## 死路：A/B 从 LDS 改 direct global load，长 K 掉 2.5×
 
@@ -99,12 +99,6 @@
 - ❌ 别再试（在 memory 子系统已干净时找 KV-load 优化）：PA decode gfx942 实测(bs16 ctx131072 batch256) L2命中 **1.7%**、32B **0%**、over-fetch **1.04x**、**2.85TB/s = 54% 峰值** → memory 子系统干净，无 KV-load 优化空间。
   - 旁证1：`block_size 16→64` 回退 **+7.8%**（更大 block 反而更差，说明当前 block_size 已合适，不是 L2/blocking 问题）。
   - 旁证2：`dwordx8` 在 CDNA3 不存在——`dwordx4`/16B 是单向量 load 上限，别指望更宽 load。
-
-### gfx1250 TDM MoE row-gather：必须 addr64，否则硬 hang
-
-- TDM MoE row-gather **必须**用 carry-safe 的 `update_tensor_gather_descriptor_addr64`：它把 lo-add 的进位传播进 `addr_hi`。
-- ❌ 别再试短版 addr-lo-only update：会**静默 wrap 一个 4 GiB page**，只在大 tensor 规模下暴露为 **HARD HANG（不是错误结果）**，极难 debug。
-- gather descriptor 的构建（以及 B / B-scale descriptors）必须 **hoist 出 K loop**，否则循环 SALU-bound。
 
 ## torch copy_ ~5.0TB/s 不是 DRAM 天花板：自定义宽向量 copy 才达 ~6.3TB/s
 

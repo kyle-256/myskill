@@ -170,7 +170,7 @@
 - ❌ **BM=128 死路**：per-tensor 4096² 也用 BM256，BM128 更慢。
 
 ### 补充（不同项目/内核，勿与上文 dense WL 混淆）：分组 wgrad var-K whole-loop（源自 gpt_oss2 mxfp8-grouped-gg-devloop 优化6，非本环境 dense WL）
-- 以下数据来自**分组（grouped）GEMM 的 wgrad var-K** 4-wave bare-asm whole-loop 实验（`_build_grouped_mxfp8_wgrad_wl_kernel`，代码已于 2026-07-05 删除、从未提交），是与本卡 dense mxfp8 fwd WL **不同的内核/不同的 GEMM pass**，详见 `48-mxfp8-grouped-wgrad-vark.md`。
+- 以下数据来自**分组（grouped）GEMM 的 wgrad var-K** 4-wave bare-asm whole-loop 实验（`_build_grouped_mxfp8_wgrad_wl_kernel`，代码已于 2026-07-05 删除、从未提交），是与本卡 dense mxfp8 fwd WL **不同的内核/不同的 GEMM pass**，详见 methodology/12-mxfp8-grouped.md「grouped var-K wgrad」。
 - WL-unscaled（无 scale 计算地板）**只在 K∈{4096,2048} 3 个 shape 快 5-7%**；**K=7168 / 2880×2880 反慢 51-59%**。
 - 反常：**4096×7168（FLOP 更少）WL=1293 比 8192×4096 WL=911 还慢**；baseline 行为正常（857<946）。
 - rocprof 定位 4096×7168 vs 8192×4096：每 tile **逐字节相同、无 WG 级失衡**，但 **MfmaUtil 29.9 vs 54.8 / VALUBusy 5.8 vs 10.6 全线砍半、MemStall≈0** → 气泡在 barrier/依赖：per-phase `s_barrier` + `vmcnt(0)/lgkmcnt(0)` drain 在 **tile-grid 16×28（N=28 非 2 次幂）** 触发调度病态。
@@ -311,7 +311,7 @@ MXFP8 死路速查表——以下方向均已实测判负，勿重试。
   - **WHY**: FlyDSL 的 JIT 在编译 kernel 时会递归收集模块级依赖，同模块内的 torch import 让依赖图爆栈。
 - **解法**: 把 kernel 放**独立干净模块**（如 `mxfp8_quant_flydsl.py` 只 `import flydsl`，**不** `import torch`），只让 harness 脚本 `import torch`。
   - kernel 模块保持纯净 → JIT 依赖收集不再递归到 torch。
-- **区分维度**: 这是**模块隔离**维度的坑，区别于 `03-tracer`（tracer 字面 if/for）与 `35-encoding`（编码）。同为 JIT 相关但根因不同。
+- **区分维度**: 这是**模块隔离**维度的坑，区别于 pitfalls/07-flydsl-frontend-tracer.md（tracer 字面 if/for）与 pitfalls/11-porting-encoding.md（编码）。同为 JIT 相关但根因不同。
 
 ---
 来源: 08-att-root-cause.md, 04-ceiling-analysis.md, project_mxfp4_k28672_ceiling.md, project_mxfp4_epilogue_store.md, flydsl-fp8-gemm-results/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, mxfp8-grouped-gg-devloop/SKILL.md, 08-deadends.md, 05-dead-ends.md, 12-llama-aiter-baseline.md, mxfp8-8wave-devloop/SKILL.md, project_mxfp8_wholeloop_port.md, project_mxfp8_grouped_wgrad_wl.md

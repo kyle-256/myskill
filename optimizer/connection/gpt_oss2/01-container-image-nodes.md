@@ -33,7 +33,7 @@
 - **ProxyCommand 跳板节点**：`root@149.28.124.225`（hostname `chi2866`，登录/跳板节点）。WHY 用它做代理:计算节点不可直连,必须经此跳。
   - 跳板节点自身可跑 `sinfo` / `squeue` 查 Slurm 队列与节点状态。
 - **计算节点命令格式**：`./.ssh-chi.sh root@chi2811 '<cmd>'`。
-- 节点变更历史（含弃用/切换记录）：见 gpt_oss2/01-container-image-nodes.md
+- 节点变更历史（含弃用/切换记录）：见本卡「gpt_oss2 目标容器/镜像/生产节点现状」小节。
 
 ---
 来源: remote-sync/SKILL.md, project_remote_sync_setup.md, mxfp8-grouped-gg-devloop/SKILL.md, feedback_flydsl_cache_staleness.md, project_mxfp8_grouped_wgrad_wl.md

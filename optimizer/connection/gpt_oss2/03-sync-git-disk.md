@@ -23,11 +23,11 @@
   GIT_SSH_COMMAND="ssh -i /workspace/code/.ssh_docker/id_ed25519 -o StrictHostKeyChecking=no -o IdentitiesOnly=yes" git push origin <branch>
   ```
 - **必须推 `origin <branch>`,禁止推显式 URL**:显式 URL 不更新 tracking ref,会让 Cursor 面板假报 ahead。
-- push 后校验命令见 common/13-git-push-ssh-override
+- push 后校验命令见 connection/common/04-build-git-triton.md
 - **mxfp8 收尾实例**: 单 commit `dac31090` push 到分支 `dev/kyle/flydsl_mxfp8_compute`,用 key `/workspace/code/.ssh_docker/id_ed25519` + **force-with-lease**。
 - **远端只读 git**: 禁止在远程跑 `commit`/`checkout`/`reset`/`pull`;编辑只改本地再 `sync.sh push`(远端直接改会被冲掉)。
 - **Cursor co-author 陷阱**: `attributeCommitsToAgent` 会自动加 `Co-authored-by: Cursor` trailer → 须在 cli-config 关掉 + 加规则 `.cursor/rules/no-cursor-coauthor.mdc`(用户硬性要求 commit 不许出现 cursor)。
-- 参见 `common/13-git-push-ssh-override`：该文档描述的是 FlyDSL/显式 URL-override 场景（用 `git@` SSH URL 临时覆盖 HTTPS origin + `--force-with-lease`），与本卡片 origin-only 场景不同,不要混用两者规程。
+- 参见 `connection/common/04-build-git-triton.md`：该文档描述的是 FlyDSL/显式 URL-override 场景（用 `git@` SSH URL 临时覆盖 HTTPS origin + `--force-with-lease`），与本卡片 origin-only 场景不同,不要混用两者规程。
 
 ## gpt_oss2 磁盘清理边界(overlay 根盘常年紧)
 

@@ -85,10 +85,10 @@
 **进 epilogue 前必须清 `SmemPtr._view_cache = None`**
 - `SmemPtr.get()` 会缓存它创建的 view 到 `SmemPtr._view_cache`。若在运行时循环体内调用，缓存的 view 定义在循环 scope；epilogue（循环外/退出 scf.for 后）复用它会触发 MLIR SSA dominance 报错。
 - 解法：循环后、epilogue 前手动 `my_smem_ptr._view_cache = None`。已验证坑。
-- 配套规矩：raw memref 在 block 顶部一次性取好，让它 dominate 所有子 scf.for/scf.if region。if 分支变量不外泄的完整规则见 03-flydsl-tracer-literal-if-for。
+- 配套规矩：raw memref 在 block 顶部一次性取好，让它 dominate 所有子 scf.for/scf.if region。if 分支变量不外泄的完整规则见本卡「FlyDSL tracer 字面 if/for 坑」小节。
 
 **run-time loop 边界必须用 `fx.Index(...)` 不能用 Python int**
-- 细节/后果见 03-flydsl-tracer-literal-if-for。
+- 细节/后果见本卡「FlyDSL tracer 字面 if/for 坑」小节。
 
 **`arith.absf` 在 FlyDSL 不存在**
 - 求绝对值必须用组合：`neg = -v; is_neg = v < zero; out = is_neg.select(neg, v)`（Vector/ArithValue 运算符）。
