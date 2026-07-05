@@ -25,7 +25,7 @@
 - ping-pong LDS (lds_stage=2) 重叠 load 与 compute。
 - epilogue：直接行主序 store，或经 LDS 的 CShuffle 打包。
 
-## copy-atom 移植坑（raw buffer_ops → FlyDSL layout API）
+## copy-atom 移植坑（raw buffer_ops → FlyDSL layout API）（源自 gpt_oss2 环境的 FlyDSL fork，非本环境 sync/FlyDSL）
 - 移植路径：make_buffer_tensor + logical_divide + copy_atom_call（用 BufferCopy*b atom），替换手写字节运算 / shrui(...,2) / i32→dtype bitcast。
 - 坑1：copy_atom_call 没有 mask= 参数 → 必须重新加显式 is_valid.select(...) 或 `if is_valid` 的 OOB guard。
 - 坑2：wave-uniform 的 row offset 当前可能折进 voffset (VGPR) 而非 soffset (SGPR) → 移植后重新检查 VGPR 压力。
@@ -35,4 +35,4 @@
 - 典型 PA decode 输出：arch_vgpr=96 accum_vgpr=128 SGPR=80、2692 指令、78% 源映射。
 
 ---
-来源: gemm-optimization/SKILL.md, flydsl-kernel-authoring/SKILL.md, capture-kernel-trace/SKILL.md, optimization-directions.md, gemm/optimization-directions.md
+来源: gemm-optimization/SKILL.md, flydsl-kernel-authoring/SKILL.md, capture-kernel-trace/SKILL.md, optimization-directions.md, gemm/optimization-directions.md, port-to-layout-api/SKILL.md（gpt_oss2 FlyDSL fork：gpt_oss2_docker/sync/mxfp8/Primus-Turbo/3rdparty/FlyDSL/.claude/skills/，该 skill 不存在于本环境 gpt_oss_docker/sync/FlyDSL）

@@ -29,5 +29,13 @@
 - 有副作用 / 循环携带值 / 分支局部定义的**运行时分支**，应拆成 local helper 并把 `if` 包进 local `@flyc.jit` dispatch 函数里调用，不能直接写在 kernel 体内。
 - 深度内核调试（all-1s 测试、单 partition 隔离、MFMA 操作数 layout 检查）用 debug-flydsl-kernel skill。
 
+## 循环变量名残留被 JIT 折叠成常量
+- `for s in range_constexpr(4)` 结束后 Python 的 `s=3` 仍留在作用域，紧接着写 `s=(grow>>4)&3` **可能被折叠成常量 3**（变量名冲突导致 trace 折叠）。preshuffle 索引里的子块变量**必须改名为 `sub`** 而非复用 `s`。
+
+## dynamic scf.for loop-carry LDS 触发 lowering bug + 单值 carry 限制
+- 两条链式 dynamic `scf.for` loop-carry LDS shared-ptr 会触发 lowering bug：`unrealized_conversion_cast fly.ptr→llvm.ptr<3>` remained live（只能 balanced/无 tail 才跑）。❌ 别再试。
+- 动态 `scf.for` 只能 loop-carry **单个 MLIR 值**，carry 不了 32 个 vec 的 list（同上 iter_args 多值 carry 限制）。
+- module-level fn 里的 `if`（如 `if wave_m==1`）不被 AST 改写，会 `bool()` dynamic 报错；**conditional-barrier 必须 inline 在 kernel body**。
+
 ---
-来源: remote-sync/SKILL.md, 08-deadends.md, prefetch-data-load/SKILL.md, flydsl-kernel-authoring/SKILL.md, flydsl-tile-programming/SKILL.md, debug-flydsl-kernel/SKILL.md, programming-model.md, agpr_phase5_lds.md
+来源: remote-sync/SKILL.md, 08-deadends.md, prefetch-data-load/SKILL.md, flydsl-kernel-authoring/SKILL.md, flydsl-tile-programming/SKILL.md, debug-flydsl-kernel/SKILL.md, programming-model.md, agpr_phase5_lds.md, mxfp8-8wave-devloop/SKILL.md, mxfp8-grouped-gg-devloop/SKILL.md

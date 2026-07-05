@@ -21,4 +21,4 @@
   - WHY 危险：没有异常、没有崩溃，结果只是"数值不对"。排查时**必须拿 index 去对取整后的预算交叉核对**，而不是当成算法/精度 bug 去查。
 
 ---
-来源: gfx950/overview.md
+来源: gfx942/overview.md（85→84 VGPR 示例、CDNA3 不 fault 表述，line 47/49）+ gfx950/overview.md（LDS 量子 1280B、CDNA4 不 fault 表述，line 51）

@@ -20,8 +20,15 @@
 - **不在 traced 闭包内的 helper 代码**：同理不失效。
 - **应 re-specialize 的 shape 但共享 dtype key**：被 stale cache 掩盖。相关坑：`make_buffer_tensor(t)` 要保持默认 `max_size=True`——因为 key on dtype not shape，首个 shape 捕获的 `num_records` 会在后续更大 tensor 上静默截断。
 
+- **comgr 缓存**：除 `~/.flydsl/cache` 外还有 `/root/.cache/comgr`。
+- **in-memory ASM 缓存 `_MX_WL_ASM_CACHE`**：env 驱动改 asm 发射时，须把 env flag **全部加进 key**，否则内存层也复用旧 asm。
+
 **金标准验证（唯一可信的判缓存是否失效的办法）**
 - 故意把核**改算错**（如 scale×2）**不清缓存**跑：出 NaN/错 = 缓存正常失效；仍出旧正确 SNR = 缓存陈旧，你之前所有结果都不可信。
+- **rocprofv3 寄存器 ground truth**：一组本该不同的探针若给出逐字节相同的时间/寄存器（如都 807us、VGPR=256/SGPR=112，或 WL 恒 ~843us），八成是 stale 命中。rocprofv3 kernel-trace CSV 列 `VGPR_Count` / `Accum_VGPR_Count` / `SGPR_Count` / `Scratch_Size` 是判内核到底变没变的可靠 ground truth。
+
+**被此坑污染的历史假阴性（清缓存重测）**
+- MXFP8 "scale 双缓冲预取无收益"、"scale-128 perf-neutral" 极可能是 stale-cache 污染的假 negative，需 `rm -rf` 清缓存重测。grouped wgrad 已翻案：清缓存后根因完全不同。
 
 **解法（优先级从高到低）**
 1. 把可编辑 kernel 逻辑放进 `@kernel` 函数体 / 嵌套 def / 嵌套 class —— 首选，零踩坑。
@@ -31,4 +38,4 @@
 - 铁律：任何 "改动没效果" 的结论，**先无条件 `rm -rf ~/.flydsl /tmp/flydsl*` + 清 lru_cache 重跑**，再谈结果。
 
 ---
-来源: flydsl-sync/SKILL.md, pr-merge-gate/SKILL.md, 03-emit-knobs.md, debug-flydsl-kernel/SKILL.md, FlyDSL/CLAUDE.md, programming-model.md
+来源: flydsl-sync/SKILL.md, pr-merge-gate/SKILL.md, 03-emit-knobs.md, debug-flydsl-kernel/SKILL.md, FlyDSL/CLAUDE.md, programming-model.md, mxfp8-8wave-devloop/SKILL.md, mxfp8-grouped-gg-devloop/SKILL.md, feedback_flydsl_cache_staleness.md, project_mxfp8_grouped_wgrad_wl.md

@@ -9,7 +9,7 @@
 - ATT 可区分 MFMA stall 到底是等 **operand bubble**(g2s+ds_read 没就绪)还是等**显式 waitcnt**。
 
 ## 为什么 ATT 是权威工具
-- rocprofv3 汇总 / out_kernel_trace.csv 会**误报 VGPR-bound**;ATT+CSV 才能权威分辨到底是 **LDS-bound** 还是 **VGPR-bound**。
+- 仅靠 ISA 扫描(code.json,不看 CSV)会**误报 VGPR-bound**——把 `v_mfma` 里的 `a[...]` 寄存器引用误判成 agpr-form;`out_kernel_trace.csv` 才是权威(Accum_VGPR_Count=0、vgpr-form、combined≈216),揭示真实瓶颈其实是 **LDS-bound**。ATT(code.json)+ CSV 合参才能权威定位 stall 根因。
 - ATT 把 per-instruction stall 映射到源码行,是定位 MFMA stall 根因的权威工具。
 
 ## 采集流程

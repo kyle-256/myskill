@@ -15,4 +15,4 @@
 - ❌ 别再试：多 agent 共用同一 `TRITON_CACHE_DIR`——撞 `.triton.lock`。
 
 ---
-来源: 07-benchmarking.md, 08-deadends.md, 10-grouped-wgrad-4wave-3buf.md, SKILL.md
+来源: 07-benchmarking.md, 08-deadends.md, 10-grouped-wgrad-4wave-3buf.md, gpu-fleet-tuning/SKILL.md

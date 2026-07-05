@@ -37,5 +37,14 @@
 - 低精度主 gate 必须用 **SNR 门**：`compute_snr(ref, actual)`，参数 **reference 在前**。
 - 只用于诊断（非 gate）：`relative_error` / `mean_squared_error` / `max_abs_error` / `cosine_similarity` / `symmetric_similarity_diff`。
 
+## fp8 TN big-shape 典型瓶颈画像（profile 解读）
+- **VMEM Utilization ~3%** → 不是 memory/store/带宽 bound。
+- **Dependency Wait 高（source 未给具体数字）+ MFMA Util ~34-40% + Occupancy ~1 WG/CU** → latency-bound（8 waves 喂不饱 MFMA+tr8 延迟链）。
+- **L2 Cache Hit**：square/big-K ~66%，big-N ~51%（L2 复用差是大 N 的主瓶颈）。
+
+## （另一内核）wgrad 4-wave 3buf 的 bank conflict / chunk_stride
+- 这是**不同内核**（grouped wgrad 4-wave 3-buffer transpose-read 内核，非上面的 dense-TN autotune 内核）：`chunk_stride=1056` padding 消掉了转置读的 bank conflict，`1 池@1056 = 0%，2 池@1024 = 14%`（`_CS` 越界会导致 LDS 超限编译报错）。
+- 来源：10-grouped-wgrad-4wave-3buf.md, project_wgrad_occ_feed_bound.md（不属于 fp8 TN big-shape 画像）。
+
 ---
-来源: fp8-gemm-bench/SKILL.md, 05-dead-ends.md, 10-grouped-wgrad-4wave-3buf.md, project_mxfp4_epilogue_store.md, verify-accuracy/SKILL.md
+来源: fp8-gemm-bench/SKILL.md, 05-dead-ends.md, 10-grouped-wgrad-4wave-3buf.md, project_mxfp4_epilogue_store.md, verify-accuracy/SKILL.md, flydsl-fp8-gemm-tuning/SKILL.md, project_wgrad_occ_feed_bound.md

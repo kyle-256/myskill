@@ -9,7 +9,7 @@
   - `over-fetch = est_HBM / (ideal_GB × dispatches) ≈ 1.0x` = 只读所需数据
   - 达到的带宽 `= ideal_bytes / kernel_time`；对干净 streaming，**50-60% 理论 HBM 峰值是正常的**，不是可优化的低效。
 - ❌ 别再试（在 memory 子系统已干净时找 KV-load 优化）：PA decode gfx942 实测(bs16 ctx131072 batch256) L2命中 **1.7%**、32B **0%**、over-fetch **1.04x**、**2.85TB/s = 54% 峰值** → memory 子系统干净，无 KV-load 优化空间。
-  - 旁证1：`block_size 16→64` 回退 **+7.8%**（大 block 更好，不是 L2 问题）。
+  - 旁证1：`block_size 16→64` 回退 **+7.8%**（更大 block 反而更差，说明当前 block_size 已合适，不是 L2/blocking 问题）。
   - 旁证2：`dwordx8` 在 CDNA3 不存在——`dwordx4`/16B 是单向量 load 上限，别指望更宽 load。
 
 ## gfx1250 TDM MoE row-gather：必须 addr64，否则硬 hang

@@ -19,6 +19,7 @@
 - Benchmark acceptance discipline: improvement **<2%** 属近噪声 → 重测 **>=3x**，只在 mean improvement **>1%** 且 **stddev < 收益幅度的一半** 时接受，否则判噪声 reject。
 - 正确性是硬门：任何行 Check=FAIL → aggregate score = 0，立即 reject。
 - 任一 core shape 在主接受指标上回归 **>=5%** → 默认 reject。
+- best-of-3/4 bench + 多次复测区分真假：只在确认真实进步（超噪声）**且 user 认可**后，才把改动合成**单个干净 commit**。
 
 **interleaved A/B 是唯一可信判胜法**
 - 正解 = interleaved A/B：**同进程**交替 config A/B × N-trial，**win-count** 判胜（不是比均值绝对数）。WHY: 交替执行让两者共享同一时钟/温度轨迹，抵消 DVFS 与热漂移。
@@ -35,4 +36,4 @@
 - 非 GEMM op：保留 `label/Check/*_stddev` 约定，只换掉 GEMM 专用列。
 
 ---
-来源: remote-sync/SKILL.md, pr-merge-gate/SKILL.md, 08-deadends.md, optimize-handoff/SKILL.md, optimize-loop.md
+来源: remote-sync/SKILL.md, pr-merge-gate/SKILL.md, 08-deadends.md, optimize-handoff/SKILL.md, optimize-loop.md, flydsl-fp8-gemm-tuning/SKILL.md

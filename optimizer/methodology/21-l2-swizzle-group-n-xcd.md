@@ -15,10 +15,12 @@
 | 类型 | 做法 | 甜点 | 实测 |
 |---|---|---|---|
 | **1D M-cluster (group_m)** | 连续 `group_m` 个 M-tile 归同一 M-band,XCD-aware 调度到同 XCD 的 CU→`B[g]` 的 N-stripe 在同 XCD L2 resident | 默认 `nt_group_m=4`, `nt_num_xcd=8`(固定=物理 XCD 数) | 基线 lever |
-| **2D band (group_n)** | N 切成宽 `group_n` 的竖带,带内再 `GROUP_M` 1D;把 working set(`GROUP_M·A_slab` + `group_n·B_slab`,各 ~2MB)锁进 L2;每组 A 的 M-slab 被多组复用 | `GROUP_M=4`, `group_n = n_blocks/8`(band 数=8=#XCD) | **big-N +12%**(L2 51→57.5%,MFMA 34→40%);big-K +1%;square 无回归 |
+| **2D band (group_n)** | N 切成宽 `group_n` 的竖带,带内再 `GROUP_M` 1D;把 working set(`GROUP_M·A_slab` + `group_n·B_slab`,各 ~2MB)锁进 L2;A 复用 `group_n`×、B 复用 `GROUP_M`× | `GROUP_M=4`, `group_n = n_blocks/8`(band 数=8=#XCD) | **big-N GM4×GN14 → +12%**(L2 51→57.5%,MFMA 34→40%,det1000=0);big-K 也 +1%;square/ffn_down 无回归。commit `7269aebc` |
 | **XCD WG-id remap** | 保持 `chunk_size` 个连续 id 在同 XCD:`chunk_idx*(num_xcds*chunk_size) + xcd*chunk_size + pos`→相邻 tile 共暖 L2 | — | GEMM/attention 有空间局部性时是实打实的 win |
 
-- 2D band 触发条件:大-N shape(N≥2880 / N_BLOCKS_N 够多)才加 `group_n`;`group_n = N_BLOCKS_N//8`(#bands=#XCD)对 big-N 另有 **+8~9%** 口径。
+- 2D band 触发条件:大-N shape(N≥2880 / N_BLOCKS_N 够多)才加 `group_n`;`group_n = N_BLOCKS_N//8`(#bands=#XCD)对 big-N 另有 **+8~9%** 口径。big-N 瓶颈是 L2 复用(1D GROUP_M 对每 M-group 重复 stream 整个 B 234MB → L2 51% vs big-K 66%);big-K 的 drain-removal / both-J **❌ 不迁移到 big-N**(短 K 摊不开,both-J 在 big-N 上是噪声)。
+- **band det 中性**:纯 tile→CU permutation,满 band 各占 `num_pid_m·GN` 个 pid、余数成最后一个窄 band,恒为 bijection。
+- **2D autotune gating**:候选 gated `n_blocks>=32 and M//256>=16`(小 M 的 m-block 太少、banding 不划算,走 1D 防回归);winK 块(K≥28672)也 sweep `group_n ∈ {n_blocks/8, n_blocks/4}`。
 - **persistent kernel** 要 remap 的是 **PERSISTENT work-id,不是 `blockIdx.x`**。
 
 ## 调参规律(4 轴 autotune)
@@ -29,4 +31,4 @@
 - **CUDA-graph capture 内无法定时→回退静态启发式**。
 
 ---
-来源: flydsl-fp8-gemm-tuning/SKILL.md, 02-nt-fwd-kernel.md, gfx950/kernel-implementation-notes.md, 13-primus-turbo-prod.md
+来源: flydsl-fp8-gemm-tuning/SKILL.md, 02-nt-fwd-kernel.md, gfx950/kernel-implementation-notes.md, 13-primus-turbo-prod.md, kernel-optimize/knowledge/ops/gemm/optimization-directions.md

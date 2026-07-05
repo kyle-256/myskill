@@ -19,7 +19,7 @@
 - `import primus_turbo.pytorch` 报 `undefined symbol ...hk_gemm_bf16`：untracked HK dense binding 引用不存在的 kernel .cu。
 - HK 后端已于 **2026-06-01** 整体移除（dense+grouped 全 untracked WIP，无 python 引用）。
 - 残留导致 build 失败的清理步骤：
-  1. 删 `hk_gemm_hip.cpp`、`hk_grouped_gemm_hip*.cpp`、`csrc/kernels/grouped_gemm/HipKittens/`
+  1. 删 `csrc/pytorch/gemm/hk_gemm_hip.cpp`、`csrc/pytorch/grouped_gemm/hk_grouped_gemm_hip*.cpp`、`csrc/kernels/grouped_gemm/HipKittens/`
   2. 从 `bindings_pytorch_hip.cpp` + `extensions_hip.h` 去掉所有 `hk_gemm*`/`hk_grouped*` 的 def/impl/声明
   3. nuke `build/` + `_C*.so` 重 build
 

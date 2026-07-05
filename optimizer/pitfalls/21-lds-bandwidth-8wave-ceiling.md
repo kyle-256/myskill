@@ -1,8 +1,8 @@
-# 8-wave mxfp4 结构封顶 ~4690-4900T：三道墙皆因 2 waves/SIMD
+# 8-wave mxfp4 结构封顶 ~4690-4760T：三道墙皆因 2 waves/SIMD
 
 > 类别: 踩过的坑 · 主题标签: 8-wave, LDS-bandwidth, ds_read, register-ceiling
 
-- **结构性封顶 ~4690-4900T**：8-wave mxfp4 架构上限就在这，三道墙全部根因 = **2 waves/SIMD**（8-wave = 2 waves/SIMD → 每 wave 硬顶 512/2 = 256 寄存器）。
+- **结构性封顶**：skill09（2026-06-24）初测给出 **~4900T**（pipe 配置 med/min=4817/4855）；skill10（2026-06-25，PMC+调度实验后）最终裁定修正为 **~4690-4760T**（baseline min/med=4744/4690）。两者是同一课题先后两次迭代的数字，以 skill10 的最终裁定为准。三道墙全部根因 = **2 waves/SIMD**（8-wave = 2 waves/SIMD → 每 wave 硬顶 512/2 = 256 寄存器）。
   - **墙①：LDS 读 A operand 4× 冗余**。8-wave 的 2×4 A frag 被 4 个 N-wave 各读一遍，ds_read/flop = 0.0234 vs 4-wave 0.0156。
   - **墙②：LDS 160KB 装不下大 tile 双缓**。BN512 BK256 = 192KB > 160KB，无法 double-buffer。
   - **墙③：寄存器 256@occ2 装不下 64 accs**。要 128×128 方形 tile 需 256 AGPR 累加器，已占满 256，operand/预取 0 空间。给一个 wave 428 寄存器（172V+256A）的唯一办法 = 降到 1 wave/SIMD = 4 waves/wg = 就是 4-wave kernel 本身。

@@ -7,7 +7,7 @@
   1. **`_wmma_op` call**：gfx11 是 v16 operands，lanes 16-31 镜像 lanes 0-15；gfx120x 是 v8 operands。
   2. **LDS-read shape**：读法随代际变。
   3. **accumulator store-back row 公式**：用错公式会**静默地把输出行转置**（不报错，结果错），最难查。
-  4. **barrier asm**：gfx11 = `s_waitcnt lgkmcnt(0)` + `s_barrier`；gfx12+ = 拆成 `s_barrier_signal` / `s_barrier_wait` 两条。
+  4. **barrier asm**：gfx11 = `s_waitcnt lgkmcnt(0)` + `s_barrier`；gfx12+ = 拆成 `s_barrier_signal` / `s_barrier_wait` / `s_wait_dscnt` 三条。
 - **内层 WMMA 循环保持 'load all B, then 1 A -> reg_n WMMAs'**。❌ 别再试反转成先 load A：反转会膨胀寄存器压力并 spill。
 - **CDNA vs RDNA 判定的单一真相是 `is_rdna_arch()`**（`python/flydsl/runtime/device.py`）。❌ 别再试硬编码 `gfx*` 条件。
   - `wave32-true` 只匹配 `gfx10*`/`gfx11*`/`gfx120*` 前缀，**不匹配 `gfx1250`**。

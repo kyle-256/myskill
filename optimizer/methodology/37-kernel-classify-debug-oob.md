@@ -57,4 +57,4 @@
 - 加新 atom 后:**先跑 FileCheck,再跑 1-wave 端到端 Python kernel**,才能信 layout。
 
 ---
-来源: flydsl-tile-programming/SKILL.md, debug-flydsl-kernel/SKILL.md, programming-model.md, oob-detection/SKILL.md
+来源: flydsl-tile-programming/SKILL.md, debug-flydsl-kernel/SKILL.md, programming-model.md, oob-detection/SKILL.md, add-target-atom-op/SKILL.md（"先跑 FileCheck 再跑 1-wave 端到端"一条出自此文件 Step 9）

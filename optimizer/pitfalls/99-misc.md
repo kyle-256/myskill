@@ -47,4 +47,4 @@
 - ❌ 别 pipe bench/test 命令过 `| tail / | head / | grep / 任何 filter`——piping 强制 stdout 全缓冲，隐藏中间输出、让运行中的命令看起来 hang。先 `> out.txt 2>&1` 重定向，完成后再读/搜。backgrounded(超时)命令不算完成：只有进程退出 **且** 预期产物落盘才算一轮完成。
 
 ---
-来源: mi300-blockwise-gg-tuning/SKILL.md, 08-deadends.md, 03-emit-knobs.md, gemm-optimization/SKILL.md, debug-flydsl-kernel/SKILL.md, FlyDSL/CLAUDE.md, programming-model.md, optimization-directions.md, optimize-loop.md
+来源: mi300-blockwise-gg-tuning/SKILL.md, 08-deadends.md, 03-emit-knobs.md, gemm-optimization/SKILL.md, debug-flydsl-kernel/SKILL.md, FlyDSL/CLAUDE.md, programming-model.md, hardware/gfx950(或gfx942)/kernel-implementation-notes.md, optimize-loop.md

@@ -26,6 +26,13 @@
 - **默认只查已提交 `origin/main..HEAD` diff**(匹配 CI 在 pushed branch 所见);`--include-local` 才纳入未提交/staged/untracked;`--fix --include-local` 也格式化本地未提交文件。
 - 格式化只对改动文件的 staged+unstaged 并集去重:`(git diff --name-only --cached; git diff --name-only) | sort -u`;无改动则不做事。in-place 编辑会让之前 staged 的文件再次显示 modified → **提醒重新 `git add`**。
 
+## lint 与 CI 同源(Primus-Turbo 已全面迁 ruff,别再套 black 那套)
+- **两份 Primus-Turbo(tensorwise、mxfp4)当前签出分支均已完成 ruff 迁移**(PR #392 已合,`bc6c7d2a` 是两分支 HEAD 的祖先):`pyproject.toml` `[tool.ruff]` line-length=110、select **B/F/I/W**、ignore **F403/F405/B905/B007/B028**;CI 跑 `ruff check` + `ruff format --check`,加 check-toml/check-ast/check-case-conflict/debug-statements/detect-private-key;ruff/pre-commit/clang-format 版本 pin 在 `requirements.txt`。`.pre-commit-config.yaml` 也已配 ruff-pre-commit,**没有 black/autoflake/isort 钩子**,不存在仍在用 black 的现行分支。
+- 上面第 18-21 节讲的 FlyDSL 仓库 black(line-length 120)+ruff lint(E/W/F/I) 是另一套体系(FlyDSL 专用),别和 Primus-Turbo 的 ruff-only 体系混为同一议题的两个时间阶段。
+- 透传形参为对齐姊妹 API 不算 dead(ruff 的 unused-arg 别误删)。
+
+> （源自 gpt_oss2 mxfp8-grouped-gg-devloop 项目，非本环境）**format 债 vs feature 拆两 commit**:若某文件里有一批 ruff 迁移前就存在的 `ruff format` 不合规行,你的改动一碰这些文件会连既有债一起报红,别把重排版和 feature 混进一个 commit。做法:先 `git stash` feature 改动 → `ruff format` 全文件 → 提一个纯 style commit(`style(...): ruff-format ...`,只有重排版、零逻辑);再 `git stash pop` → `ruff format` → 提干净的 feature commit;若 stash pop 因排版基线变化冲突,直接以格式化后基线为准重放语义 hunk;两个 commit 各自 `ruff format --check` 全绿再 push。（源: gpt_oss2 `myskill/pr-merge-gate/SKILL.md`、`myskill/mxfp8-grouped-gg-devloop/SKILL.md`）
+
 ## Primus-Turbo 五层垂直切片
 每个 operator 是穿过 5 层的垂直切片,**开发第一步是判断改哪层**:
 1. `modules/` — nn.Module 包装。

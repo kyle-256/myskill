@@ -11,6 +11,8 @@
   - 发现 metric `rocprof-compute profile --list-metrics`;counter `rocprofv3 --list-counters`
   - flags 随 ROCm 版本变,scripting 前先 `--help` 确认
 - analyze 后 grep:MFMA Util / L2 Cache Hit / Dependency Wait / VMEM Util / Wavefront Occ / Insufficient SIMD VGPR / Insufficient CU LDS / Bank Conflict。
+- **先 profile 再调常数**:❌ 别再试 靠实验扫常数(vmcnt_hint/lgkmcnt/barrier_mask 等)——必须先 rocprof-compute + ISA disasm 做理论分析,再决定调什么。扫 tile-blocking 因子(GROUP_M/group_n)时,要测 L2 命中率作机制依据才算 grounded。
+- 诊断命令模板:`rocprof-compute profile -n <tag> --no-roof -- python <pmc_run.py>`(pmc_run 跑 kernel 5-10 次)→ `rocprof-compute analyze -p workloads/<tag>/MI* | grep -iE "MFMA Util|L2 Cache Hit|Dependency Wait|VMEM Util|Wavefront Occ|Insufficient SIMD VGPR|Insufficient CU LDS|Bank Conflict"`。
 
 ## 第 0 步:先看 GPU 利用率,别急着 micro-tune
 - **>60%** 才够 GPU-bound,值得 kernel 级优化。

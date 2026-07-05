@@ -7,6 +7,9 @@
 - **tail tile 必须重新(FRESHLY)解码 scale**:沿用 prologue 的 scale state / 用了 stale scale 会污染最后一个 K block。
 - FP8 requant 带来的 **1-5% mismatch 是预期容差,不是 bug**。
 
+## 低精度对标要选同类 MFMA 指令
+- **mxfp8 是 scaled-MFMA**(`v_mfma_scale_f32` 每条多读 2 个 scale 操作数),合理对标是 **scaled 的 aiter mxfp8**(mxfp4 达 98%),**不是**非-scaled per-tensor(per-tensor 用 `v_mfma_f32` 非-scaled)。别拿非-scaled 基线冤枉 scaled 内核。
+
 ## 低精度验证策略(profiling 不够,必须分步验)
 1. 单独验 conversion 和 packing。
 2. block-scaled 路径单独验 scale 处理。
@@ -32,4 +35,4 @@
 - 把唯一的 `>>4` hoist 出循环;若把 x16 correction / groupwise scale 推迟到 epilogue,则 epilogue **必须**施加它。
 
 ---
-来源: gemm/optimization-directions.md, tool-rocprof/SKILL.md, project_mxfp4_epilogue_store.md, optimization-directions.md
+来源: gemm/optimization-directions.md, tool-rocprof/SKILL.md, project_mxfp4_epilogue_store.md, optimization-directions.md, project_mxfp8_wholeloop_port.md

@@ -16,5 +16,11 @@
 
 - **移植 4-wave kernel 要单独 vendor helper，不复用 gemm_helper.py**：turbo 产品化的 8-wave 把原语分叉了——`Mfma16x16x128` 去掉 `call_one`、`G2S/S2RLoader` 去掉 `load_one`、`StoreC→StoreCPerTensor`（per-tensor 标量 scale，非 row/col-wise）。4-wave 直接 import 会崩。vendor 一份保证 bench-identical 且不碰 8-wave。
 
+- **Primus-Turbo（mxfp4/tensorwise，本环境）放行硬门禁（缺一不可）**：`pre-commit run --files <改动>` 全绿（ruff check/format + clang-format + shellcheck，无 isort/black/autoflake）；SNR 正确（rowwise ~56dB、tensorwise ~40-47dB，odd-K 单独验）；整除-K 零回归；FlyDSL 改动需确认 JIT 缓存确实失效（否则测的是旧核）；性能须是同脚本相对比较+多轮均值下超过 DVFS 噪声带的真增益；改 csrc 须对应 venv 重 `pip install -e . --no-build-isolation`；git 干净、author=`kyle-256 <Kyle.Zhao@amd.com>` 无 coauthor；只在用户明确要求时 commit/push。
+  - （源自 gpt_oss2 mxfp8 项目 pr-merge-gate/SKILL.md，非本环境）：该项目门禁另含 `pytest <file> -q -p no:randomly` + `--deterministic-only -q -p no:randomly`，无 `Fatal Python error: Aborted` / HIP 非法访存，det 10 次 repeat bit-exact **0 失败是红线**，改 csrc/triton 用 `setup.py build_ext --inplace` 重 build。
+
+- **绿了先证伪（DVFS 功耗墙 + JIT 缓存陈旧，本环境）**：fp8/mxfp4 GEMM 在真实幅度数据下是 DVFS 功耗受限，同核 zeros→randn 速度差 21-37%，跨脚本绝对 TFLOPS 方差 ~8-12%，极易把噪声/频率差当真增益。证伪手段：同脚本同数据相对比较（只信比值不信绝对值）；多轮均值（单轮噪声 ±0.3-0.5pp）；复用同一输出 buffer 防 overlap 膨胀虚高吞吐；`rocm-smi` 查是否掉频。增幅 < DVFS 噪声带（~2-3%）视为噪声，不放行。
+  - （源自 gpt_oss2 mxfp8 项目 pr-merge-gate/SKILL.md 的"绿了也要先证伪"一节，非本环境）：该项目讲的是 `torch.empty` 假绿——低精度 grouped GEMM kernel 靠 allocator 碰巧非 NaN 通过，无关改动改变 allocator 布局会把 latent 越界/未初始化读从隐形变 NaN/Abort。证伪手段：`-e PYTORCH_NO_CUDA_MEMORY_CACHING=1` 复跑（由红变绿=未初始化内存/越界被布局掩盖，非真修）；full suite 连跑 ≥2 次确认稳定；同节点 A/B（`git stash` diff 跑 baseline、pop 跑 diff）锁定触发者。
+
 ---
-来源: 13-primus-turbo-prod.md, 12-llama-aiter-baseline.md, remote-sync/SKILL.md
+来源: 13-primus-turbo-prod.md, 12-llama-aiter-baseline.md, remote-sync/SKILL.md, pr-merge-gate/SKILL.md

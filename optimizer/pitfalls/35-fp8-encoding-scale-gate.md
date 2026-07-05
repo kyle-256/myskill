@@ -17,6 +17,12 @@
   - ❌ 别再试 `Vec.to(Float8E4M3FN)`：走 `arith.truncf`，后端**不 lower**。fp8 cast 要用 `fx.rocdl.cvt_pk_fp8_f32`（2 f32 → 2 fp8/op）。
   - ❌ 别再试 `cvt_scalef32_pk8_fp8_bf16`：gfx950 上 **Cannot select，不可用**。
   - ❌ 别再试 `create_buffer_resource(max_size=True)`：会 OOB 读到垃圾。用 `max_size=False, num_records_bytes=...`。
+- **FlyDSL 常见编译错误修法清单**：
+  - `RecursionError` → kernel / torch 分拆成独立文件。
+  - `'Float32' has no bitcast`（`.reduce("max")` 返回 Float32）→ 用 `(F32(0.0)>ca).select(F32(0.0), ca)` 包一层。
+  - `arith.truncf not lowerable`（`.to(fp8)`）→ 改 `rocdl.cvt_pk_fp8_f32`（同上条 fp8 cast 约束）。
+  - `ScalarizeVectorOperand LLVM ERROR`（`buffer_store` 写 bf16 scalar）→ 改写 int32 打包 fp8。
+  - `'Int32' has no bitcast` → 用 `fm.exp2(ep.to(F32))`。
 
 ---
-来源: fp8-gemm-bench/SKILL.md, overview.md, tool-rocprof/SKILL.md, flydsl-sync/SKILL.md, gfx942/kernel-implementation-notes.md
+来源: fp8-gemm-bench/SKILL.md, overview.md, tool-rocprof/SKILL.md, flydsl-sync/SKILL.md, gfx942/kernel-implementation-notes.md, gfx950/kernel-implementation-notes.md, mxfp8-8wave-devloop/SKILL.md

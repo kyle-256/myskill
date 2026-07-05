@@ -1,4 +1,4 @@
-# 正确性门:SNR 阈值、det=0 bit-exact ≥500-2000 run、outdiff=0 证同源
+# 正确性门:SNR 阈值、det=0 bit-exact ≥500-1000 run(强测 2×2000)、outdiff=0 证同源
 
 > 类别: 方法论 · 主题标签: SNR-gate, determinism, correctness, race-debug
 
@@ -28,7 +28,7 @@
 - WHY:同源参考路径产生同样量化误差,数值完全一致说明差异来自 quant 而非 kernel 计算。
 
 ## det=0(bit-exact)验证:run 数与 fresh 随机
-- **必须 ≥500-1000 run**(200-run 会假阳性);SNR 不掉(55/79/87 dB 看 scale)**不代表 det=0**。
+- **必须 ≥500-1000 run**(200-run 会假阳性);SNR 不掉(55/79/87 dB 看 scale)**不代表 det=0**。（源自 gpt_oss2 mxfp8 项目实例，非本环境:`vmcnt_hint=4` 在 200 run 看 det=0,500 run 才暴露 **1.5e-5** race,见 gpt_oss2_docker/myskill/flydsl-fp8-gemm-tuning/SKILL.md）
 - 强测 = cache_clear + **≥2×2000 run**,每 pass 换 **fresh mk() 随机 a,b**。WHY:race 是 data-dependent + intermittent,固定随机会漏。
 - 小 K(如 K512)门:SNR≥55 dB 且 det=0,DETRUNS≥4(严验用 ≥6 甚至 30)。
 

@@ -5,7 +5,7 @@
 **cache 纪律**
 - ❌ 别再试：autotune 里 result cache(缓存 quantize/transpose/group_offs 的结果)和任何 **id(tensor)-keyed** cache。id(tensor) 会复用/回收——同一地址可指向不同数据,cache 命中即数据错误。
 - 只能 cache 两种东西：compiled object(`flyc.compile` 产物)和 launch closure(闭包**不含 data**,只含 launch 参数)。
-- cache key 用**纯静态维度**：`(op, N, K, G, M_total, cbsz, blgp)`。WHY：这些是唯一决定最优 kernel 的量,不含运行期 buffer 身份。
+- cache key 用**纯静态维度**：`(op, N, K, G, M_total, out_fp16, cbsz, blgp)`。WHY：这些是唯一决定最优 kernel 的量,不含运行期 buffer 身份。
 
 **per-shape 过拟合(overfit)**
 - ❌ 别再试：dgrad NN 按 c_n 做 per-shape `num_xcd`。实测 **−0.5%** 负杠杆,没有干净物理阈值——属于纯 overfitting。

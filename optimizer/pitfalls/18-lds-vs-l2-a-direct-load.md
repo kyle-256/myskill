@@ -8,9 +8,9 @@
   - 等价复现历史 X 变体失败模式。
   - raw-AGPR 腾 VGPR 也**救不了**：瓶颈是 **occupancy 不是 VGPR 数**。
 
-- ❌ 别再试：B 操作数直载到 VGPR 跳过 LDS → **慢 4×**。
-  - 原因：相邻 lane 地址差 **K 步长** → uncoalesced。
-  - B 走 LDS 的**唯一目的**就是把 gather 变 coalesce。
+- ❌ 别再试：B 操作数直载到 VGPR 跳过 LDS（b_vgpr）→ mxfp4-8wave 实测**慢 ~22%**（4096²×8192 77.8%），已 bit-exact 非坏但慢。
+  - 原因：8wave 同 wave_n 的多 wave 本可协作共享 LDS 中的 B，b_vgpr 让每 wave 各自从 global 冗余重载 B → 省了 LDS 读却暴增 global 流量。
+  - （另有 fp8 dense/grouped GEMM 调优环境下的说法是"慢 4×，因相邻 lane 地址差 K 步长 uncoalesced"，见 08-deadends.md，但那是不同 kernel/context，非本 mxfp4-8wave 场景，不可混用。）
 
 - ❌ 别再试（实测推翻旧误判）：把 8-wave mxfp4 GEMM 的 occupancy 当 LDS-bound。真相是 **REGISTER-bound**。
   - 128 VGPR + 128 AGPR = 256 共享 512 寄存器文件 → 硬卡 **2 waves/SIMD = 1 wg/CU**。

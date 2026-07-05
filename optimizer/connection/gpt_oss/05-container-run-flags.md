@@ -43,4 +43,4 @@ docker run -d --name=mlperf_gptoss \
 - SSH 连接防挂死:`ssh -o ConnectTimeout=30`。
 
 ---
-来源: claim-mi355x-node/SKILL.md, build-rocm-image/SKILL.md
+来源: claim-mi355x-node/SKILL.md；build-rocm-image/SKILL.md(仅借用其中 `--progress=plain` 与交互式 `docker run -it` 两条通用 docker 用法提示，该 skill 其余内容是构建 rocm-dev-custom:main 通用镜像的完全不同工作流，与本卡片的 mlperf_gptoss 容器无关)

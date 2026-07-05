@@ -7,6 +7,12 @@
   - fwd **1.19×**、dgrad **1.14×**、wgrad **1.91×**(wgrad 相对优势最大,单 shape 最高 **2.11×**)
 - vs GB200/TE(288 case):
   - fwd geomean **1.80×**、bwd **1.36×**,**286/288 PASS**(int64 解锁所有 shape)
+- **MXFP8**(LDS-合并转置写)vs GB200(9 Llama shape,SNR 全 28dB):
+  - fwd geomean **~0.99×**(≈对齐)、bwd **~1.10×**(反超)。
+  - e2e(Timer 口径)新 vs 旧 BM=32:fwd **1710→1824 TFLOPS**(+6.7%)、bwd **1839→1878**(+2%)。
+  - 提升集中在 quant-heavy K=11008 fwd:4096×4096×11008 **+21%**、8192 **+13%**、16384 **+10%**。
+  - fwd 差距根因 = B200 硬件 MX cast 近免费 vs MI355X 软件 dual-cast(详见 mxfp8 卡 51)。
+  - fwd 稳过 1.0× 仍需 in-gemm fusion ❌ 别再试(用户否决)。
 
 ## 本项目净收益分解(2026-06-09 → 06-16)
 | kernel | before → after | 增幅 | 来源 |
@@ -31,4 +37,4 @@
 - 反例:dense/fwd/dgrad 的指令效率优化被功耗墙掩盖(相同 MFMA → 相同功耗 → 相同频)。
 
 ---
-来源: 09-perf-numbers.md, flydsl-fp8-gemm-results/SKILL.md, gemm-optimization/SKILL.md
+来源: 09-perf-numbers.md, flydsl-fp8-gemm-results/SKILL.md, gemm-optimization/SKILL.md, mxfp8-8wave-devloop/SKILL.md

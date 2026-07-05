@@ -18,6 +18,7 @@
 - mixed MFMA 选哪个操作数格式 (FP8/BF8/FP6/BF6/FP4) 取决于 mantissa 在操作数 VGPR 里**怎么 packing**，不是换 opcode。
 - ❌ 别再试 靠改 opcode 切格式 —— packing 错了会**静默地算错**，但仍然 type-check 通过、正常跑。host 端的 permutation 与 device 端 descriptor 必须**逐字一致**。
 - F8xF8 **拿不到 small-cycle path**：cycle 数是 16 或 32。(src: gfx950/kernel-implementation-notes.md)
+- whole-loop MFMA 格式切换：asm 从 fp4 的 `cbsz:4 blgp:4` → mxfp8 的 `cbsz:0 blgp:0`(E4M3)；E5M2/HYBRID 时 cbsz/blgp 按 operand format(**0=E4M3, 1=E5M2**)，**scale 路径不变**。(src: project_mxfp8_wholeloop_port.md)
 
 **DS_READ_*_TR transpose-load 仅 gfx950 (gfx942 完全没有)**
 - 发射前 **EXEC 必须全 1**；LDS 地址要按数据大小对齐。≥64-bit 的 DS op 需要 **偶对齐 VGPR**（B96_TR_B6 例外）。
@@ -31,4 +32,4 @@
 - gfx950 赢在 FP16/BF16/FP8（per-CU 低精度约 **2×**），且是**唯一**有 block-scaled MX / FP6 / FP4 的代。(src: gfx942/overview.md, gfx942/kernel-implementation-notes.md)
 
 ---
-来源: overview.md, gfx950/kernel-implementation-notes.md, gfx942/overview.md, gfx942/kernel-implementation-notes.md
+来源: overview.md, gfx950/kernel-implementation-notes.md, gfx942/overview.md, gfx942/kernel-implementation-notes.md, project_mxfp8_wholeloop_port.md

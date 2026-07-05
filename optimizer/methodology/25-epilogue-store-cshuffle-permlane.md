@@ -2,7 +2,7 @@
 
 > 类别: 方法论 · 主题标签: epilogue-store, cshuffle, permlane16_swap, preshuffle
 
-## 根因:MFMA 输出布局 column-strided → naive store 非合并
+## 根因:MFMA 输出布局 row-strided → naive store 非合并
 - MFMA-native lane layout 是 row-strided:单 lane 拥 4 连续行同列,相邻列由相邻 lane 持有。naive store 逐列走 → uncoalesced。
 - 要宽存(`buffer_store_dwordx4`,8 bf16/lane)必须做 lane→col 真转置。
 

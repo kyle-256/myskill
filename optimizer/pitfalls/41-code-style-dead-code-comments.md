@@ -12,7 +12,8 @@
 ### ruff check --fix 陷阱
 - ruff `--fix` 会删 **F401 未用 import** 和 **F841 简单未用变量**并排序 import。
 - ❌ 别再试 无脑接受 `--fix` 结果：它可能删掉那些**本意保留**的变量(编译期决策标记 / 局部可读性变量)。自动修复后**必须查 diff**——若改的是行为而非仅格式/import 卫生，恢复行为逻辑再重跑 formatter。
-- ruff **不删**未用函数/类，那些需人工审。
+- ruff **不删**未用函数/类，那些需人工审：autoflake/ruff F401/F841 抓不到未用函数/类/私有 helper，自己 `rg '<name>\b'` 全仓搜，**0 命中即删**(实例 `_get_fp4_dtype`，源自 gpt_oss2 pr-merge-gate/SKILL.md，非本环境)。
+- **裸 TODO 处理**：无 issue 号的裸 `# TODO` 要么挂号(关联 issue)要么删，不留悬空。注释掉的旧代码/占位一律删。
 
 ### CI 报无关文件失败
 - 本地风格检查全过，但 PR CI 仍报**无关文件**失败=PR 分支落后 main，**不是 formatter 的锅**。

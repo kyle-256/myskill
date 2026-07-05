@@ -20,7 +20,7 @@
 
 ## L2/HBM 三指标三决策(scripts/pmc_l2_analyzer.py)
 输入 `pmc_l2` + `pmc_ea` 两个 counter CSV,参数 `--kernel --ideal-gb <每 dispatch GB> --ea-channels 2`。
-- **L2 命中率** = TCC_HIT/TCC_REQ → 有无**时间复用**可挖。
+- **L2 命中率** = TCC_HIT/(TCC_HIT+TCC_MISS) → 有无**时间复用**可挖。
 - **32B fraction** = `TCC_EA0_RDREQ_32B / TCC_EA0_RDREQ` → 空间局部性/cache 线浪费。
   - ≈0% = 满 64B cache line、无空间浪费;**高 32B%** 才指向 scatter/misaligned,值得重构。
 - **over-fetch** = 实取字节 vs `--ideal-gb` → 有无冗余取数。
@@ -33,7 +33,7 @@
 
 ## 不可信的计数(权威判据在别处)
 - CSV `Accum_VGPR_Count` **恒报 0**。
-- `VGPR_Count` 对 256-VGPR 内核也报 **128/254 等错值**。
+- `VGPR_Count` 对 256-VGPR 内核也报 **128 等错值**(如 8-wave wholeloop 内核,真实 num_vgpr=256)。
   - 权威 VGPR/AGPR 必须用 `FLYDSL_DUMP_IR` 的 ISA `num_vgpr/num_agpr`。
 - prof_summary 的 "MFMA busy %"(除以 GUI*4)对聚合计数**不成比例(>100%)** → 改用权威派生指标 `MfmaUtil` / `MeanOccupancyPerActiveCU`。
 - 查 VGPR 分配的 rocprofv3 SQL(仅供参考,同样不足信):

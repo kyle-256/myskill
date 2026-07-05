@@ -50,9 +50,18 @@
 3. **TensorView shim** = 轻量 torch-agnostic 临时 launch / host 单测,但仅 row-major + per-axis tiling,dtype 表只覆盖 `{f32,f16,bf16}`(超出静默返回 `None`)。
 - 三层正交可共存(如 A 走 layout API + LDS,预 shuffle 的 B 走手搭 descriptor 直入寄存器)。
 
+## 关键 API 速查(逐字签名)
+- `buffer_load(rsrc, offset, vec_width=4, dtype=BFloat16.ir_type)`
+- `buffer_store(word, rsrc, byte_offset, cache_modifier=1, offset_is_bytes=True)`
+- `create_buffer_resource(tensor, max_size=False, num_records_bytes=I32(nbytes))` — **element-offset 默认**
+- `make_row_band_resource(bo.extract_base_index(T), base_row, c_rows, c_cols, elem_bytes)` — 2D int64 rebasing
+- LDS 分配:`fx.SharedAllocator().allocate(Smem).peek()`
+- LDS strided read:`make_view(base, make_layout(32, PAD)).load()` 正确生成 32 次 `ds_read_b16`
+- barrier:`rocdl.s_barrier()`
+
 ## 内部类型 & 其他
 - 优先 FlyDSL 内部类型而非裸 MLIR op:`Vec=fx.Vector` 包 `vector<NxTy>`;索引 `Vec(v)[i]`、bitcast `Vec(v).bitcast(fx.Float32)`、转换 `v.to(fx.BFloat16)`、算术 `a*b`/`a+b`、splat `Vec.filled(N,val,dtype)`、组向量 `Vec.from_elements`。常量 `fx.Index`/`fx.Int32`/`fx.Int64`/`fx.Float32`,index cast 用 `fx.Int32(v)` 而非 `arith.index_cast`。仅需显式 fastmath flags 时才用裸 `arith.*FOp`。
 - 动态 shape / 对齐:`flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=0, divisibility=4)`。
 
 ---
-来源: flydsl-tile-programming/SKILL.md, flydsl-kernel-authoring/SKILL.md, programming-model.md, overview.md, FlyDSL/CLAUDE.md
+来源: flydsl-tile-programming/SKILL.md, flydsl-kernel-authoring/SKILL.md, programming-model.md, overview.md, FlyDSL/CLAUDE.md, mxfp8-8wave-devloop/SKILL.md, add-target-atom-op/SKILL.md(ThrVal/ThrBit 静默垃圾结果)
