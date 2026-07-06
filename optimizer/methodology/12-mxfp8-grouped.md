@@ -85,11 +85,12 @@
 - **禁止手搓 cuda-event 计 bwd**(把 autograd dispatch 算进去,bwd 低估 ~10-18%)。
 
 ### 节点 / GPU 占用检查
-- gpt_oss2 用 **GPU 4 或 5**(用 `mem_get_info` 现查占用)。检查:
+- 选空闲卡(本工作区 gpt_oss,容器 `mlperf_gptoss`):
   ```
-  docker exec mlperf_gptoss2 bash -c "rocm-smi --showuse | grep 'GPU\[4\]\|GPU\[5\]'"
+  docker exec mlperf_gptoss bash -c "rocm-smi --showuse --showmeminfo vram"
   ```
-- 节点 chi2810 = gfx950 ×8,HBM3e ~8 TB/s 峰值,实测 1R:1W copy 上限 ~6.3 TB/s。
+  取利用率/显存最低的卡;完整选卡三件套见 `connection/common/02-pick-free-gpu.md`。
+- 节点 chi2811 = gfx950 ×8,HBM3e ~8 TB/s 峰值,实测 1R:1W copy 上限 ~6.3 TB/s。
 
 ### LDS-合并转置写 vs GB200 结果
 - fwd geomean ~0.99×(≈对齐)、bwd ~1.10×(反超)。

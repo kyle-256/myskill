@@ -10,7 +10,6 @@
 ## 本地化 / 远端运行
 - Primus-Turbo 代码在 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`，本地直接编辑/运行，无 rsync/ssh/docker。改 flydsl kernel 后必须 `rm -rf /root/.flydsl/cache` 清缓存；复用已编译则跳过。
 - wgrad 4-wave kernel canonical 在 `sync/tensorwise/Primus-Turbo`（分支 `feat/kyle/grouped-wgrad-4wave`），远端 chi2811 编译测（remote-sync skill）。kernel 文件 `primus_turbo/flydsl/grouped_gemm/gemm_fp8_grouped_kernel.py`；bench harness `_ow.py`(TF+SNR sweep, untracked)，race 测 `_race_wg.py`，prof 用 `_op3.py`。
-- 远端跑 FlyDSL：`ssh -o LogLevel=ERROR hjbog-srdc-39.amd.com 'docker exec hungry_dijkstra bash -c "cd /FlyDSL && python3 my_kernel.py"'`（同法跑 `tests/kernels/test_vec_add.py`、`bash scripts/run_benchmark.sh`）。FlyDSL 装 `/FlyDSL` editable(`pip install -e .`)，Python 3.12，ROCm 7.2。
 - 本地跑 FlyDSL 内核：`PYTHONPATH=./ python my_kernel.py`；带 IR dump：`FLYDSL_DUMP_IR=1 PYTHONPATH=./ python my_kernel.py`。
 - 长时间远端构建用 `docker exec -d` 后台跑并重定向日志：`docker exec -d <C> bash -c "cd /FlyDSL && bash scripts/build_llvm.sh -j128 > /tmp/build_llvm.log 2>&1"`，再 `docker exec <C> tail -5 /tmp/build_llvm.log` 监控（等 'Creating tarball...'）。
 
@@ -48,9 +47,6 @@
 - 部署测试脚本到远端容器：`scp $TEST_SCRIPT $USER@$HOST:/tmp/` 然后 `ssh ... "docker cp /tmp/$TEST_SCRIPT $CONTAINER:/tmp/"`。下载 trace：`ssh ... "docker cp $CONTAINER:$UI_OUTPUT_DIR /tmp/ui_trace_download"` 再 `scp -r $USER@$HOST:/tmp/ui_trace_download/* $LOCAL_DIR/`。
 - rocprof-trace-decoder 缺失安装：`wget github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/...manylinux-2.28-0.1.6-Linux.sh`，chmod+x 后 `./...sh --skip-license --prefix=/tmp/rtd-install`，把 `*.so*` 拷到 `/opt/rocm/lib/` 再 `ldconfig`。版本须匹配镜像 ROCm 版本（从 `/opt/rocm/.info/version` 用 `sed -E 's/^([0-9]+)\.([0-9]+).*/\1.\2/'` 取主次版本；已知 RTD 0.1.5/0.1.6 可用；安装器名 `rocprof-trace-decoder-manylinux-2.28-${RTD_VERSION}-Linux.sh`）。验证已装：`ls /opt/rocm/lib/librocprof*decoder*`，缺它 rocprofv3 trace 解码会失败。
 
-## 标准 ROCm 开发镜像
-- 基于 `rocm/vllm-dev:nightly`（含 rocprofv3 ROCm7.0、PyTorch 2.9），定制：aiter 换 github ROCm/aiter main、FlyDSL 装 ROCm/FlyDSL main、装匹配 ROCm 版本的 rocprof-trace-decoder。
-- 已验证环境：容器 `hungry_dijkstra`，镜像 `rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.8.0`，host `hjbog-srdc-39.amd.com`。
 
 ## Correctness / performance 跑法（Primus-Turbo）
 - correctness：`pytest tests/pytorch/ -n 8`（单 GPU 套件，每 xdist worker 由 conftest.py 钉一个 GPU）；`-k "blockwise and TRITON"` 过滤 op+backend；`--deterministic-only` 跑 bitwise determinism；`--dist-only` 跑多 GPU。conftest.py 定义 deterministic/multigpu marker（普通 run 被 skip）。
