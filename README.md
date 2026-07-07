@@ -1,11 +1,11 @@
 # myskill
 
-`/wekafs/kyle` 下的 skill 集合。每个 skill 一个子目录，里面放一个 `SKILL.md`。
+`/workspace/code/conductor_455/myskill` 下的 skill 集合。每个 skill 一个子目录，里面放一个 `SKILL.md`。
 
 ## 目录结构
 
 ```
-/wekafs/kyle/myskill/
+/workspace/code/conductor_455/myskill/
 ├── README.md                          # 本文件
 └── <skill-name>/
     └── SKILL.md                        # 必需：带 frontmatter 的说明
@@ -27,23 +27,19 @@ description: 一句话说清楚什么时候用、做什么。Claude 靠这行决
 
 ## 现有 skill
 
-- [`remote-mlperf-gptoss/`](remote-mlperf-gptoss/SKILL.md) —— 连接远程计算节点（当前 chi2774，以 ssh config 为准），进入 mlperf_gptoss 容器在 /workspace/code 下操作。fresh 容器需从源码装 FlyDSL+重装 turbo（见 claim §5.5）；HK 后端已移除。
-- [`remote-sync/`](remote-sync/SKILL.md) —— 在本地 `/wekafs/kyle/code2/remote_sync/{Primus-Turbo,HipKittens}` 编辑代码，rsync 推到远程 host 路径再执行（远程无外网用的工作流）。
-- [`gpu-fleet-tuning/`](gpu-fleet-tuning/SKILL.md) —— N 个 GPU + N 个 sub-agent 做 kernel/config 调优的事件驱动调度模式（GPU 永不空闲，状态文件持久化，broad → refine → diversify → done）。
-- [`mi300-blockwise-gg-tuning/`](mi300-blockwise-gg-tuning/SKILL.md) —— MI300X 上 Triton blockwise FP8 grouped GEMM 调优的硬约束、已验证 priors、和 tensorwise 公平对比方法、常见坑（fwd persistent + bwd variable-K 两条路径都覆盖）。
-- [`global-permissions/`](global-permissions/SKILL.md) —— 把 permissions allow 规则合并写入 `~/.claude/settings.json`，所有项目共享免确认（Bash/Read/Write/Edit/Skill/Glob/Grep/WebFetch/WebSearch）。
-- [`claim-mi355x-node/`](claim-mi355x-node/SKILL.md) —— 原 mi355x 节点不可用时，经 login_node2 找一台 GPU 真闲的 compute 节点（sinfo/squeue + rocm-smi 巡检）、种公钥、起 `mlperf_gptoss` 容器（rocm/primus:v26.2，挂 /mnt/shared/kyle/code2）。
-- [`flydsl-fp8-gemm-tuning/`](flydsl-fp8-gemm-tuning/SKILL.md) —— FlyDSL fp8 dense GEMM (TN/NN/NT) 在 gfx950 提速：profile→定位瓶颈的诊断框架、按 shape regime 选 lever（big-K = both-path-J drain removal，big-N = 2D L2 band swizzle）、已穷尽的死路清单、det=0 红线验证、gfx950 fp8 硬约束。
+- [`remote-conductor455/`](remote-conductor455/SKILL.md) —— 连接远程计算节点（heliosp-1b114-c05-3，SSH key /workspace/code/.ssh_docker/id_ed25519），进入 conductor_455 容器在 /workspace/code 下操作。
+- [`remote-sync/`](remote-sync/SKILL.md) —— 本地编辑代码，rsync 推到远程 host 路径 /home/zhuang12/kyle_tmp 再执行（远程工作流）。
+- [`gfx1250-gemm/`](gfx1250-gemm/SKILL.md) —— gfx1250 (MI450) FlyDSL GEMM 开发手册：TDM 异步搬运、WMMA tile、sync 原语、descriptor K-loop 更新、死锁排查。
 
 ## 加新 skill
 
 ```bash
-mkdir /wekafs/kyle/myskill/<新名字>
-$EDITOR /wekafs/kyle/myskill/<新名字>/SKILL.md
+mkdir /workspace/code/conductor_455/myskill/<新名字>
+$EDITOR /workspace/code/conductor_455/myskill/<新名字>/SKILL.md
 ```
 
 写完之后告诉 Claude 一声，让它在 memory 里加一条指向新 skill 的索引。
 
 ## 为什么不放在 ~/.claude/skills/
 
-放这里是为了跟项目走、能进 git、好分享。代价是 Claude Code 的 `/skill` 菜单不会自动列出来 —— 不过 `/wekafs/kyle` 的 memory 里有索引，进入这个目录的会话会自动加载，效果一样。
+放这里是为了跟项目走、能进 git、好分享。代价是 Claude Code 的 `/skill` 菜单不会自动列出来 —— 不过 `/workspace/code/conductor_455` 的 memory 里有索引，进入这个目录的会话会自动加载，效果一样。
