@@ -57,13 +57,13 @@ docker run -d --name=mlperf_gptoss \
 
 ## 生产节点/容器/rocm 版本现状
 
-- **当前生产节点**: gfx950/MI355X 当前 = **chi2811**（历史 chi2774/chi2810/chi2832）。2026-06-30 起曾切到 chi2810（8 卡全空）；2026-07-03 因 chi2810 被别的任务（`rail-probe`/`xb_sglang` SGLang 服务）占满 8 卡，已切回 chi2811（确认 8 卡真空闲）。均为单卡稳态测。
-- **容器**: 名 `mlperf_gptoss`（镜像 `mlperf_gptoss:saved-20260703`，旧 `saved-20260625b` 是 chi2810 时代镜像已删除）；rocm 版本未在 chi2811/saved-20260703 语境下重新确认（旧源标注 rocm 7.2 是 chi2810/saved-20260625b 时代的数字，不保证仍适用）；venv 在 `/opt/venv`（chi2774 亦有 /opt/venv）。
-- **仓库挂载**: bind mount 宿主 `/mnt/vast/kyle/code2` → 容器内 `/workspace/code`（chi2810/chi2811/chi2774 一致）。
-- **连接**: 经 `sync/.ssh-chi.sh` 跳板，如 `sync/.ssh-chi.sh root@chi2811`。
+- **当前生产节点**: gfx950/MI355X 当前 = **chi2774**（2026-07-07 起；历史主用 chi2811，更早 chi2810/chi2832）。切换史：chi2811 长期主用 → **2026-07-07 切到 chi2774**，原因：chi2811 8 卡被别人占满（100% / ~290GB 每卡）且我们的容器被 OOM 杀（Exit 137）；chi2810 虽 8 卡空但 docker 盘只剩 37G（无法 load 93G 镜像，占盘的全是别人 tagged 镜像不可清）；chi2774 则 8 卡真空闲 + docker 盘 289G，遂在 chi2774 从 code2 的 tar（`docker_images/mlperf_gptoss-20260703.tar.zst`）`docker load` 起容器。均为单卡稳态测。
+- **容器**: 名 `mlperf_gptoss`（镜像 `mlperf_gptoss:saved-20260703`，旧 `saved-20260625b` 是 chi2810 时代镜像已删除）；rocm 版本未在 chi2774/saved-20260703 语境下重新确认（旧源标注 rocm 7.2 是 chi2810/saved-20260625b 时代的数字，不保证仍适用）；venv 在 `/opt/venv`（chi2774 亦有 /opt/venv）。
+- **仓库挂载**: bind mount 宿主 `/mnt/vast/kyle/code2` → 容器内 `/workspace/code`（chi2774/chi2810/chi2811 各节点一致，code2 为集群共享 NFS）。
+- **连接**: 经 `sync/.ssh-chi.sh` 跳板，如 `sync/.ssh-chi.sh root@chi2774`。
 - **指定 GPU**: 用 `HIP_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` 环境变量。
 - **运行示例**: `docker exec mlperf_gptoss bash -lc "cd /workspace/code/FlyDSL && HIP_VISIBLE_DEVICES=7 python turbo/test_vmono.py M N K"`。
 - **WHY/证据**: 旧绝对 TFLOPS 多在被争用节点测，**仅 ratio 可信**，干净节点须重测。
 
 ---
-来源: claim-mi355x-node/SKILL.md；build-rocm-image/SKILL.md(仅借用其中 `--progress=plain` 与交互式 `docker run -it` 两条通用 docker 用法提示，该 skill 其余内容是构建 rocm-dev-custom:main 通用镜像的完全不同工作流，与本卡片的 mlperf_gptoss 容器无关)；README.md, 09-perf-numbers.md, 13-primus-turbo-prod.md, agpr_phase5_mono.md, project_chi2811_sync.md
+来源: claim-mi355x-node/SKILL.md；build-rocm-image/SKILL.md(仅借用其中 `--progress=plain` 与交互式 `docker run -it` 两条通用 docker 用法提示，该 skill 其余内容是构建 rocm-dev-custom:main 通用镜像的完全不同工作流，与本卡片的 mlperf_gptoss 容器无关)；README.md, 09-perf-numbers.md, 13-primus-turbo-prod.md, agpr_phase5_mono.md, project_chi2774_sync.md

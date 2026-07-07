@@ -4,10 +4,10 @@ description: >-
   MI355X (gfx950) 上优化 FlyDSL fp8/mxfp4/mxfp8 GEMM/attention kernel 的知识库：远程连接/选卡/同步、
   通用优化与 profiling 方法论、以及大量踩过的坑（tile 尺寸、occupancy、测量噪声、LDS/寄存器、race、
   autotune、各种死胡同）。⚠️ 本工作区 = gpt_oss 环境（容器 mlperf_gptoss / 盘 code2 / venv /opt/venv）；
-  chi2811 上的 mlperf_gptoss2 与盘 code3 属于另一个项目 gpt_oss2_docker，严禁 rsync/docker exec/触碰。
+  chi2774 上的 mlperf_gptoss2 与盘 code3 属于另一个项目 gpt_oss2_docker，严禁 rsync/docker exec/触碰。
   章节卡按需打开，别全量加载。
 when_to_use: >-
-  优化/调试/benchmark FlyDSL 或 Primus-Turbo 的 GEMM/attention kernel；连接远端 MI355X (chi2811)
+  优化/调试/benchmark FlyDSL 或 Primus-Turbo 的 GEMM/attention kernel；连接远端 MI355X (chi2774)
   跑测（只用 gpt_oss = mlperf_gptoss / code2；严禁碰 mlperf_gptoss2 / code3）；诊断性能回退、掉点、race、SNR 崩；
   查"某个方向是不是已经试过且失败了"；写 autotune dispatch；确认 tile/occupancy/LDS 该怎么选。
   凡是碰 gfx950 FlyDSL kernel 性能/正确性的活都先翻这里。
@@ -19,7 +19,7 @@ user-invocable: true
 > 🚨 **环境红线（务必先读，违反=破坏别人环境）** 🚨
 > 本工作区 `/workspace/code/gpt_oss_docker` = **gpt_oss** 环境。所有远端操作只能用：
 > 容器 **`mlperf_gptoss`**（**无 "2"**）、host 盘 **`/mnt/vast/kyle/code2`**（→ 容器 `/workspace/code`）、
-> venv **`/opt/venv`**（mxfp4）/ `/opt/venv-tw`（tensorwise）、节点 chi2811。
+> venv **`/opt/venv`**（mxfp4）/ `/opt/venv-tw`（tensorwise）、节点 chi2774。
 > **严禁**对 **`mlperf_gptoss2`** 或盘 **`/mnt/vast/kyle/code3`** 做任何 rsync / docker exec / 改动——
 > 那是**另一个项目 `gpt_oss2_docker`** 的地盘（认：容器名有无 "2"、盘 code2 vs code3）。
 > 跑 campaign / bench 前，逐一核对 `--container` / `--remote-host-root` / `--venv` 全部指向 gpt_oss（code2）。
@@ -33,14 +33,14 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - 三个文件夹：`connection/`（怎么连上远端跑）、`methodology/`（怎么优化/debug/看利用率）、`pitfalls/`（踩过的坑——**最重要**，动手前先查）。
 - 死胡同用 `❌ 别再试` 标注；卡尾 `来源:` 可回溯；卡间用 `见 <路径>` 或 `见本卡「小节」` 交叉引用。
 - 硬件默认 **gfx950 (MI355X)**；gfx942 (MI300) 仅作跨代对照。
-- **唯一可用的远端环境 = gpt_oss**（chi2811，跳板 149.28.124.225，key `/workspace/code/.ssh_docker/id_ed25519`）：
+- **唯一可用的远端环境 = gpt_oss**（chi2774，跳板 149.28.124.225，key `/workspace/code/.ssh_docker/id_ed25519`）：
   | | gpt_oss（本工作区唯一可用） |
   |---|---|
   | 容器 | `mlperf_gptoss`（无 "2"） |
   | 挂载 | host `/mnt/vast/kyle/code2` → 容器 `/workspace/code` |
   | venv | `/opt/venv`(mxfp4) + `/opt/venv-tw`(tensorwise) |
   | 重点 | mxfp4 / tensorwise fp8 |
-  🚨 **同机 chi2811 上还有 `mlperf_gptoss2` / 盘 `code3`——那是 gpt_oss2_docker 项目的，绝对禁止碰**
+  🚨 **同机 chi2774 上还有 `mlperf_gptoss2` / 盘 `code3`——那是 gpt_oss2_docker 项目的，绝对禁止碰**
   （rsync 到 code3 会覆盖别人的树、docker exec mlperf_gptoss2 会污染别人的容器）。连接共享设施在
   `connection/common/`、gpt_oss 差异在 `connection/gpt_oss/`（本工作区不含也不该有 gpt_oss2 连接卡）。
 - 动手前最短路径：① 翻 `pitfalls/` 确认方向没被判负 → ② 翻 `methodology/` 找做法 → ③ 翻 `connection/`（选对环境）把代码弄上卡跑测。

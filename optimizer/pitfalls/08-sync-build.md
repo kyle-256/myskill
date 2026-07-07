@@ -22,7 +22,7 @@
 - 本地 sync/FlyDSL 比远程容器 /workspace/code/FlyDSL 旧 → 照本地 vendor 会搬到**补丁前**版本，表现为移植版慢 ~15%。
 - 实例：fp8 4wave AGPR 提速（ROCm/FlyDSL PR #714，`Mfma16x16x128AGPR` inline-asm `=a,v,v,0` 把 f32x4 累加器钉 AGPR、消 `v_accvgpr_mov`+`s_nop`，+5~13%）**只在远程有**。
 - 教训：移植前先 `diff <(本地) <(远程 cat)`，或直接从远程容器取源。host 上没 FlyDSL 时：
-  `./.ssh-chi.sh root@chi2811 "docker exec mlperf_gptoss cat <容器内路径>" > 本地文件` 落盘。
+  `./.ssh-chi.sh root@chi2774 "docker exec mlperf_gptoss cat <容器内路径>" > 本地文件` 落盘。
 
 ### vendor helper 为何不复用 gemm_helper.py（vendor-reuse）
 - turbo 产品化的 8-wave 把原语分叉了，4-wave 直接 import 会崩：

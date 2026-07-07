@@ -20,7 +20,7 @@
 ### 真·可用判据
 - 鲁棒批量扫:`rocm-smi --showpids 2>/dev/null | grep -cE '^[0-9]'` == 0 且 `docker ps` 无业务容器。
 - VRAM% 要低,但 **pid 数才是金标准**。
-- chi2811 实测真空态:8 卡 0% use、每卡仅 ~298MB 底噪、0 pid。
+- chi2774 实测真空态:8 卡 0% use、每卡仅 ~298MB 底噪、0 pid。
 - 空闲 VRAM 参照:`rocm-smi --showmeminfo vram | grep 'Used Memory'` ~300MB = 空;或 `--showuse` GPU%=0 且 `--showmemuse` VRAM%<50。
 
 ### vllm 陷阱:gpu_use=0 会骗人

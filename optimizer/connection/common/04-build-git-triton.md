@@ -4,7 +4,7 @@
 
 ## Primus-Turbo/FlyDSL git push 与 author 覆盖
 
-- **无凭证前提**：chi2811 容器与本机对 HTTPS origin（`AMD-AGI/Primus-Turbo`）都无 GitHub 凭证。push 必须用本机 jump-host SSH key，通过 git@ SSH URL 临时覆盖 HTTPS origin（**不改 remote 配置**）。
+- **无凭证前提**：chi2774 容器与本机对 HTTPS origin（`AMD-AGI/Primus-Turbo`）都无 GitHub 凭证。push 必须用本机 jump-host SSH key，通过 git@ SSH URL 临时覆盖 HTTPS origin（**不改 remote 配置**）。
 - **push 命令**（SSH key = `/workspace/code/.ssh_docker/id_ed25519`）：
   ```
   GIT_SSH_COMMAND="ssh -i /workspace/code/.ssh_docker/id_ed25519 -o StrictHostKeyChecking=no -o IdentitiesOnly=yes" \

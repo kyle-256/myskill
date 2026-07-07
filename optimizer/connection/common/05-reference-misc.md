@@ -9,7 +9,7 @@
 
 ## 本地化 / 远端运行
 - Primus-Turbo 代码在 `/workspace/code/gpt_oss_docker/sync/Primus-Turbo`，本地直接编辑/运行，无 rsync/ssh/docker。改 flydsl kernel 后必须 `rm -rf /root/.flydsl/cache` 清缓存；复用已编译则跳过。
-- wgrad 4-wave kernel canonical 在 `sync/tensorwise/Primus-Turbo`（分支 `feat/kyle/grouped-wgrad-4wave`），远端 chi2811 编译测（remote-sync skill）。kernel 文件 `primus_turbo/flydsl/grouped_gemm/gemm_fp8_grouped_kernel.py`；bench harness `_ow.py`(TF+SNR sweep, untracked)，race 测 `_race_wg.py`，prof 用 `_op3.py`。
+- wgrad 4-wave kernel canonical 在 `sync/tensorwise/Primus-Turbo`（分支 `feat/kyle/grouped-wgrad-4wave`），远端 chi2774 编译测（remote-sync skill）。kernel 文件 `primus_turbo/flydsl/grouped_gemm/gemm_fp8_grouped_kernel.py`；bench harness `_ow.py`(TF+SNR sweep, untracked)，race 测 `_race_wg.py`，prof 用 `_op3.py`。
 - 本地跑 FlyDSL 内核：`PYTHONPATH=./ python my_kernel.py`；带 IR dump：`FLYDSL_DUMP_IR=1 PYTHONPATH=./ python my_kernel.py`。
 - 长时间远端构建用 `docker exec -d` 后台跑并重定向日志：`docker exec -d <C> bash -c "cd /FlyDSL && bash scripts/build_llvm.sh -j128 > /tmp/build_llvm.log 2>&1"`，再 `docker exec <C> tail -5 /tmp/build_llvm.log` 监控（等 'Creating tarball...'）。
 
