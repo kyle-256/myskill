@@ -27,7 +27,7 @@
 ### 生产内核 vs WL 对象
 - 生产 = `_build_grouped_mxfp8_wgrad_kernel`(8-wave / occ=2 / packed-preshuffle scale / chunk-SSA 软流水)。
 - 对象 WL = `_build_grouped_mxfp8_wgrad_wl_kernel`(occ=1 / 4-wave 单块 bare-asm hw-loop,NT 布局 `[OUT,m_total]`,per-1x32 E8M0 折进 `v_mfma_scale_f32_16x16x128_f8f6f4`)。
-- 基准(chi2774 gfx950 B=8 M=4096 N×K=4096×4096 清缓存):baseline 479us / WL-scaled 811-813us(1.7× 慢)/ WL-unscaled 445us(0.93× 反超);SNR 28.1 全对。**WL scale 折进 MMA 是 1.7× 慢的真凶**。
+- 基准(chi2811 gfx950 B=8 M=4096 N×K=4096×4096 清缓存):baseline 479us / WL-scaled 811-813us(1.7× 慢)/ WL-unscaled 445us(0.93× 反超);SNR 28.1 全对。**WL scale 折进 MMA 是 1.7× 慢的真凶**。
 - WL scale-prefetch 修法(收益仅 ~4%,845→811):删 phase-top emit_scale + 阻塞 vmcnt(0),改成在 emit_inplace 里每个 scale VGPR 最后消费 MFMA 之后重载下一 phase scale(藏进 MFMA shadow),prologue 只留一次 emit_scale。瓶颈是吞吐非延迟。真正修复(未做)= packed/preshuffle scale(4 个 E8M0 打进 1 i32 op_sel 选),预期边际 ~5%。
 
 ### 下一刀 ROI
@@ -90,7 +90,7 @@
   docker exec mlperf_gptoss bash -c "rocm-smi --showuse --showmeminfo vram"
   ```
   取利用率/显存最低的卡;完整选卡三件套见 `connection/common/02-pick-free-gpu.md`。
-- 节点 chi2774 = gfx950 ×8,HBM3e ~8 TB/s 峰值,实测 1R:1W copy 上限 ~6.3 TB/s。
+- 节点 chi2811 = gfx950 ×8,HBM3e ~8 TB/s 峰值,实测 1R:1W copy 上限 ~6.3 TB/s。
 
 ### LDS-合并转置写 vs GB200 结果
 - fwd geomean ~0.99×(≈对齐)、bwd ~1.10×(反超)。

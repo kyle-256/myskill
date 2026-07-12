@@ -193,6 +193,16 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
 - **全 0 输出**：输出地址错（`stride_out_seq`/`stride_out_part` 错，打印 `output.stride()` 核对）；multi-partition 必须写到 `part_z` 槽而非绝对 partition index（reduce kernel 从 `part_z=0..grid_z-1` 读）；主 kernel 没写 `exp_sums`/`max_logits` 则 reduce 出 0（启动前 `fill_(-999.0)` sentinel 验证）。
 - **>50% 错**：常因 `grid_z < total_partitions` 且 kernel 每 CTA 只处理一个 partition（无循环），大部分 context 被跳过。验证 `total_parts=ceil(context_len/KV_COMPUTE_BLOCK)`，assert `grid_z==total_parts` 或有 multi-partition 循环。
 
+### wave-collective 读前禁 divergent scf.if(gfx950/flydsl,实测)
+- **`ds_read_tr16_b64`(16-lane 协作 transpose 读)前面若有一个按 wave/lane divergent 的运行时
+  `if wave==0:` scf.if——即便块内只是纯 side-effect `buffer_store`(不外泄变量)——会破坏随后的
+  collective 读**,产出 NaN / 3.4e38 overflow(实测 sparse-MLA bwd dQ:1922 nan/27 inf,localized)。
+  - 机制:divergent scf.if 改变了 collective op 所需的 lane 活跃/寄存器状态。
+  - **修法:把 divergent 条件写移到 collective 读之后**(如 dS/P 的 wave0-only store 放到 PV loop 之后)。
+  - 定位捷径:同 kernel 里不经过该 collective 的输出(dkv/dsink,走普通 MFMA/reduce)全程正确,
+    只有经过 ds_read_tr16 的输出(dq)崩 → 精准锁定到 collective 读路径。
+  - fwd flash kernel 无此坑,因它无 wave-divergent 分支;bwd 因 dS/P 只需一个 writer 才引入。
+
 ### 测试局限与 MFMA 操作数
 - **全 1 隔离测试**：`query/key/value.fill_(1.0)` 下 softmax 概率全相等、PV 输出=1.0，任何偏差暴露 layout/寻址 bug。❌ **别只靠全 1 测**：均匀值无论顺序都对，测不出 V/P 操作数错位，需另测非均匀输入。
 - **MFMA 操作数顺序**：`mfma(LHS, RHS, acc)` —— LHS→M 维，RHS→N 维。QK 中 K 是 LHS、Q 是 RHS。搞错就是 layout 大错。

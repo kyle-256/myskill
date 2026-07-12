@@ -13,12 +13,12 @@
 - **命令模板**（必须在 `sync/` 目录下跑，保证 `$PWD` 解析正确、trailing `/` 同步目录内容而非目录本身）：
   ```
   rsync -azh --exclude-from=.rsync-exclude -e "$PWD/.ssh-chi.sh" \
-    "$PWD/tensorwise/Primus-Turbo/" root@chi2774:/mnt/vast/kyle/code2/Primus-Turbo-tensorwise/
+    "$PWD/tensorwise/Primus-Turbo/" root@chi2762:/mnt/vast/kyle/code2/Primus-Turbo-tensorwise/
   ```
-- `-e "$PWD/.ssh-chi.sh"`：ssh 包装脚本，经跳板机连 chi2774（rsync + ssh 跳板）。**chi2810 已下线/不可用**（2026-07-03 起被别人的 SGLang 服务 8 卡全占，别去这台跑东西），当前活跃节点是 chi2774。
+- `-e "$PWD/.ssh-chi.sh"`：ssh 包装脚本，经跳板机连当前节点（rsync + ssh 跳板）。**当前活跃节点 = chi2762**（2026-07-08 从 chi2811 迁移，chi2811 被 atom-bench 占满 8 卡）。chi2810 曾被 SGLang 8 卡全占且盘满，用前必按 02-pick-free-gpu 核实。code2 是共享 NFS，换节点后远端 repo 路径不变（`root@<node>:/mnt/vast/kyle/code2/...`）。
 - `--exclude-from=.rsync-exclude`：排除 `.git`、`*.so`、`build`、`venv`。
 - **canonical 本地镜像**（git）：`sync/mxfp4/Primus-Turbo`（分支 `dev/kyle/flydsl_mxfp4_compute`）、`sync/tensorwise/Primus-Turbo`；也涵盖 FlyDSL/turbo 子树。
-- **WHY 必须先 rsync 再测**：改本地 `sync/mxfp4/Primus-Turbo`（或 FlyDSL/turbo）后不推远端，远端（chi2774/chi2774）会一直编译**旧二进制**，所有 ISA/perf/SNR 结论都对着旧代码 → 假象。血泪教训：改完先 rsync 再测。
+- **WHY 必须先 rsync 再测**：改本地 `sync/mxfp4/Primus-Turbo`（或 FlyDSL/turbo）后不推远端，远端（当前 chi2762）会一直编译**旧二进制**，所有 ISA/perf/SNR 结论都对着旧代码 → 假象。血泪教训：改完先 rsync 再测。
 - **对齐校验**：`md5sum` 本地 == 远程（远程用 `docker exec ... md5sum 容器路径`）必须相等；不等 = 没同步，测的是旧二进制。
 - **正常差异**：`.so`/`build` 产物只在远程存在（被 exclude 不同步），属正常，不算未对齐。
 
@@ -29,7 +29,7 @@
 - **rsync 加 `--no-o --no-g`**: 避开 JuiceFS 的 chown/chmod 报错(cosmetic,但会刷屏)。
 - **commit author 必须显式覆盖**: `author=kyle-256 <Kyle.Zhao@amd.com>`,`GIT_AUTHOR_*` / `GIT_COMMITTER_*` 全设;禁止任何 Claude/Cursor coauthor。
 - **本地 flydsl egg 可能是坏的**: `sync/` 里的 egg(如 dev409)可能坏/API 太老,本地根本跑不了;所有 kernel 测试必须在远端容器跑(远端有匹配的 flydsl 版本)。
-- **live import 源码在远端**: kernel 的 live import 源码是远端 `/workspace/code/Primus-Turbo/`(经 chi2774 ssh+docker),本地 `sync/mxfp4/Primus-Turbo/` 只是镜像。可用 `cat patch.py | ssh ... docker exec -i python -` 管道 patch 远端 live 文件,本地镜像同步改保持一致。
+- **live import 源码在远端**: kernel 的 live import 源码是远端 `/workspace/code/Primus-Turbo/`(经当前节点 ssh+docker),本地 `sync/mxfp4/Primus-Turbo/` 只是镜像。可用 `cat patch.py | ssh ... docker exec -i python -` 管道 patch 远端 live 文件,本地镜像同步改保持一致。
 
 ### JIT 缓存坑(最关键)
 - **现象**: 改完 FlyDSL kernel 普通跑仍跑旧版二进制。根因: FlyDSL JIT 缓存**不 hash 模块级 class 方法**,clear comgr 缓存也没用。

@@ -57,13 +57,14 @@ docker run -d --name=mlperf_gptoss \
 
 ## 生产节点/容器/rocm 版本现状
 
-- **当前生产节点**: gfx950/MI355X 当前 = **chi2774**（2026-07-07 起；历史主用 chi2811，更早 chi2810/chi2832）。切换史：chi2811 长期主用 → **2026-07-07 切到 chi2774**，原因：chi2811 8 卡被别人占满（100% / ~290GB 每卡）且我们的容器被 OOM 杀（Exit 137）；chi2810 虽 8 卡空但 docker 盘只剩 37G（无法 load 93G 镜像，占盘的全是别人 tagged 镜像不可清）；chi2774 则 8 卡真空闲 + docker 盘 289G，遂在 chi2774 从 code2 的 tar（`docker_images/mlperf_gptoss-20260703.tar.zst`）`docker load` 起容器。均为单卡稳态测。
-- **容器**: 名 `mlperf_gptoss`（镜像 `mlperf_gptoss:saved-20260703`，旧 `saved-20260625b` 是 chi2810 时代镜像已删除）；rocm 版本未在 chi2774/saved-20260703 语境下重新确认（旧源标注 rocm 7.2 是 chi2810/saved-20260625b 时代的数字，不保证仍适用）；venv 在 `/opt/venv`（chi2774 亦有 /opt/venv）。
-- **仓库挂载**: bind mount 宿主 `/mnt/vast/kyle/code2` → 容器内 `/workspace/code`（chi2774/chi2810/chi2811 各节点一致，code2 为集群共享 NFS）。
-- **连接**: 经 `sync/.ssh-chi.sh` 跳板，如 `sync/.ssh-chi.sh root@chi2774`。
+- **当前生产节点**: gfx950/MI355X 当前 = **chi2762**（2026-07-08 从 chi2811 迁移——chi2811 被 atom-bench 等占满 8 卡 100%，落节点选卡见 `../common/02-pick-free-gpu`；更早 chi2811/chi2810/chi2832）。落节点前务必按 02-pick-free-gpu 核实占用与 docker 盘容量：历史上 chi2810 曾 docker 盘只剩 37G/0G 无法 load 93G 镜像、8 卡被别人占满导致容器 OOM 杀（Exit 137）等坑。镜像来自 code2 的 tar（`docker_images/mlperf_gptoss-20260703.tar.zst`，21G 压缩/93G 解压，`zstd -dc <tar> | docker load` 起容器；盘不够先 `docker image prune -af` 清未用镜像）。均为单卡稳态测。
+- **迁移到新节点的完整流程**（2026-07-08 chi2762 实操验证）：① `.ssh-chi.sh root@<node>` 确认 code2 已挂 + `rocm-smi --showpids` 8 卡 0 pid；② 盘不够 `docker image prune -af`（chi2762 一次回收 245G）；③ `zstd -dc /mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260703.tar.zst | docker load`；④ 固定 flag `docker run -d --name=mlperf_gptoss ...`（见本卡上方）；⑤ 验证容器 `device_count==8`/code2/venv-tw；⑥ campaign 改 `--host root@<node>`（REPO_REMOTE_HOST 在 code2 共享 NFS 上，路径不变）后 resume。
+- **容器**: 名 `mlperf_gptoss`（镜像 `mlperf_gptoss:saved-20260703`，旧 `saved-20260625b` 是 chi2810 时代镜像已删除）；rocm 版本未在 chi2811/saved-20260703 语境下重新确认（旧源标注 rocm 7.2 是 chi2810/saved-20260625b 时代的数字，不保证仍适用）；venv 在 `/opt/venv`(mxfp4) + `/opt/venv-tw`(tensorwise)。
+- **仓库挂载**: bind mount 宿主 `/mnt/vast/kyle/code2` → 容器内 `/workspace/code`（chi2762/chi2811/chi2810 各节点一致，code2 为集群共享 NFS；换节点无需重新 sync 远端 repo）。
+- **连接**: 经 `sync/.ssh-chi.sh` 跳板，如 `sync/.ssh-chi.sh root@chi2762`（当前节点；跳板 149.28.124.225 内网可解析任意 chiXXXX）。
 - **指定 GPU**: 用 `HIP_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` 环境变量。
 - **运行示例**: `docker exec mlperf_gptoss bash -lc "cd /workspace/code/FlyDSL && HIP_VISIBLE_DEVICES=7 python turbo/test_vmono.py M N K"`。
 - **WHY/证据**: 旧绝对 TFLOPS 多在被争用节点测，**仅 ratio 可信**，干净节点须重测。
 
 ---
-来源: claim-mi355x-node/SKILL.md；build-rocm-image/SKILL.md(仅借用其中 `--progress=plain` 与交互式 `docker run -it` 两条通用 docker 用法提示，该 skill 其余内容是构建 rocm-dev-custom:main 通用镜像的完全不同工作流，与本卡片的 mlperf_gptoss 容器无关)；README.md, 09-perf-numbers.md, 13-primus-turbo-prod.md, agpr_phase5_mono.md, project_chi2774_sync.md
+来源: claim-mi355x-node/SKILL.md；build-rocm-image/SKILL.md(仅借用其中 `--progress=plain` 与交互式 `docker run -it` 两条通用 docker 用法提示，该 skill 其余内容是构建 rocm-dev-custom:main 通用镜像的完全不同工作流，与本卡片的 mlperf_gptoss 容器无关)；README.md, 09-perf-numbers.md, 13-primus-turbo-prod.md, agpr_phase5_mono.md, project_chi2811_sync.md

@@ -10,10 +10,10 @@
 - **venv 按分支选**:
   - `Primus-Turbo-tensorwise` 分支 → `/opt/venv-tw/bin/python -u <script>`
   - 生产 mxfp4 → `/opt/venv`(容器 `mlperf_gptoss` 内默认 venv);mxfp8 属于 gpt_oss2/mlperf_gptoss2/code3 的独立环境(容器/venv 均不同),别混用
-  - 完整示例(tensorwise):`./.ssh-chi.sh root@chi2774 "docker exec -e HIP_VISIBLE_DEVICES=$G mlperf_gptoss bash -lc 'cd /workspace/code/Primus-Turbo-tensorwise && /opt/venv-tw/bin/python -u <script>'"`
+  - 完整示例(tensorwise):`./.ssh-chi.sh root@chi2762 "docker exec -e HIP_VISIBLE_DEVICES=$G mlperf_gptoss bash -lc 'cd /workspace/code/Primus-Turbo-tensorwise && /opt/venv-tw/bin/python -u <script>'"`
   - 完整示例(primus_turbo + 清缓存):`docker exec -e HIP_VISIBLE_DEVICES=N -e <env> mlperf_gptoss bash -lc 'cd .../primus_turbo && rm -rf /root/.flydsl/cache && <env> python3 _ow.py'`
 - **生产节点/环境**:
-  - 当前活跃节点 `chi2774`(2026-07-07 从 chi2811 切换:chi2811 8 卡被别人占满 + 容器 OOM 137),容器 `mlperf_gptoss`(gfx950 / MI355X)。历史节点 chi2811/chi2810/chi2832 用前需按 claim-mi355x-node 重新核实占用(chi2810 盘满且被别人镜像占,不宜用)。
+  - 当前活跃节点 `chi2762`(2026-07-08 从 chi2811 迁移),容器 `mlperf_gptoss`(gfx950 / MI355X)。历史节点 chi2811/chi2810/chi2832 用前需按 02-pick-free-gpu 重新核实占用(chi2811 被 atom-bench 占满、chi2810 盘满且被别人镜像占,不宜用)。
   - 仓库 bind mount:宿主 `/mnt/vast/kyle/code2` → 容器内 `/workspace/code`(改宿主文件即容器内可见,无需 rebuild)。
 
 ## mxfp4/tensorwise 两份 checkout 与 venv 隔离
