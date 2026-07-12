@@ -344,6 +344,15 @@ methodology-03 明确:kernel-trace CSV 的 `Accum_VGPR_Count` 恒报 0、`VGPR_C
 - **buffer_load_lds**:需 lane-consecutive LDS(无 pad);去 D_LDS pad 实测 flash cr4 648→254 / pro 840→277(**−60~67%**,tr16 bank 冲突)→ by construction 净负。padding 528 已最优(544 更差,560/592≈528)。
 - **ds_load_tr16_b128**(v8 一次读,减半 tr 读指令,直打 LDS-port):**LLVM Cannot select intrinsic**(gfx950 后端不支持,绑定有但 codegen 拒)。
 - **fine-grained vmcnt / sched_barrier**:N/A(已 hoist gather + 每 tile barrier 是 LDS-RAW 必需);**masked/unmasked split**:已内建(mask 预算到 lds_mask + dyn_pool)。
-- **★ occ-2 结构定论(两探针决定性)**:fwd occ-2 是 VGPR 限,o_acc = D512 的 f32 输出累加器 = **128 寄存器**。①AGPR o_acc 探针:occ 仍 1.96(AGPR 文件也 256/SIMD,128 在 VGPR/AGPR 都 occ-2)+ TF −16%;②bf16 o_acc 探针:occ 仍 1.98(MFMA C 仍需 f32 峰值 128 + loop old/new o_acc 双活 + 每 d-tile cast 的 VALU)+ TF −58% + SNR 62→43。→ **o_acc 128 寄存器结构性锁 occ-2,寄存器缩减撬不动**;唯一理论剩余 = d-chunk 2 趟(QK/gather/softmax 翻倍,几乎必负)。
+- **★ occ-2 探针(两个,decisive on their own terms)**:fwd occ-2,o_acc = D512 的 f32 输出累加器 = **128 寄存器**。①AGPR o_acc 探针:occ 仍 1.96(**AGPR 与 VGPR 共用同一 512 池** → o_acc 挪 AGPR 总量不变 → occ 不变,见 methodology/04;不是"AGPR 另一块 256 文件")+ TF −16%;②bf16 o_acc 探针:occ 仍 1.98(MFMA C 仍需 f32 峰值 128 + loop old/new o_acc 双活 + 每 d-tile cast 的 VALU)+ TF −58% + SNR 62→43。
 - bench 收敛为单个 `bench_mla.py`(6 fwd + 6 bwd = 12 结果 + triton SNR,`python bench_mla.py` 直接跑;删 campaign_*/bench_campaign/bench_triton/verify_turbo)。
-∴ MLA attention 已追平/超越 flash-attn(已有 tr16 / 寄存器预取 / K32-direct-v8 / inline-asm-AGPR / s_setprio / XCD-remap / mask-precompute,数项 flash 反而没有);通用移植无效 = MLA 已重度调优 + sparse-gather/tr16-padded 结构 ⊥ dense 技巧。真正剩余头款 = 算法级 / 工具链解锁(b128 select、accvgpr helper)。
+∴ MLA attention 已追平/超越 flash-attn(已有 tr16 / 寄存器预取 / K32-direct-v8 / inline-asm-AGPR / s_setprio / XCD-remap / mask-precompute,数项 flash 反而没有)。
+
+### ★★ 自我修正:"occ-2 硬结构 floor"下早了,用错了硬件数(2026-07-12,对照 B200 + 复核 methodology/04)
+上面把 occ-2 说成"结构性锁死撬不动"——**这个结论建立在两个错的硬件数上,不成立**:
+1. **寄存器**:我一路按"256 VGPR 硬顶"算 occ。错。**MI355X 是 512 寄存器/lane/SIMD(regular≤256 + AGPR≤256 共用一个 512 池)**,occ = 512/(总寄存器)。o_acc 128 + 其余 ~70 ≈ 200 → occ 512/200≈2.5(实测 1.96 吻合)。→ **o_acc 只占 512 的 1/4,不是占满**;释放非-o_acc 的 ~70 就能上 occ-3。(methodology/04 本来就写对了 512,是我 dsv4 分析时自相矛盾。)
+2. **LDS**:之前 DMA 判负用"gfx950 ~64KB LDS,4-buffer 67.6KB 不入"。错。**CDNA4 是 160KB/CU**,4-buffer 流水完全放得下 → 那条判负前提不成立,**4-buffer 流水化 DMA 从没真测过**。
+- **重开的真杠杆 = `buffer_load_to_lds`**(HBM→LDS 直连,免 reg 暂存):AMD 官方 register-pressure 指南实测**省 ~100 VGPR/wave,参考 GEMM 697→1113 TFLOPS(+60%)**。用正确账:MLA 释放 gather 暂存 ~32 VGPR → V 200→168 → **occ 512/168≈3**,LDS 160KB 放得下。之前"DMA 判负"是拿去-padding 的**代理测量**推的,没做 per-rank-DMA 保 padding 的真实现——**分析代替实测的又一次**。
+- **对照 B200**:Blackwell 1450TF(bf16 dense)靠 tmem(第三层内存放累加器);AMD 两层(512 寄存器 + 160KB LDS)下,累加器/暂存放 LDS 是同方向的解法,尚未穷尽。**下一步:真正实现 buffer_load_to_lds gather(per-rank DMA 保 tr16 padding)+ 测 occ/TF/SNR,不再代理判负。**
+
+- bench 收敛为单个 `bench_mla.py`(6 fwd + 6 bwd = 12 结果 + triton SNR,`python bench_mla.py` 直接跑;删 campaign_*/bench_campaign/bench_triton/verify_turbo)。
