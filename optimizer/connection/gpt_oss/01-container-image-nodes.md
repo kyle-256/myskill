@@ -2,6 +2,12 @@
 
 > 类别: 连接 · 主题标签: docker, mlperf_gptoss, ROCm, 验证, container, docker-image, bind-mount, editable-install, prod-node, rocm-version
 
+## 🚨 本机环境边界（哪个是你的、哪些严禁碰）
+> 这是本机(gpt_oss)环境的**具体边界**——SKILL 的通用「环境红线」在此落地。
+- **你的**:容器 **`mlperf_gptoss`**(无 "2")、host 盘 **`/mnt/vast/kyle/code2`**(→ 容器 `/workspace/code`)、venv **`/opt/venv`**(mxfp4)/`/opt/venv-tw`(tensorwise)。
+- **严禁碰**:容器 **`mlperf_gptoss2`** / 盘 **`/mnt/vast/kyle/code3`** —— 那是另一个项目 `gpt_oss2_docker` 的地盘,对其做任何 rsync / docker exec / 删改都会污染别人的树。
+- **认边界**:容器名有无 "2"、盘 `code2` vs `code3`。跑 campaign/bench 前逐一核对 `--container`/`--remote-host-root`/`--venv` 全部指向 code2 侧。
+
 ## 起 mlperf_gptoss 容器固定 flag 与验证
 
 ### 固定 docker run flag(用户审定,别擅改)

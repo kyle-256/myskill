@@ -3,26 +3,21 @@ name: flydsl-mi355-optimizer
 description: >-
   MI355X (gfx950) 上优化 FlyDSL fp8/mxfp4/mxfp8 GEMM/attention kernel 的知识库：远程连接/选卡/同步、
   通用优化与 profiling 方法论、以及大量踩过的坑（tile 尺寸、occupancy、测量噪声、LDS/寄存器、race、
-  autotune、各种死胡同）。⚠️ 本工作区 = gpt_oss 环境（容器 mlperf_gptoss / 盘 code2 / venv /opt/venv）；
-  同集群任意节点上的 mlperf_gptoss2 与盘 code3 属于另一个项目 gpt_oss2_docker，严禁 rsync/docker exec/触碰。
-  章节卡按需打开，别全量加载。
+  autotune、各种死胡同）。methodology/ 与 pitfalls/ 与机器无关、可原样复用；本机环境细节（容器/盘/venv/节点）
+  在 connection/。⚠️ 只操作你被指定的容器/盘/venv，共享集群上严禁碰不属于你的容器/盘。章节卡按需打开，别全量加载。
 when_to_use: >-
-  优化/调试/benchmark FlyDSL 或 Primus-Turbo 的 GEMM/attention kernel；连接远端 MI355X (当前 chi2762)
-  跑测（只用 gpt_oss = mlperf_gptoss / code2；严禁碰 mlperf_gptoss2 / code3）；诊断性能回退、掉点、race、SNR 崩；
-  查"某个方向是不是已经试过且失败了"；写 autotune dispatch；确认 tile/occupancy/LDS 该怎么选。
-  凡是碰 gfx950 FlyDSL kernel 性能/正确性的活都先翻这里。
+  优化/调试/benchmark FlyDSL 或 Primus-Turbo 的 GEMM/attention kernel；连接远端 gfx950 节点跑测；
+  诊断性能回退、掉点、race、SNR 崩；查"某个方向是不是已经试过且失败了"；写 autotune dispatch；
+  确认 tile/occupancy/LDS 该怎么选。凡是碰 gfx950 FlyDSL kernel 性能/正确性的活都先翻这里。
 user-invocable: true
 ---
 
 # FlyDSL MI355X 内核优化知识库
 
 > 🚨 **环境红线（务必先读，违反=破坏别人环境）** 🚨
-> 本工作区 `/workspace/code/gpt_oss_docker` = **gpt_oss** 环境。所有远端操作只能用：
-> 容器 **`mlperf_gptoss`**（**无 "2"**）、host 盘 **`/mnt/vast/kyle/code2`**（→ 容器 `/workspace/code`）、
-> venv **`/opt/venv`**（mxfp4）/ `/opt/venv-tw`（tensorwise）、当前节点 **chi2762**（换节点流程见 connection/gpt_oss/01）。
-> **严禁**对 **`mlperf_gptoss2`** 或盘 **`/mnt/vast/kyle/code3`** 做任何 rsync / docker exec / 改动——
-> 那是**另一个项目 `gpt_oss2_docker`** 的地盘（认：容器名有无 "2"、盘 code2 vs code3）。
-> 跑 campaign / bench 前，逐一核对 `--container` / `--remote-host-root` / `--venv` 全部指向 gpt_oss（code2）。
+> **只操作你被明确指定的容器 / host 盘 / venv。** 多租户或共享集群上，**不属于你的容器或盘严禁做任何 rsync / docker exec / 删改**——会覆盖或污染别人的树。
+> 跑 campaign / bench 前，逐一核对 `--container` / `--remote-host-root` / `--venv` 全部指向**你自己的**环境；**尤其名字只差一个字符/一个数字的相邻环境最易误伤**（如 `xxx` vs `xxx2`、`codeN` vs `codeN+1`）。
+> **本机的具体边界（哪个容器/盘/venv 是你的、哪些相邻环境严禁碰）见 `connection/`。**
 
 MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。内容来自 myskill、
 `.claude/memory`、FlyDSL 官方 `.claude/skills` 与 Primus-Turbo `agent/skills`。
@@ -35,16 +30,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - 死胡同用 `❌ 别再试` 标注；卡尾 `来源:` 可回溯；卡间用 `见 <路径>` 或 `[[memory-name]]` 交叉引用。
 - ★ **上界≠可达铁律**(methodology/03):subtractive/HALF 探针、roofline 峰值率、纸面 op-count 给的都是**上界**,不是可达值——判负/判正前必须 edit→bench 真实现(踩证:HALF_PV +8.7% 假想 → 真 K32-PV −11%)。
 - 硬件默认 **gfx950 (MI355X)**；gfx942 (MI300) 仅作跨代对照。
-- **唯一可用的远端环境 = gpt_oss**（当前节点 chi2762，跳板 149.28.124.225，key `/workspace/code/.ssh_docker/id_ed25519`）：
-  | | gpt_oss（本工作区唯一可用） |
-  |---|---|
-  | 容器 | `mlperf_gptoss`（无 "2"） |
-  | 挂载 | host `/mnt/vast/kyle/code2` → 容器 `/workspace/code` |
-  | venv | `/opt/venv`(mxfp4) + `/opt/venv-tw`(tensorwise) |
-  | 重点 | mxfp4 / tensorwise fp8 |
-  🚨 **同集群节点上可能还有 `mlperf_gptoss2` / 盘 `code3`——那是 gpt_oss2_docker 项目的，绝对禁止碰**
-  （rsync 到 code3 会覆盖别人的树、docker exec mlperf_gptoss2 会污染别人的容器）。连接共享设施在
-  `connection/common/`、gpt_oss 差异在 `connection/gpt_oss/`（本工作区不含也不该有 gpt_oss2 连接卡）。
+- **远端环境细节（容器 / host 盘 / venv / 节点 / 跳板 / SSH key）= env-specific，见 `connection/`**：`connection/common/` 是通用连接设施，本机环境差异在 `connection/<env>/`。换机器时只替换 `connection/` 这一层，`methodology/` `pitfalls/` `00-decision-index` 与本导航保持通用、原样复用。
 - 动手前最短路径：**① grep [00-decision-index](00-decision-index.md) 确认你要试的动作没被判负** → ② 下方「症状→卡」表按现象分诊 → ③ 翻 `methodology/` 找做法 → ④ 翻 `connection/`（选对环境）把代码弄上卡跑测。
 
 ## 症状 → 先查哪张卡
@@ -69,22 +55,21 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 ## 顶层
 - [00-decision-index](00-decision-index.md) — **动手前先 grep**：全库 ❌ 死路 / ⚠️条件 / ✅开口 的动作索引入口(占用率/LDS/quant/attention/autotune/正确性/测量/环境/flydsl 九域)
 
-## connection/ — 远程连接 / 选卡 / 同步 / 构建
+## connection/ — 远程连接 / 选卡 / 同步 / 构建（env-specific 层：换机器时替换/重写本层，KB 其余部分通用）
 
 ### connection/common/ — 通用连接设施
-- [common/01-remote-access-jump-ssh](connection/common/01-remote-access-jump-ssh.md) — 跳板机(149.28.124.225)拓扑与 SSH key 种钥
+- [common/01-remote-access-jump-ssh](connection/common/01-remote-access-jump-ssh.md) — 跳板机拓扑与 SSH key 种钥
 - [common/02-pick-free-gpu](connection/common/02-pick-free-gpu.md) — rocm-smi 三件套选卡、共存/OOM 判据（sinfo 不可信）
 - [common/03-docker-disk-crash-guard](connection/common/03-docker-disk-crash-guard.md) — docker 根盘清理、docker save 暂存坑、大 spill 崩容器防护
 - [common/04-build-git-triton](connection/common/04-build-git-triton.md) — 按需 build/清 flydsl cache、git push、triton 版本
 - [common/05-reference-misc](connection/common/05-reference-misc.md) — 权限/硬件表/MFMA 延迟/LDS 规格/ISA dump 等参考
 
-### connection/gpt_oss/ — 唯一环境（mlperf_gptoss · code2 · mxfp4/tensorwise）
-- [gpt_oss/01-container-image-nodes](connection/gpt_oss/01-container-image-nodes.md) — 容器 flag/saved tar/生产节点现状
+### connection/gpt_oss/ — 本机环境连接卡（容器 / host 盘 / venv 细节，env-specific；换机器时替换本子目录）
+- [gpt_oss/01-container-image-nodes](connection/gpt_oss/01-container-image-nodes.md) — 容器 flag/saved tar/生产节点现状 + 本机边界(哪个容器/盘是你的、相邻环境严禁碰)
 - [gpt_oss/02-run-and-venv](connection/gpt_oss/02-run-and-venv.md) — docker exec 跑法 + mxfp4/tensorwise venv 隔离
-- [gpt_oss/03-sync-and-remote](connection/gpt_oss/03-sync-and-remote.md) — NFS(code2)/rsync 规程/FlyDSL 远端为主
+- [gpt_oss/03-sync-and-remote](connection/gpt_oss/03-sync-and-remote.md) — NFS/rsync 规程/FlyDSL 远端为主
 
-> ⚠️ 本工作区**没有也不该有** `connection/gpt_oss2/`。gpt_oss2（mlperf_gptoss2 / code3）是另一个项目
-> `gpt_oss2_docker` 的，其连接卡应放在那个工作区，不在这里。这里出现任何 code3 / mlperf_gptoss2 = 走错环境。
+> ⚠️ connection/ 是 env-specific 层:只放**你自己环境**的连接卡;相邻/别人的环境(名字相近的容器·盘)严禁在此混入或触碰,见上「环境红线」。
 
 ---
 
