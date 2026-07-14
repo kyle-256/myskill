@@ -174,6 +174,15 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
 - 映射方向:LDS stall → bank-conflict swizzle;VMEM-wait → 更深 prefetch / async G2S;barrier → ping-pong overlap。
 - 高MFMA低TFLOPS判据见下方"ATT trace 做 stall 根因"一节。
 
+### subtractive/HALF 编译期探针:PMC/ATT 不可用时的 stall 归因 + ★「上界≠可达」铁律
+- **技法**:PMC counter 被同集群别的 campaign 占锁、或无 ATT decoder .so 时,用**编译期门控探针**隔离每项成本:`skip_X`(跳过某段计算/store/barrier,故意破坏正确性只测时间)、`HALF_X`(跳一半 MFMA)、`REUSE_X`(某读塌成 1 次)。event-median ×40-60 隔离计时,逐项从 wall 里减出各成本;`skip_both`(同时跳两大计算)剩下的 residual = occ-1 暴露的结构延迟(HBM gather + 循环调度 + 依赖链串行,无第二 wave 掩盖)。
+- **★★ 铁律:subtractive/HALF 探针天花板、roofline 峰值率、纸面 op-count 分析给的都是「上界」,不是「可达值」。判负/判正前必须 edit→bench 真实现。** 反复踩证(dsv4 sparse-MLA,见 pitfalls/12):
+  - HALF_PV 探针「−8.7% 假想天花板」→ 真 K=32-PV **净负 −11%**(2-tile 批打断 QK→softmax→PV 交织,批结构本身是杀手,非 k 维)。
+  - SKIPST「store 占 wall 30-47%」→ 真 DMA / register-transpose / query-blocking **全净负**:store 是「跨-wave 数据共享 + register-prefetch 隐藏 HBM」的必需机制,不是可省浪费。
+  - 「gfx950 k=32 双倍 bf16 率」roofline 头 → 落地被数据布局(tr16 转置读 =4bf16/lane=k16)锁死到「必须 2-tile 批」,批税吃光收益。
+  - 去-padding「代理测量」判 DMA 负 → 其实测的是 tr16 bank-conflict,不是 DMA 本身;真 per-rank-DMA 保 padding 从没被那个代理覆盖(**代理≠真实现**)。
+  - **∴ 探针只告诉你「某成本是否在关键路径」(值不值得投入去攻),不告诉你「去掉它是否可实现」。可达头只有真实现 + bench 能定;纸面 op-count 预判(如 bpermute≫store)与探针天花板一样常错。**
+
 ## ATT trace 做 stall 根因:MFMA operand bubble 记在 MFMA 头上而非 waitcnt
 
 ### 核心洞察:operand bubble 记在 MFMA 头上,不记在 waitcnt 上

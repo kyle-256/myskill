@@ -149,7 +149,7 @@
 - dense WL+swizzle 是 **per-shape win**:`SWIZ=1` 70B Down 3075(1.03× per-K, 0.94× pt)、GateUp 2815(1.00× perK)、O_proj 2800(0.93×);小 shape 0.85-0.98×(prologue/grid 主导)。集成方向 = autotune 在 **WL vs per-K 按 shape 选**。
 - 诊断旋钮(dense):`WL_NOSCALE_MMA`(emit 非-scaled v_mfma)、`WL_NOSCV`(跳 scale load)、`FP4_WLNOG2S`、`FP4_WLNODSR`、`WL_SC128`(scale 减半)。
 - 诊断旋钮(grouped wgrad,**已从工作树删除,2026-07-05,从未 commit、git 历史里也没有,当前代码不可用**):`PT_MXGG_WGRAD_WL_{UNSCALED/PACK2/NOSCMMA/NOSCLOAD/SCMIN}`。生产 grouped wgrad 现仅 `_build_grouped_mxfp8_wgrad_kernel`(无 WL 路径)。
-- **后续裁决(commit ab7ad885):用户最终裁定 `mx_wholeloop` 文件夹严禁存在,WL 从 dense 生产中整体移除**(手调 2133 行 bare-asm 硬件循环无法"小改"搬进 mxfp8_gemm_kernel.py)。**每 shape ≥97% per-tensor 的目标最终靠 WL-free 的纯 per-K + scale_pack(opsel byte-pack)+ 大-K scale 预取达成**,已提交 `dac31090`(分支 `dev/kyle/flydsl_mxfp8_compute`)。WL 代码留档于 gpt_oss2 环境的 `.wl_study/`(仓库外)+ git 历史 fc45f4bb,若将来重做只能走真正 fp8-only clean rewrite。
+- **后续裁决(commit ab7ad885):用户最终裁定 `mx_wholeloop` 文件夹严禁存在,WL 从 dense 生产中整体移除**(手调 2133 行 bare-asm 硬件循环无法"小改"搬进 mxfp8_gemm_kernel.py)。**每 shape ≥97% per-tensor 的目标最终靠 WL-free 的纯 per-K + scale_pack(opsel byte-pack)+ 大-K scale 预取达成**,已提交 `dac31090`(分支 `dev/kyle/flydsl_mxfp8_compute`)。WL 代码留档于 `.wl_study/`(仓库外)+ git 历史 fc45f4bb,若将来重做只能走真正 fp8-only clean rewrite。
 
 ### C++ quant 配套修 3 处
 - `quantize_mxfp8_dual_meta` 的 preshuffle int32 buffer sizing;`preshuffle_n_tiles≥1` 防 `%0`;padded K-block scale byte 恢复 **0**(非 unit/bias)。
@@ -159,7 +159,7 @@
 ### 为什么禁 fallback
 - MXFP8 quant 吐的是 **FlyDSL-preshuffled int32 scale**,C++ 后端只认 raw E8M0;**一旦 FlyDSL fallback 到 HIPBLASLT/TURBO 必崩**。FlyDSL 必须自己覆盖所有 MX case。
 
-### 需扩展的 4 块(mx_blockwise 从 275 失败 → 0,1536 passed;源自 gpt_oss2 project_mxfp8_wholeloop_port.md,非本环境)
+### 需扩展的 4 块(mx_blockwise 从 275 失败 → 0,1536 passed)
 1. **E5M2/HYBRID**:`MfmaScale` 的 `cbsz/blgp` 按 operand format 设(0=E4M3,1=E5M2)。
 2. **fp16 out**:`StoreCPlain` 用 `out_ty`。
 3. **K<256 / K%128≠0(K-tail)**:execute 零填充 K → operand=0、scale pad **127(=1.0)**。
@@ -178,4 +178,4 @@ and M*K<2**31 and N*K<2**31
 - `granularity==MX_BLOCKWISE` 时 `can_handle()` 返回 **False**(FlyDSL NT 只接 preshuffled,而 dispatcher 喂的是 raw)。
 
 ---
-来源: mxfp8-8wave-devloop/SKILL.md; project_mxfp8_wholeloop_port.md; mxfp8-grouped-gg-devloop/SKILL.md 优化7; project_mxfp8_grouped_wgrad_wl.md(均源自 gpt_oss2 环境 `.claude/memory/`,非本 gpt_oss 环境;WL 相关结论已在两文中被后续 commit 标注为废弃/删除,详见正文各节说明)
+来源: mxfp8-8wave-devloop/SKILL.md; project_mxfp8_wholeloop_port.md; mxfp8-grouped-gg-devloop/SKILL.md 优化7; project_mxfp8_grouped_wgrad_wl.md(WL 相关结论已在两文中被后续 commit 标注为废弃/删除,详见正文各节说明)

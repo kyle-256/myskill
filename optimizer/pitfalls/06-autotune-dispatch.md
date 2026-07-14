@@ -5,7 +5,7 @@
 ## autotune/dispatch 纪律：禁 id(tensor) cache、can_handle 不 raise、per-shape 过拟合
 
 **cache 纪律**
-- ❌ 别再试：autotune 里 result cache(缓存 quantize/transpose/group_offs 的结果)和任何 **id(tensor)-keyed** cache。id(tensor) 会复用/回收——同一地址可指向不同数据,cache 命中即数据错误。
+- ❌ 别再试：autotune 里 result cache(缓存 quantize/transpose/group_offs 的结果)和任何 **id(tensor)-keyed** cache。id(tensor) 会复用/回收——同一地址可指向不同数据,cache 命中即数据错误。(Python 对象被 GC 回收后,新 tensor 可能拿到同一 `id` 值,cache 便把旧 key 命中到新数据。)
 - 只能 cache 两种东西：compiled object(`flyc.compile` 产物)和 launch closure(闭包**不含 data**,只含 launch 参数)。
 - cache key 用**纯静态维度**：`(op, N, K, G, M_total, out_fp16, cbsz, blgp)`。WHY：这些是唯一决定最优 kernel 的量,不含运行期 buffer 身份。
 
@@ -32,7 +32,7 @@
 
 ## 别接永不被采纳的候选：4w-persistent NT 对真实 8w-best <4% 净改动为零
 
-- **接生产前必须证明会被采纳**：新内核变体接进 autotune 前，先证它在**真实全量候选池**里能按采纳门槛（>4% 滞后，用来压 DVFS 噪声）被选中——分母必须是**真实 dispatch best**，不是手挑的弱子集。否则只白加编译开销，净改动为零。（pr-merge-gate/SKILL.md）
+- **接生产前必须证明会被采纳**：新内核变体接进 autotune 前，先证它在**真实全量候选池**里能按采纳门槛（>4% 滞后，用来压 DVFS 噪声；比放行门 2-3% 更严，见 pitfalls/02）被选中——分母必须是**真实 dispatch best**，不是手挑的弱子集。否则只白加编译开销，净改动为零。（pr-merge-gate/SKILL.md）
 - **grouped NT 4w-persistent 实测被否**：对真实 8w-best 仅 ~3%（<4% 门槛），且在它本该赢的**短-K 区又输给 4w-np**→已撤销，净改动为零。（pr-merge-gate/SKILL.md）
 - **fwd/dgrad 上 4-wave ≈ 8-wave-persistent**：打平（±2% 噪声内），autotuner 多数选 8-wave-persistent；dense/grouped 的 4w-persistent NT 候选几乎不被采纳。4-wave 的价值集中在 **wgrad（variable-K）**：早期生产 autotune 对比（auto vs 8w-only）**+6~17%**；后续修复 dispatch bug 并用 `PT_WARMUP=250` 校正后的 A/B（`c846d954` vs main）全 7 shape × 2 m 无一回归，大 contraction / 宽-N **+9~19%**，qwen/synth +3~9%。（flydsl-fp8-gemm-results/SKILL.md）
 
@@ -48,7 +48,7 @@
 - **wgrad 小-M 用持久，优于 masked**：per-group contraction ≤ **1536** 时，持久内核胜过 masked 分支——省掉 over-run chunk 的废循环（masked 会跑满整个 chunk 再 mask 掉尾部，浪费循环）。
 - ❌ **别再试**：把 big-K 的 drain-removal lever 迁移到 big-N。**不迁移**：big-N 的短 K 摊不开 drain 成本，lever 在 big-N 上无收益。
 
-- **vmcnt_hint 要调到 det=0 的上限**（determinism/正确性边界）：
+- **vmcnt_hint 要调到 det=0 的上限**（determinism/正确性边界；与 methodology/13 deep-wl 的 `(vmcnt,lgkmcnt)` 是不同轴：这里是正确性 det=0 上限，非性能 margin）：
   - big-K：`vh=3` 是 sweet spot。`vh=2` 也满足 det=0 但**更慢**。
   - big-N：det 上限**同样是 3**。
   - ❌ **别再试**：`vh > 3`。超过上限会 **race**（越界触发数据竞争，det≠0）。
@@ -84,6 +84,7 @@
 - ❌ **别再试**：把 `M_per_group` 烘成编译期常量。
 - ❌ **别再试**：`assert M_per_group % BLOCK_M == 0`。
 - ❌ **别再试**：假设固定 per-expert count 的静态 work partitioning。
+- ❌ **别再试**：grouped/dense config sweep 选 `BLOCK_M=128`。少启动块是假象（grid 写死 /256），真实慢 **1.55×**——完整根因见 pitfalls/05。
 - ✅ **必须**处理空组：`M_per_group == 0` 时 skip launch / 对 zero rows 分支。
 - **验证纪律**：每一轮 MoE 都要在倾斜分布上验证——top-1 + capacity factor，以及近退化情形（某 expert 拿 ≥50% token）。在 skew 下消失的增益 = benchmark over-fit，**必须回退**。
 
@@ -98,7 +99,7 @@
   - `R_real`（必须 = 0）
 - 若 **headline − real 差 > 1%** → 标为 benchmark-loop residual 并建议回退。
 
-### iteration_rules 核心纪律（贯穿以上）
+### iteration_rules 核心纪律（贯穿以上；通用循环机制见 methodology/13）
 
 - 一轮一个假设；perf 前先过 correctness gate；accept/rollback 有 lineage。
 - 每个 accepted gain **必须能迁移到真实训练 step**：不许 id(...) 作 key 的 activation/grad_out cache；不许只适配均匀分布的 GroupGemm 捷径（真实倾斜 token 分布下无效）。

@@ -7,9 +7,9 @@
 - **5405T 天花板根因 = occ=1 wave/SIMD，由 LDS 144KB/wg 锁死（非 VGPR）**：160KB/CU ÷ 144KB = 1 WG/CU；2 个 WG 需 288KB > 160KB 物理不可能。即使 VGPR 允许 2 waves，LDS 也只允许 1。单 wave 无法用第二个 wave 的 MFMA 去填 operand bubble → **MFMA 89.5% stall**。
 
 - **减法探针成本（500-sample，4-wave K28672 BK256）**：
-  - `g2s`（buffer_load→LDS DMA，HBM-BW-bound）= **1061T = 主瓶颈**
+  - `g2s`（global→shared，即 buffer_load→LDS 的 DMA 预取，HBM-BW-bound）= **1061T = 主瓶颈**
   - `ds_read`（96 read / 256 mfma）= **292T**
-  - `scale-load` 成本已被 GAVOID + SCVGPR + ILV 完全藏住（CONSTSC = prod real 5401）
+  - `scale-load` 成本已被 GAVOID + SCVGPR（scale 常驻 VGPR、免主循环重复 VMEM load）+ ILV 完全藏住（GAVOID/ILV/CONSTSC 等均为内部探针名；CONSTSC = prod real 5401）
   - 减 g2s 需更大 tile → AGPR 溢出；减 ds_read 需 BK128 → loop 开销更大。K28672 下 5500 med 超出 4-wave BK256 物理顶。
 
 - **K 越长 hiding 越充分**：K8192 = 4603 / K28672 = 5401 / K57344 = 5481。
@@ -41,12 +41,13 @@
 - 机制统一为：在途 store 占统一 vmcnt（见上），无法与 g2s 并行。
 
 ### ❌ 别再试：store 变宽 / coalescing（所有维度）
-- **CShuffle（LDS-stage 128b 宽存）** — neutral 到略差。LDS round-trip 延迟 ~12us（128 ds_write + lgkmcnt 串行 wait + ds_read）吃掉 8× 降发射的收益。
+- **CShuffle（经 LDS 暂存做 128b 宽存的 epilogue 重排手法）** — neutral 到略差。LDS round-trip 延迟 ~12us（128 ds_write + lgkmcnt 串行 wait + ds_read）吃掉 8× 降发射的收益。
 - **DPP / permlane16_swap（转错轴）** — 只换 16-lane 组、转错轴。HW 已把跨 lane store coalesce 成 128B/行（80% HBM 写峰 = 该 pattern 上限），任何寄存器/LDS 重排都不降事务数（masked-off lane 仍发射）。
-  - ⚠️ **注意区分**：这里判负的是**转错轴**的 permlane。**转对轴**的 `permlane16_swap` 转置 + `dwordx4` 宽存反而是 store-bound 胖形状的**最优 epilogue**（8192²×4096 从 fly/ait 1.039→0.998），见 `methodology/25`。别因为这条把 permlane 整体当死路。
+  - ⚠️ **注意区分**：这里判负的是**转错轴**的 permlane。**转对轴**的 `permlane16_swap` 转置 + `dwordx4` 宽存反而是 store-bound 胖形状的**最优 epilogue**（8192²×4096 从 fly/ait 1.039→0.998），见 `methodology/07`（§Epilogue 存策略，permlane16_swap）。别因为这条把 permlane 整体当死路。
 - **ds_bpermute 正确宽存（dwordx2）** — 全面更慢：LDS-crossbar 延迟 > 省的发射量；dwordx2 仅 32B coalesce 无提升，外加 64 crossbar + drain。
 
 ### ds_bpermute 三个坑（从全错救成 maxdiff=0）
+（`ds_bpermute` = 跨 lane 寄存器重排指令，此处用于 epilogue 转置宽存）
 1. **in-place dst==src 损坏跨 lane 读** — native rocdl 与 inline-asm `=v,v,v` 都被 RA coalesce 成 in-place → 必须 inline-asm `=&v,v,v`（earlyclobber）。
 2. **inline-asm ds_bpermute 是 opaque** — 编译器不插 `s_waitcnt lgkmcnt` → 必须显式 `rocdl.s_waitcnt(0)` drain；但 per-bperm 手写 lgkmcnt(0) 会序列化退化，**必须批量 wait**。
 3. **FlyDSL JIT 缓存不 hash 模块级方法** → 需 `FLYDSL_EXTRA_SOURCE_DIRS` bust cache。
@@ -87,13 +88,13 @@
 
 - ❌ 别再试：worst shape 的 **swizzle{5} × xcd{1,2,4,8} × vmcnt{1..8}** 全平（<2%）。瓶颈是 feed 带宽，不是这些旋钮。
 
-### grid 调度杠杆判负（源自 gpt_oss2 mxfp8-grouped-gg-devloop 项目，非本 fp8-TN wgrad 内核）
+### grid 调度杠杆判负（下为 grouped MXFP8 var-K wgrad 内核，与本卡 fp8-TN wgrad 内核不同，勿混淆）
 
-- ❌ 别再试：**persistent-across-groups**（grid `G*TILES→TILES`，一 WG 顺序做同一 tile 位置的全部 G 组）。此结论来自 **gpt_oss2 环境的 MXFP8 分组变长-K wgrad 内核**（`mxfp8_grouped_kernel.py`，与本卡其余部分讨论的 fp8-tensorwise TN 4-wave whole-loop wgrad 内核是不同内核/不同量化方案/不同 benchmark harness）。该项目中设计正确（SNR 28.14）但性能大幅倒退（MX/TW 从 ~1.02x 恶化到 **1.23-2.00x**）。根因：grid 缩 G× 后 TILES_PER_GROUP 只 **276-448**，在 256 CU 上仅 **1.1-1.75 波**，occ=1 下负载严重不均 + 8× 展开代码 I-cache 抖动。⇒ grid 缩 G× 与 occ=1 的 CU 负载均衡根本冲突，persistent 只在 **TILES_PER_GROUP >> num_CU** 时才有利，本卡的 fp8-TN wgrad 内核未验证此杠杆。
+- ❌ 别再试：**persistent-across-groups**（grid `G*TILES→TILES`，一 WG 顺序做同一 tile 位置的全部 G 组）。此结论来自 **MXFP8 分组变长-K wgrad 内核**（`mxfp8_grouped_kernel.py`，与本卡其余部分讨论的 fp8-tensorwise TN 4-wave whole-loop wgrad 内核是不同内核/不同量化方案/不同 benchmark harness）。该内核中设计正确（SNR 28.14）但性能大幅倒退（MX/TW 从 ~1.02x 恶化到 **1.23-2.00x**）。根因：grid 缩 G× 后 TILES_PER_GROUP 只 **276-448**，在 256 CU 上仅 **1.1-1.75 波**，occ=1 下负载严重不均 + 8× 展开代码 I-cache 抖动。⇒ grid 缩 G× 与 occ=1 的 CU 负载均衡根本冲突，persistent 只在 **TILES_PER_GROUP >> num_CU** 时才有利，本卡的 fp8-TN wgrad 内核未验证此杠杆。
 
 ### 测量方法论坑
 
-- ❌ 别再信：**"跳过整条指令测天花板"类探针**（如 `PT_TR_HALF` 跳过读）。跳过读 ≠ 换成更少的等效读。真实替换后（`ds_read_b128` 换 2×`tr-b8`）因带宽受限**收益归零**。测"去掉 X 的天花板"必须用真实替代指令，不能靠删指令——否则天花板虚高、误导方向。
+- ❌ 别再信：**"跳过整条指令测天花板"类探针**（如 `PT_TR_HALF` 跳过读）。跳过读 ≠ 换成更少的等效读。真实替换后（`ds_read_b128` 换 2×`tr-b8`）因带宽受限**收益归零**。测"去掉 X 的天花板"必须用真实替代指令，不能靠删指令——否则天花板虚高、误导方向（见 `methodology/03` §subtractive/HALF「上界≠可达铁律」）。
 
 ## 结构性死路杂项：8-wave 达不到 4-wave 长 K、dense SRD/split-K、scf.for iter_args
 
@@ -146,10 +147,10 @@
 - scale gap 随 k_iters **线性**（M=1024→1.5x、4096→1.9x、8192→1.94x）→ 是 per-K-iter 开销。
 
 ### scale_pack / opsel byte-pack：前提是「裸无预取」，生产不适用
-- ❌ 别再试（生产 per-K）：GEMM K-loop 里砍 scale LOAD 数（scale_pack / §9.4 opsel）——探针只加载 k=0 scale 复用测天花板，scale-tax ≈ 0%（4 shape 全 ≤1% 甚至略慢）。
-- WHY：现有流水已提前一拍预取 sa/sb（sa0n + s_setprio）把 scale i32 load 藏进 MFMA shadow。§9.4 的 scale_pack=4/opsel 前提是**没预取的裸状态**，本 codebase 不适用。
+- ❌ 别再试（生产 per-K）：GEMM K-loop 里砍 scale LOAD 数（scale_pack / opsel byte-pack）——探针只加载 k=0 scale 复用测天花板，scale-tax ≈ 0%（4 shape 全 ≤1% 甚至略慢）。
+- WHY：现有流水已提前一拍预取 sa/sb（sa0n + s_setprio）把 scale i32 load 藏进 MFMA shadow。外部（AITER 文档 §9.4）的 scale_pack=4/opsel 前提是**没预取的裸状态**，本 codebase 不适用。
 - WL(4-wave/occ=1) 上 scale_pack 曾被证伪（寄存器压力↑→spill），但那是 WL 的问题；WL 已整体放弃（手调 2500 行汇编不可维护），per-K(occ=2) 才是生产路径。
-- pack2（2 个 E8M0 字节合成 1 次 buffer_load_ushort，op_sel:[0,0,0]/[1,1,0] 选低/高字节，载入 32→16/iter）在 WL 吃回 54%（817→620）；但生产 per-K 已被预取藏住，无用。
+- pack2（2 个 E8M0 字节 —— E8M0 = MX 格式的 8-bit 指数、0 尾数 block-scale 编码 —— 合成 1 次 buffer_load_ushort，op_sel:[0,0,0]/[1,1,0] 选低/高字节，载入 32→16/iter）在 WL 吃回 54%（817→620）；但生产 per-K 已被预取藏住，无用。
 
 ### scale-128（dwordx4）无提速，WL_SC128 有索引 bug
 - dense Down 上 operand:scale 字节比 = 32:1。
@@ -169,7 +170,7 @@
 - ⚠️ **8-wave WL 早期诊断"死路"已被撤回**：Stage-0 初期（2026-06-23）曾判 8-wave WL 用 VGPR accs 无法 pin operand 做 fp8 2×b128 → 死路；但同日晚些时候明确撤回此结论——8-wave 仅 32 acc/wave，VGPR acc 放得下 + 留空间 pin fp8 operand，`occ=2 + 手写调度` 被重新评估为冲 98% 的**真正路径**，此后再无来源重新验证/判死 8-wave；WL 最终移出生产是因用户裁定 vendored 严禁（见下），并非 8-wave 被重新证伪。4-wave WL occ=1 是已验证的结构性天花板。
 - ❌ **BM=128 死路**：per-tensor 4096² 也用 BM256，BM128 更慢。
 
-### 补充（不同项目/内核，勿与上文 dense WL 混淆）：分组 wgrad var-K whole-loop（源自 gpt_oss2 mxfp8-grouped-gg-devloop 优化6，非本环境 dense WL）
+### 补充（不同内核，勿与上文 dense WL 混淆）：分组 wgrad var-K whole-loop（grouped MXFP8 var-K wgrad 内核，与本卡 dense WL 不同）
 - 以下数据来自**分组（grouped）GEMM 的 wgrad var-K** 4-wave bare-asm whole-loop 实验（`_build_grouped_mxfp8_wgrad_wl_kernel`，代码已于 2026-07-05 删除、从未提交），是与本卡 dense mxfp8 fwd WL **不同的内核/不同的 GEMM pass**，详见 methodology/12-mxfp8-grouped.md「grouped var-K wgrad」。
 - WL-unscaled（无 scale 计算地板）**只在 K∈{4096,2048} 3 个 shape 快 5-7%**；**K=7168 / 2880×2880 反慢 51-59%**。
 - 反常：**4096×7168（FLOP 更少）WL=1293 比 8192×4096 WL=911 还慢**；baseline 行为正常（857<946）。
@@ -181,7 +182,7 @@
 - ❌ **WL 用 buffer_store 掉 7-9%（0.95→0.91）**：WL(occ=1/4-wave/寄存器紧)**只认 copy-atom store**；per-K(occ=2 有余量)两者持平；**SGPR-pin 救不了**（不是 waterfall，是紧预算下 copy-atom 就是更优）。
 
 ### WLPAD：只证瓶颈，破坏正确性
-- ❌ **WLPAD=16 给 +10.6% 但破坏正确性**（pad 不兼容协作式连续 G2S）。仅用来证实 identity LDS 的 **16-way bank 冲突（row stride 128B = bank period）** 是瓶颈；**正确修法是 swizzle**，不是 pad。
+- ❌ **WLPAD=16 给 +10.6% 但破坏正确性**（pad 不兼容协作式连续 G2S）。仅用来证实 identity LDS 的 **16-way bank 冲突（row stride 128B = bank period）** 是瓶颈；**正确修法是 swizzle**，不是 pad。（探针只证瓶颈、非可达值，见 `methodology/03` §subtractive/HALF「上界≠可达铁律」。）
 
 ### C++ 后端 raw E8M0 崩 + int32 scale 不可填充
 - `test_gemm_fp8_mx_blockwise` 失败根因：quant 吐 **FlyDSL-preshuffled int32 scale**，FlyDSL 处理不了的 case（E5M2/HYBRID、K<256、K%128≠0、N%64≠0、fp16 out）fallback 到 C++ 后端要 **E8M0 → 崩**。
@@ -207,7 +208,7 @@
   - WHY: 256×256 tile 的 MFMA operand 复用在 compute-bound 形状更优。
   - **教训重申**: sweep/探针任何变快必须先确认 grid/tile 覆盖完整,或跑数值对拍。
 
-- **❌ bm=128 需 nt_a=2 preshuffle 布局(确认死路已回退)**: `bm=128` 还需 A-scale preshuffle 发 `nt_a=2` 布局(32-row group、每 record 2 子块),否则 `ScaleS2R(n_tiles=2)` 只读一半 → 数值全错。已把 `_emit_lds_repack(nt=...)` / preshuffle / workspace / grid 全参数化打通验证,确认 `bm=128` 死路后全回退,dense/wgrad 保持 `nt=4`。
+- **❌ bm=128 需 nt_a=2 preshuffle 布局(确认死路已回退)**: (`nt` = preshuffle 每 record 的子块数) `bm=128` 还需 A-scale preshuffle 发 `nt_a=2` 布局(32-row group、每 record 2 子块),否则 `ScaleS2R(n_tiles=2)` 只读一半 → 数值全错。已把 `_emit_lds_repack(nt=...)` / preshuffle / workspace / grid 全参数化打通验证,确认 `bm=128` 死路后全回退,dense/wgrad 保持 `nt=4`。
 
 - **输入 band 收紧中性(依赖搬家没净减)**: grouped qa 主 kern 输入 buffer band 从 `[in_rebase, total_M)` 收成 `[in_rebase, RIE)` 靠 `num_records` HW-drop 删 `(grow < real_end)` select,实测中性。WHY: 依赖只是从 RE-load 换成 RIE-load,没净减少;grouped M-remap 的 SRD 本就要 runtime 组信息 gate 住 load,是结构性的。
 
@@ -236,14 +237,14 @@
 ### qa kernel 已高度调优，离峰 gap 是结构性
 - qa kernel PMC：**occ 75.4% / MeanOcc 24.16 waves/CU / WriteSize 306MB≈理论 283（放大仅 8%）/ MemStall 1.6% / VALUBusy 30%**。
 - 解读：占用率高 → **非 occ-limited**；写高效 → **无半-cache-line 写放大**。
-- ❌ 别再试低垂果实（提 occ / 写合并 / scale_pack）：**全证伪，不存在**。
+- ❌ 别再试低垂果实（提 occ / 写合并 / scale_pack）：**全证伪，不存在**（scale_pack 同 §scale_pack / opsel byte-pack 结论，已被预取藏住）。
 - 离峰 gap 根因：**phased load→barrier→compute→barrier→store 结构**（计算相时 DRAM 空闲，**dense 同样只 ~60% 峰**）。要抬只能**跨-tile 软流水重叠访存与计算**，是大改高风险。
 - grouped 独有的 **1.30x（+37us）** 是 M-remap SRD-gating + col-padding + prologue，**全结构性**。
 
 ### ❌ 别再试：fwd/dgrad 三条重写路（全证伪）
 - grouped MX fwd/dgrad 慢 4-12%，无低风险可落地优化：
-  - **scale_pack**：被预取隐藏，scale-tax≈0。
-  - **BLOCK_M=128**：少启动块假象，真实 **1.55x 慢**。
+  - **scale_pack**：被预取隐藏，scale-tax≈0（见上 §scale_pack / opsel byte-pack）。
+  - **BLOCK_M=128**：少启动块假象，真实 **1.55x 慢**（见上 §BLOCK_M=128 少启动块假象，完整机制+数字）。
   - **band-swizzle**：`group_n>0` / `gm=8` 略慢或崩 **1.5x**。
 - **preshuffle 只占 3.5%（15.5us / ~3.4 TB/s）非瓶颈**。
 - 唯一有效 lever 是**调度局部性（xcd/gm/gn），已被 autotune 吃掉**。

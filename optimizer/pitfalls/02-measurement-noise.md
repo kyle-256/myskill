@@ -27,6 +27,7 @@
 - 正解 = interleaved A/B：**同进程**交替 config A/B × N-trial，**win-count** 判胜（不是比均值绝对数）。WHY: 交替执行让两者共享同一时钟/温度轨迹，抵消 DVFS 与热漂移。
 
 **timing 引擎别跨比（工具边界）**
+- （归属：`quick_test_bench.py` / `bench_<op>_turbo.py` 是 **fp8-gemm turbo harness**；dsv4 attention 另用单个 `bench_mla.py`。）
 - `quick_test_bench.py` 用手写 `time.perf_counter` 循环；full `bench_<op>_turbo.py` 用 `torch.utils.benchmark.Timer` → **不同 timing 引擎，绝不能跨这两者比绝对数字**。
 - `quick_test_bench.py` 是 round-to-round 每-shape 回归门的**权威源**（BASELINE 和每个 VALIDATE 都跑它，比 `--summary-csv`）。
 - full bench 只用于：(i) 从全 shape 集挑 `representative_shapes`；(ii) campaign 后最终验收。
@@ -104,6 +105,7 @@
   - ❌ 别再试 把 prologue 摊成一串 tiny torch 算子搬 host：正解 = 融合 **on-device prologue kernel**（HIP 用 `compute_padded_layout_gpu <<<1,1>>>`，~9µs，1 线程从 tight int64 offs 直接算 64/128 对齐 lens/offs），塞进 jit stub 与 meta/kern 背靠背发射。(src: mxfp8-grouped-gg-devloop/SKILL.md)
 
 - **per-call scale 转换 Python 循环是 host 瓶颈**：`gemm_mxfp8_flydsl_kernel` 的 per-call scale 转换（broadcast → WL lane-contig 经 `preshuffle_scale_lane_contig` 的 Python 循环）= **8000µs/call**，是端到端 host 开销瓶颈（kernel-only perf 已达标）。解法：向量化 / 缓存。(src: project_mxfp8_wholeloop_port.md)
+  - （术语：**WL** = whole-loop mxfp8 移植路径；**lane-contig** = 把 scale 重排成 lane-contiguous 布局供该核直读。）
 
 ## 虚高 TFLOPS 假象：SNR<0 跳过计算 TF 虚高、超 peak 数字、do_bench 不可靠
 
@@ -118,11 +120,12 @@
 ### '跳过整条指令测天花板'类探针不可信
 - **PT_TR_HALF**（跳过读）之类探针不可信：跳过读 ≠ 换成更少的等效读。
 - 真实替换后（`ds_read_b128` 换 2×`tr-b8`）因带宽受限，收益归零。
-- ❌ 别再试：靠删指令测'去掉 X 的天花板'。测'去掉 X'必须用**真实替代指令**，不能靠删指令。
+- ❌ 别再试：靠删指令测'去掉 X 的天花板'。测'去掉 X'必须用**真实替代指令**，不能靠删指令。（呼应 methodology/03「★★ 上界≠可达铁律」：subtractive/HALF/roofline/纸面 op-count 都只给上界，判正/判负前必须 edit→bench 真实现。）
 
 ### proxy 测量的赢点常是 artifact
 - **STORE_PLW / BPERM** proxy 用 contiguous 地址（数据故意错，footprint 变小）显得快 **+8%**；正确 row-strided 数据拿不到——coalescing 受 tile 列宽限，最大 ~64-128B。
 - **COALADDR** 把数据写飞进别的行才显快（地址错 → artifact）。
+- （以下两条非 proxy artifact，是真实测的中性/判负结论，仅同处此小节）
 - `s_setprio` 对 mxfp4 neutral（`waves_per_eu=1` 无跨 wave 仲裁对象 + 稳态已 stall-free）。
 - **wl-depth** 轴对 Llama shape 全在 ±0.5% 噪声内（"best" 随机跳）。❌ 别再试：扩 wl autotune。
 
@@ -157,8 +160,8 @@
 - **任何改缓冲布局 / vmcnt 都必须重跑 race 测**：这两类改动直接影响跨 barrier 的写窗口，SNR 过了也可能已经在腐蚀输出。改完不重跑 `_race_wg.py` = 没验证。
 - **racing 优势本质是不安全的跨 barrier 写**：`PT_WL_2BPOOL` 2 池 3buf 时开 racing（`PT_RACE_VM=1`），在 m4096 上 SNR 掉到 **53-54**，就是输出正在被腐蚀的信号。其机制是让 `vmcnt(16)` 把 4 个 pool 的全部 G2S 写放到跨 barrier 之外（约 **0.17% bit-flip**），这是不安全的加速。
 - **安全 3buf 才是正解**：不要为 racing 的速度收益牺牲正确性；racing 的"优势"是拿正确性换来的假象。
-- （源自 gpt_oss2 mxfp8 grouped GEMM 项目 `dev/kyle_mxfp8_gg_pr`，非本环境 wgrad 4wave 内核，仅作跨项目参考）**官方 deterministic pytest 是该项目的 race 验收口径**：以 `test_grouped_gemm_fp8_mx_blockwise_deterministic` 为准（`rtol=0`/`atol=0` + `empty_cache` churn、`repeats=10`）；d7b149a ×100 全过。全量 `pytest tests/pytorch/ops/test_grouped_gemm_fp8.py -k mx_blockwise` 期望 **3840/3840**。
-- （同上，源自 gpt_oss2 mxfp8 项目，与本卡 wgrad 4wave 无关）**mxfp8 真实性能数字（安全实现，供参考）**：gpt_oss-20B Expert shape(B=4 M=2048 N=5760 K=2880) reg notes 修后 grouped fwd/wgrad 达 **106/0/0/0**；Perf(B=16 M=2048 N=4096 K=7168) **Fwd 1435 / Dgrad 1416 / Wgrad 2013 TFLOPS**，SNR **28.23 / 28.23 / 28.08 dB**。grouped MoE bench 第二类修前后基本持平：Fwd 941.02→934.67(**−0.67%**)、Bwd 1109.91→1099.66(**−0.92%**)。
+- （下为 grouped MXFP8 GEMM 内核，分支 `dev/kyle_mxfp8_gg_pr`，与本卡 wgrad 4wave 内核无关，跨内核参考）**官方 deterministic pytest 是该内核的 race 验收口径**：以 `test_grouped_gemm_fp8_mx_blockwise_deterministic` 为准（`rtol=0`/`atol=0` + `empty_cache` churn、`repeats=10`）；d7b149a ×100 全过。全量 `pytest tests/pytorch/ops/test_grouped_gemm_fp8.py -k mx_blockwise` 期望 **3840/3840**。
+- （同上 grouped MXFP8 内核，与本卡 wgrad 4wave 无关，跨内核参考）**mxfp8 真实性能数字（安全实现，供参考）**：gpt_oss-20B Expert shape(B=4 M=2048 N=5760 K=2880) reg notes 修后 grouped fwd/wgrad 达 **106/0/0/0**；Perf(B=16 M=2048 N=4096 K=7168) **Fwd 1435 / Dgrad 1416 / Wgrad 2013 TFLOPS**，SNR **28.23 / 28.23 / 28.08 dB**。grouped MoE bench 第二类修前后基本持平：Fwd 941.02→934.67(**−0.67%**)、Bwd 1109.91→1099.66(**−0.92%**)。
 
 ❌ 别再试：靠 SNR 判断 race 是否存在。SNR=53-54 才暴露、正常 SNR 完全掩盖 1/30000 级 bit-flip，采样量不到 30000+ 次时假阴性。
 ❌ 别再试：`PT_RACE_VM=1` + 2 池 3buf 的跨 barrier G2S 写。m4096 实测 SNR 掉到 53-54，约 0.17% bit-flip，速度收益是以腐蚀输出为代价的。

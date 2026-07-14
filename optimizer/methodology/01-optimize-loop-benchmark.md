@@ -56,14 +56,14 @@
 - grouped-gemm autotune dispatch 反复测出"看似很大其实非真回退"的差异,根因就是混用两把尺子。
 - 禁用 `timeit.Timer` / `torch.utils.benchmark.Timer.timeit(50).mean`:会被 **CPU scheduler jitter + GPU boost clock 未稳定**污染。
 
-### FlyDSL compile-once:避 jit 派发被计进 event(源自 gpt_oss2 mxfp8-8wave-devloop 项目,非本环境)
+### FlyDSL compile-once:避 jit 派发被计进 event(下述为 MXFP8 8-wave devloop 计时口径,与本节 tensorwise fp8 harness 不同,勿混淆)
 - `flyc.jit` 的 launch **每次调用有 ~40us Python 派发开销**,cuda-event 会把它量成派发延迟(而非真实 GPU 时间)。
 - 正确:先 `comp = flyc.compile(launch, ...)` **编译一次**,再 `comp(...)` 直进 GPU stream 用 cuda-event 计时(**warmup=30 / iter=300**)。
 
-### 官方 benchmark 口径 (e2e / bwd 必用,禁手搓 event)(源自 gpt_oss2 mxfp8-8wave-devloop 项目,非本环境)
+### 官方 benchmark 口径 (e2e / bwd 必用,禁手搓 event)(下述为 MXFP8 8-wave devloop 口径,与 tensorwise fp8 harness 不同,勿混淆)
 - MXFP8 e2e benchmark 用官方口径(与 **TE GB200 一致**):`torch.utils.benchmark.Timer(stmt="fn()").timeit(100).mean*1e3`;`tflops = 2*M*N*K/(ms*1e-3)/1e12`。
 - ❌ 别再试 手搓 cuda-event 计 bwd:会把 **autograd dispatch** 算进去,**bwd 低估 ~10-18%**。
-- (注:上文"禁 `timeit(50).mean`"针对 autotune/kernel 微基准;e2e op-level 口径反用 `timeit(100).mean` 与官方对齐,但两条均为 gpt_oss2 MXFP8 devloop 的口径,与本环境 tensorwise Primus-Turbo FlyDSL-fp8-gemm 流程不是同一套 harness,引用前需确认适用。)
+- (注:上文"禁 `timeit(50).mean`"针对 autotune/kernel 微基准;e2e op-level 口径反用 `timeit(100).mean` 与官方对齐,但两条均为 MXFP8 devloop 的口径,与 tensorwise Primus-Turbo FlyDSL-fp8-gemm 流程不是同一套 harness,引用前需确认适用。)
 
 ### warmup 长度 (短-K / occ=1 的头号坑)
 - 短-K shape **冷/热差异 >20%**,warmup 太短会严重 **mis-pick**(autotune 选错 config)。

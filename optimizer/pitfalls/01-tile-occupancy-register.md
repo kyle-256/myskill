@@ -9,11 +9,11 @@
 - 512 合并寄存器池公式与 co-saturation 方法论：见 methodology/04-occupancy-and-tile.md，本卡只保留该模型下的踩坑细节与反直觉数字。
 - gfx942 waves/SIMD 阶梯（`512 // (arch+accum)`）：≤128→4wave、≤170→3wave、≤256→2wave、≤512→1wave、**>512 SPILL 严重回退**。
   - 例：arch=148/accum=148→296→1wave；再加 32 arch→328 仍 1wave；要 2wave 需**合并** ≤256。
-- gfx942 分级（另一维度视角）：≤128/≤128 得 2 wave（好）；129-256/≤256 得 1 wave（compute-bound 可接受）；>256 SPILL（严重回退）。
+- 口径统一：上面阶梯的门槛值均指**合并总量 R=arch+accum**（非单独 arch 或 accum）；≤256 得 ≥2 wave、257-512 得 1 wave（compute-bound 可接受）、**>512 SPILL 严重回退**。
 - **AccVGPR 不与 arch 竞争分配**：MFMA 累加器用 accum_vgpr（独立文件），预取缓冲/B tile/A tile 用 arch_vgpr，二者不互相竞争寄存器**分配**——但**共享占用预算**。
 - **LDS 地址逻辑也吃占用**：LDS 寻址逻辑增长 arch_vgpr，即便不碰 MFMA 累加器也会吃 occupancy；kernel 靠近 2-wave 边界时要压低 LDS 地址 VGPR 压力。
 - **每 buffer_load_dwordx4 = 4 arch_vgpr**；双缓冲净增约一组 'next' 缓冲。
-- gfx950 8-wave WG（512 线程，2 waves/SIMD）硬上限 V+A ≤ 256 dword/lane（每 SIMD 16384 dword）；occ=1 时 512-VGPR 满载锁死 prefetch 深度。
+- gfx950 8-wave WG（512 线程，2 waves/SIMD）硬上限 V+A ≤ 256 dword/lane（推导：每 wave-slot 512 dword，8-wave 时每 SIMD 2 wave → 512/2=256 dword/lane；16384 = 每 SIMD 物理寄存器总量 512 dword×32 lane 视角，仅供换算）；occ=1 时 512-VGPR 满载锁死 prefetch 深度。
 
 ### ❌ 别再试：砍 LDS 提 8-wave mxfp4 occupancy
 
@@ -25,18 +25,16 @@
 ### 4-wave 真瓶颈：occ=1 单 wave 无延迟隐藏，MFMA idle ~40%
 
 - 4-wave mxfp4 真瓶颈 = **occ=1**（1 wave/SIMD，vgpr432 + agpr256，waves_per_eu=1）→ 单 wave 无跨 wave 延迟隐藏，**MFMA idle ~40%**，不是 shuffle。
-- **反证旋钮 BN128**（HAS_BR=False，32 accs=128 AGPR，2-buf，LDS≤80K）→ occ=2 反而藏 ds_read 延迟更好。
+- **反例配置 BN128**（用来反驳「occ=1 大 tile 必赢」的对照实验；把 tile 缩到 32 accs=128 AGPR + 2-buffer + LDS≤80K，即降算术强度换 occ=2；`HAS_BR=False` 是关闭某内部分支的 flag）→ occ=2 反而藏 ds_read 延迟更好。
   - PMC 证据：LdsUtil 8%（non-bw-bound），大 SQ_WAIT_INST_LDS 被 1-wave/SIMD 暴露。
 - **结论**：occ=1 大 tile 不是无脑赢，是 tile 强度 vs 延迟隐藏的权衡。
 
 ## 死路：maxnreg 强制 accum_vgpr=0、AGPR 搬移救不了 VGPR 溢出
 
-- ❌ 别再试：用 `maxnreg` 强制 `accum_vgpr=0` 来给预取/arch-VGPR 腾寄存器。占用率会翻倍，但 MFMA 累加器被逼经 `v_accvgpr_read` 溢出到 arch_vgpr（arch-VGPR spills），实测 **~4.5× GPU kernel 回退**。MFMA-heavy kernel 绝不能用 `maxnreg`。**AccVGPR 压力只能付在 occupancy 上，无法规避。**
-
-- 占用预算模型（gfx942/gfx950 合并 512-entry/SIMD 池，非 gfx908 的 256/max）：见 methodology/04-occupancy-and-tile.md
+- ❌ 别再试：用 `maxnreg` 强制 `accum_vgpr=0` 来给预取/arch-VGPR 腾寄存器。历史环境（flag 曾生效时）实测 **~4.5× GPU kernel 回退**（⚠️旧环境数）：占用率翻倍，但 MFMA 累加器被逼经 `v_accvgpr_read` 溢出到 arch_vgpr（arch-VGPR spills）。MFMA-heavy kernel 绝不能用 `maxnreg`。**AccVGPR 压力只能付在 occupancy 上，无法规避。** ⚠️ 本容器 external codegen 不可用 → `maxnreg` 已完全无效（ISA 逐字节相同，见 methodology/03），此路在本容器连「生效」都做不到。
 
 - **死坑：把 accs 搬 AGPR 救不了溢出**。CDNA occ=2 下 `ArchVGPR + AccVGPR` 共享 256 组合预算（`accum_offset 256`）。把累加器搬到 AGPR **不减少总量**，救不了 VGPR 溢出。
-  - fp4 MFMA 有 5 个操作数 `(a, b, sa, sb, c)`；`sa`/`sb` 必须留 VGPR，`acc` 可移 AGPR，但 **V 不下降** → `V + A = 384 > cap`。
+  - fp4 MFMA 有 5 个操作数 `(a, b, sa, sb, c)`；`sa`/`sb`（a、b 各自的 scale 操作数）必须留 VGPR，`acc` 可移 AGPR，但 **V 不下降** → `V + A = 384 > cap`。
   - ❌ 别再试：8-wave BN512 BK128 实测 spill 到 Scratch，1132 → 374 TF（**13× 慢**，每个 MFMA 都读写 scratch = 打 HBM）。
 
 ## 占用率量子边界：只有跨 allocation quantum 才买到一个 wave
@@ -117,6 +115,7 @@ AITER 有 per-shape 选 128×128 / 192×256 / 256×512… 在本架构（gfx950 
 - 被 register-bound 墙挡死：1-deep A 预取需 +64 VGPR，raw 的 VGPR 上限只有 256-128(AGPR)=128，加后 **300>256** 破 1 wg/CU。
 
 ### MONOHOIST：把 operand ds_read 上提到迭代顶 — 只提 b1 是唯一干净赢
+（名词表：a0/a1=A 的两片 operand fragment，b0/b1=B 的两片；数字后缀如 b2/a2=该 frag 下移到第 2 个 barrier 之后的变体。raw=bare-asm whole-loop 路径 / intrinsic=编译器 SSA 路径，二者区别见本卡「raw-AGPR 8-wave」小节。）
 - ❌ 别再试 FP4_MONOHOIST=1/both/a：同时持有 a0+a1+b0+b1(~96VGPR)+scales/addr/g2s/readout 超 128 预算 → spill(scratch)，perf 掉到 **3735**(baseline ~4477)。
 - ❌ 别再试 FP4_MONOHOIST=a2(a1 下移一 barrier)：单独 SNR29.6 数值错 + spill perf **3385**。b2a2 组合正确但仍 spill perf **3350**。
 - ✅ 唯一干净赢点 = 只提 b1(b2，+16VGPR，num_vgpr 128→110 不 spill)：稳超 raw-baseline **+0.7%**，微超 intrinsic **+0.13~0.16%**。
@@ -148,7 +147,7 @@ AITER 有 per-shape 选 128×128 / 192×256 / 256×512… 在本架构（gfx950 
 
 - ❌ **别再试上游 AGPR-pin commit 救 mxfp4**：上游 ROCm/FlyDSL AGPR-pin commit（**#714 aeb5afc**，作用于 fp8 4wave AGPR 原地累加、消 accvgpr-shuffle +5~13%）对 **mxfp4 4-wave 无帮助**。WHY：mxfp4 走 bareasm whole-loop，accs 已用 `=a` tied 原地累加、更彻底，accvgpr-shuffle 问题根本不存在。实测 **agpr1（5407/5322）≈ agpr0（5390/5348）** 噪声内相等。上游针对 SSA-lowered 路径，bareasm 无此路径。
 
-- ❌ **别再试 `amdgpu-mfma-vgpr-form=false` 在生产 4-wave**：对生产 4-wave 内核**零收益**，ISA 逐字节相同（accvgpr_write=1 / read=256 / agpr=256 / vgpr=432 / scratch=0）。WHY：累加已由 `passthrough amdgpu-agpr-alloc=256` + `waves_per_eu=1` + `maxnreg` 强制进 AGPR，循环内 **0 条 accvgpr shuffle**（256 条 `v_accvgpr_read` 全在 epilogue、只发生一次）。探针"8164/512 per-MFMA accvgpr shuffle 是头号瓶颈"是**误诊**（来自旧版/8wave/agpr=False 变体）。
+- ❌ **别再试 `amdgpu-mfma-vgpr-form=false` 在生产 4-wave**：对生产 4-wave 内核**零收益**，ISA 逐字节相同（accvgpr_write=1 / read=256 / agpr=256 / vgpr=432 / scratch=0）。WHY：AGPR 累加是 FlyDSL intrinsic 层既成的，**与编译 flag 无关**——本容器 external codegen 下 `maxnreg`/`waves_per_eu`/`amdgpu-mfma-vgpr-form` 全无效（见 methodology/03），累加器本就在 AGPR 里，循环内 **0 条 accvgpr shuffle**（256 条 `v_accvgpr_read` 全在 epilogue、只发生一次）。探针"8164/512 per-MFMA accvgpr shuffle 是头号瓶颈"是**误诊**（来自旧版/8wave/agpr=False 变体）。
 
 ---
 来源: 01-architecture.md, gemm-optimization/SKILL.md, lds-optimization/SKILL.md, prefetch-data-load/SKILL.md, kernel-trace-analysis/SKILL.md, programming-model.md, agpr_phase5_lds.md, project_mxfp4_vgprform_deadend.md, diag_4w_vs_8w.md, 09-8wave-ceiling.md, gfx942/overview.md, gfx950/overview.md, flydsl-fp8-gemm-results/SKILL.md, flydsl-kernel-authoring/SKILL.md, gemm/overview.md, project_mxfp4_epilogue_store.md, 03-nn-dgrad-kernel.md, 05-dead-ends.md, 04-ceiling-analysis.md, 10-8wave-scvgpr.md, agpr_phase5_ldsr.md, agpr_phase5_mono.md, agpr_rawasm_progress.md, remote-sync/SKILL.md, 11-upstream-agpr-pin-moot.md

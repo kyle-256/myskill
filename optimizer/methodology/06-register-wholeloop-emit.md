@@ -73,7 +73,7 @@
 
 - big-K(K 很大如 8192×8192×28672,长 K-loop,L2 已好)瓶颈 = A-side tr8 的 `s_waitcnt vmcnt(0)` 全排空(LLVM 对 intrinsic `ds_read` 保守插入)。
 - **WIN = both-path-J drain removal**:`a_inline_asm=1,b_inline_asm=1`(A、B 都走 inline-asm `ds_read_b64_tr_b8`,opaque 给 SIInsertWaitcnts → 无自动 vmcnt(0) drain)+ `asm_mma=2`(绕过 agpr guard,MMA 仍 intrinsic)+ `agpr_alloc=0` + `vmcnt_hint=3`。配套的 asm-inplace MFMA(`asm_mma=2` wire `_asm_mma_do` mode2,D 别名 C in AGPR,`agpr_alloc=128`,消 accvgpr 拷贝 + spill 18→0):big-K **+2.3%,det0(3×2000 fresh)**,commit **1049c9ee**。
-- `vmcnt_hint` 调到 det=0 上限:**vh=3 是 sweet spot**;vh=2 也 det=0 但更慢;big-N 的 det 上限也是 3。(注:此前版本记载的 424fe26b/2580→2756TF/2710-2734TF 数字系与 gpt_oss2/mxfp8 环境的同名 skill 文件混淆,本环境源文件无此数据,已按 gpt_oss 自身来源 flydsl-fp8-gemm-tuning/SKILL.md 更正)
+- `vmcnt_hint` 调到 det=0 上限:**vh=3 是 sweet spot**;vh=2 也 det=0 但更慢;big-N 的 det 上限也是 3。(注:此前版本记载的 424fe26b/2580→2756TF/2710-2734TF 数字系与 MXFP8 同名 skill 文件混淆,tensorwise fp8 源文件无此数据,已按 flydsl-fp8-gemm-tuning/SKILL.md 更正)
 - **同 FLOPs 不同 shape 对照是金矿定位法**:big-N 慢就拿 big-K(同 FLOPs 同 kernel)对照 profile,差异指标(L2 51 vs 66)直接点出瓶颈。
 
 ### wgrad ≠ DVFS 功耗受限(区别于 dense fp8)

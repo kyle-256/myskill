@@ -10,9 +10,9 @@
   - 等价复现历史 X 变体失败模式。
   - raw-AGPR 腾 VGPR 也**救不了**：瓶颈是 **occupancy 不是 VGPR 数**。
 
-- ❌ 别再试：B 操作数直载到 VGPR 跳过 LDS（b_vgpr）→ mxfp4-8wave 实测**慢 ~22%**（4096²×8192 77.8%），已 bit-exact 非坏但慢。
+- ❌ 别再试：B 操作数直载到 VGPR 跳过 LDS（b_vgpr）→ mxfp4-8wave 实测**慢 ~22%**（4096²×8192，b_vgpr 仅达 intrinsic 的 77.8%），已 bit-exact 非坏但慢。
   - 原因：8wave 同 wave_n 的多 wave 本可协作共享 LDS 中的 B，b_vgpr 让每 wave 各自从 global 冗余重载 B → 省了 LDS 读却暴增 global 流量。
-  - （另有 fp8 dense/grouped GEMM 调优环境下的说法是"慢 4×，因相邻 lane 地址差 K 步长 uncoalesced"，见 08-deadends.md，但那是不同 kernel/context，非本 mxfp4-8wave 场景，不可混用。）
+  - （另有 fp8 dense/grouped GEMM 调优环境下的说法是"慢 4×，因相邻 lane 地址差 K 步长 uncoalesced"，但那是不同 kernel/context，非本 mxfp4-8wave 场景，不可混用。）
 
 - ❌ 别再试（实测推翻旧误判）：把 8-wave mxfp4 GEMM 的 occupancy 当 LDS-bound。真相是 **REGISTER-bound**。
   - 128 VGPR + 128 AGPR = 256 共享 512 寄存器文件 → 硬卡 **2 waves/SIMD = 1 wg/CU**。
@@ -40,10 +40,11 @@
 ## LDS bank 冲突/swizzle：gfx942 32 banks vs gfx950 64 banks，mask 需重推
 
 ### bank 数按代不同，mask 必须重推
-- **gfx942 = 32 banks，512 B 分配块**；**gfx950 = 64 banks，1280 B 分配块**（1280 B 对齐，no wrap）。
+- **gfx942 = 32 banks，LDS 分配粒度 512 B**；**gfx950 = 64 banks，LDS 分配粒度 1280 B**（1280 B 对齐，no wrap）。
 - bank 冲突 stride 随 bank 数变：**gfx942(32) stride=128 字节全冲突；gfx950(64) 同样 stride=128 字节只 2-way 冲突**（线程在 2 bank 间交替），要 **256 字节倍数(64*4)** 才全 64-way 冲突。
 - WHY：为 32-bank 设计的 XOR swizzle mask 直接搬到 64-bank gfx950 会**留残留 2-way 冲突**，mask 需调宽。
 - footprint 陷阱：原本在 512 B 上整除干净的 footprint，在 1280 B 上可能浪费整个块、掉一个 occupancy tier。移植时 swizzle/padding mask 都要重新推导。
+- （XOR mask 通式与 padding stride 推导见 methodology/05-lds-swizzle-prefetch-sched.md，本卡只列移植踩坑判据。）
 - A 型 bank 冲突判据：ds_read/ds_write 自身 stall>100 cycle/hit，read2_b64/write2 的 offset 为 bank 数倍数（gfx942=32 / gfx950=64）。
 
 ### swizzle 写读路径必须完全一致
@@ -64,7 +65,7 @@
 
 ### 无冲突时消冲突无意义（死坑）
 - ❌ 别再试 实测本就无冲突时做 padding 消 bank conflict：SQ_LDS_BANK_CONFLICT=0 / ADDR_CONFLICT=0 / UNALIGNED_STALL=0 时消冲突毫无意义。
-- 8-wave **SWZ1 已把 bank 冲突清零**：SWZ0=0.75 ratio、MfmaUtil 44% vs **SWZ1 MfmaUtil 60-62%**。
+- 8-wave **SWZ1 已把 bank 冲突清零**：SWZ0(swizzle 关)=0.75× ratio、MfmaUtil 44% vs **SWZ1(swizzle 开) MfmaUtil 60-62%**。
 - ❌ 别再试 调度层杠杆：WLDSR 细 staggered lgkmcnt / SS sub-stream / INPLACE 全部 ≤baseline；拆细单一粗同步点只会约束 wave-switching 自由度、暴露更多 stall。
 
 ## 8-wave mxfp4 结构封顶 ~4690-4760T：三道墙皆因 2 waves/SIMD
@@ -79,7 +80,7 @@
 
 - **ds_read 已在理论下限，无冗余可消**（实测推翻"重读冗余"假设）：
   - vraw 8-wave 主循环 A/B frag 已在 Python 层跨 quadrant 完全复用（a0→c00/c01，a1→c10/c11；b0→c00/c10，b1→c01/c11）。
-  - ds_read 已在理论下限 **24 b128/iter（A16+B8）**，与 intrinsic 完全相同（均 192@K2048）。
+  - ds_read 已在理论下限 **24 b128/iter（A16+B8）**，与 intrinsic 完全相同（均 192@K2048）。（b128 = 单条 128-bit ds_read；192@K2048 = K=2048 配置下每 wave 主循环的 ds_read 总条数，与 intrinsic 逐条相同。）
   - 全部 ds_read_b128 已是最大单指令宽度：同 tile s=0/1 隔 64B、tile 间隔 2048B 不连续，无法更宽合并。
   - 所谓"N 子块重读 A 的 1.5× 冗余"**不存在**；phase-5a 看到的 A:B LDS insts = 2:1 是 tile 大小正当读量比，非重复读。
   - phase-4/5 在 8-wave 内追的 0.3~1.5% 残差是"8-wave 局部最优"内部的事，非结构杠杆。

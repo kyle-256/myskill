@@ -29,9 +29,11 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 
 ## 怎么用
 
+- **🅰️ 动手前第一站 = [00-decision-index](00-decision-index.md)**：**准备试某个杠杆前,先在决策索引 grep 你要做的动作**(如 `grep -i "占用率\|maxnreg\|direct\|atomic\|DMA\|scale_pack\|s_setprio"`)。命中 = 别重踩,点进详卡看根因。这一步治的就是「读了 skill 还去重踩坑」——把查阅强制到**决策的那一刻**,而不是靠开头读一遍的记忆。
 - **章节卡结构**：本文件是导航；每张卡是一个主题章节，卡内用 `## 小节` 分隔子话题。按当前任务打开对应卡（Read），别一次性全读。
-- 三个文件夹：`connection/`（怎么连上远端跑）、`methodology/`（怎么优化/debug/看利用率）、`pitfalls/`（踩过的坑——**最重要**，动手前先查）。
-- 死胡同用 `❌ 别再试` 标注；卡尾 `来源:` 可回溯；卡间用 `见 <路径>` 或 `见本卡「小节」` 交叉引用。
+- 三个文件夹：`connection/`（怎么连上远端跑）、`methodology/`（怎么优化/debug/看利用率）、`pitfalls/`（踩过的坑——**最重要**，动手前先查）。顶层 `00-decision-index` 是这些卡里所有 ❌ 死路的**动作索引入口**。
+- 死胡同用 `❌ 别再试` 标注；卡尾 `来源:` 可回溯；卡间用 `见 <路径>` 或 `[[memory-name]]` 交叉引用。
+- ★ **上界≠可达铁律**(methodology/03):subtractive/HALF 探针、roofline 峰值率、纸面 op-count 给的都是**上界**,不是可达值——判负/判正前必须 edit→bench 真实现(踩证:HALF_PV +8.7% 假想 → 真 K32-PV −11%)。
 - 硬件默认 **gfx950 (MI355X)**；gfx942 (MI300) 仅作跨代对照。
 - **唯一可用的远端环境 = gpt_oss**（当前节点 chi2762，跳板 149.28.124.225，key `/workspace/code/.ssh_docker/id_ed25519`）：
   | | gpt_oss（本工作区唯一可用） |
@@ -43,9 +45,29 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
   🚨 **同集群节点上可能还有 `mlperf_gptoss2` / 盘 `code3`——那是 gpt_oss2_docker 项目的，绝对禁止碰**
   （rsync 到 code3 会覆盖别人的树、docker exec mlperf_gptoss2 会污染别人的容器）。连接共享设施在
   `connection/common/`、gpt_oss 差异在 `connection/gpt_oss/`（本工作区不含也不该有 gpt_oss2 连接卡）。
-- 动手前最短路径：① 翻 `pitfalls/` 确认方向没被判负 → ② 翻 `methodology/` 找做法 → ③ 翻 `connection/`（选对环境）把代码弄上卡跑测。
+- 动手前最短路径：**① grep [00-decision-index](00-decision-index.md) 确认你要试的动作没被判负** → ② 下方「症状→卡」表按现象分诊 → ③ 翻 `methodology/` 找做法 → ④ 翻 `connection/`（选对环境）把代码弄上卡跑测。
+
+## 症状 → 先查哪张卡
+
+| 你看到的现象 | 先查 |
+|---|---|
+| 想优化但**不知道 bound 在哪** | methodology/03(profiling/regime 分类)→ methodology/04(occ)|
+| **掉速**了(某改动 net-negative) | 00-decision-index(是不是已知死路)→ pitfalls 对应域 |
+| **occ 上不去 / 想抬占用率** | 00-decision-index §A → methodology/04 → pitfalls/01 |
+| **SNR 崩 / 数值错 / 疑似 race** | pitfalls/04(race/vmcnt/正确性)+ pitfalls/02(SNR 判据)+ methodology/02 |
+| **store/LDS-bound** 想减 store | 00-decision-index §B → pitfalls/03,05 |
+| **quant/scale** 慢 | 00-decision-index §C → methodology/11,12 → pitfalls/05 |
+| **测量数字不可信 / DVFS 漂移** | pitfalls/02 → methodology/01 |
+| **build 失败 / 同步出错 / undefined symbol** | pitfalls/08 → connection/common/04 |
+| **跨代移植**(gfx942/RDNA)编译/数值错 | pitfalls/11 |
+| **flydsl 前端**(tracer/JIT/if-for)报错或静默错 | pitfalls/07 → methodology/09 |
+| **attention(dsv4)** 优化 | pitfalls/12(必读)→ 00-decision-index §D |
+| **autotune/dispatch/MoE 变长** | pitfalls/06 → methodology/13 |
 
 ---
+
+## 顶层
+- [00-decision-index](00-decision-index.md) — **动手前先 grep**：全库 ❌ 死路 / ⚠️条件 / ✅开口 的动作索引入口(占用率/LDS/quant/attention/autotune/正确性/测量/环境/flydsl 九域)
 
 ## connection/ — 远程连接 / 选卡 / 同步 / 构建
 
@@ -71,7 +93,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [01-optimize-loop-benchmark](methodology/01-optimize-loop-benchmark.md) — 优化主循环、robust timing、测量噪声、公平对比、性能基线 regime
 - [14-benchmark-shapes](methodology/14-benchmark-shapes.md) — **canonical 跑分 shape**：dense Llama-2 7B/70B + grouped MoE(gpt_oss-20b/Qwen3-235B/DeepSeek-V3, B=8, M∈{1024,2048,4096})
 - [02-correctness-race-cache](methodology/02-correctness-race-cache.md) — SNR/det 门控、cross-wave LDS-barrier race 诊断、长 K 非确定、JIT 缓存失效
-- [03-profiling-utilization](methodology/03-profiling-utilization.md) — ISA dump 权威、rocprofv3(kernel-trace/PMC)、regime 分类、ATT stall 根因、hotspot 分析
+- [03-profiling-utilization](methodology/03-profiling-utilization.md) — ISA dump 权威、rocprofv3(kernel-trace/PMC)、regime 分类、ATT stall 根因、hotspot 分析、subtractive探针(★上界≠可达铁律)
 - [04-occupancy-and-tile](methodology/04-occupancy-and-tile.md) — 512 寄存器共享池、LDS/SGPR limit、256×256 主 tile、小-M BM128、MFMA 数账
 - [05-lds-swizzle-prefetch-sched](methodology/05-lds-swizzle-prefetch-sched.md) — LDS 分配/swizzle、L2 swizzle(group_n/XCD)、双缓冲预取、热循环调度
 - [06-register-wholeloop-emit](methodology/06-register-wholeloop-emit.md) — AGPR 累加消 spill、whole-loop LDS-feed bound、mxfp4 生产 emit 杠杆
@@ -99,5 +121,5 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [09-isa-profiling](pitfalls/09-isa-profiling.md) — sched_* 计数/s_setprio、ATT vs PMC 分工、code.json AGPR-blind
 - [10-code-style-deploy](pitfalls/10-code-style-deploy.md) — 源码禁调试痕迹、放行硬门禁+绿测先证伪、backend 签名/cache key
 - [11-porting-encoding](pitfalls/11-porting-encoding.md) — FNUZ/OCP 跨代编码门、CDNA4/RDNA 移植、"是不是自己改坏"诊断捷径
-- [12-dsv4-sparse-mla-attn](pitfalls/12-dsv4-sparse-mla-attn.md) — **DSV4 sparse-MLA fwd/bwd 优化必读**：6组bench/cr语义/现状/roofline判据(bwd占用率非带宽,3-4×余量)/bwd分解/已判负(atomic-scatter·fp8·占用率换非合并)/未试大杠杆(banded-SWA·dQ+interm融合)/flydsl专属坑
+- [12-dsv4-sparse-mla-attn](pitfalls/12-dsv4-sparse-mla-attn.md) — **DSV4 sparse-MLA fwd/bwd 优化必读**(已整理去矛盾)：cr语义/当前实测(fwd mean 509.7 pro cr4 940 / bwd mean 319.5)/已部署赢(fast_path·BLOCK_H128·PV-K32·delta融合·rtr·K32-MFMA)/当前bound(occ统一512池·dQ非tr16-read)/已判负(s_setprio·XPIPE·DMA·QB·K32-PV·dual-KV)/开口(小topk interm·banded-SWA·hybrid scatter)/flydsl专属坑
 - [99-misc](pitfalls/99-misc.md) — 其它零散事实

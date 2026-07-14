@@ -4,9 +4,11 @@
 
 ## partial-drain race：读写距离决定安全 defer，vmcnt 按所有池写总数算
 
+> 术语：**相位/phase** = 主循环一次迭代的写-读窗口。**drain**（全 drain）= `s_waitcnt vmcnt(0)` 等所有在飞写落地。**partial-drain** = 只等到 `vmcnt(N>0)`，留 N 条写跨 barrier 继续在飞以省等待。**距离** = 一条写与对它的读之间隔的相位数；缓冲越深距离越大，能安全 defer 的在飞写越多。**nsa/nsb** = A/B 两个 3buf 池各自每相位的 `buffer_load` 写条数。
+
 - **读写距离决定安全 defer**：2buf = 距离 1（写完下一相位就读，必须**全 drain**）；3buf = 距离 2（有整整一相位余量，可安全 **partial-drain** 让写跨 barrier）。缓冲深度不足就 defer 写 = 低概率 race。（不是"总能 partial-drain"，取决于 buffer 深度给的距离余量。）
 
-- **多池 partial-drain 的 vmcnt 必须按所有 3buf 池的写总数 `sum(nsa|nsb)` 计算**，不能只算第一个池。`_n_outstanding = nsb` 是 bug：2 池都 3buf 时实际延迟 `2×nsb = 8` 条写，但只 drain 4 条 → 留未 accounted 的 in-flight 写 → **1/30000 race**。
+- **多池 partial-drain 的 vmcnt 必须按所有 3buf 池的写总数 `sum = nsa + nsb` 计算**，不能只算第一个池。`_n_outstanding = nsb` 是 bug：2 池都 3buf 时实际延迟 `2×nsb = 8` 条写，但只 drain 4 条 → 留未 accounted 的 in-flight 写 → **1/30000 race**。
   - 修法靠 emit 顺序 + 正确 vmcnt(sum)：把 distance-2 安全的 B 池排**最后** emit，`vmcnt(sum)` 恰好留 B 池在飞、把 distance-1 的 A 池**全 drain**。
 
 - **byte-exact 排除法必须组合所有省空间手段再算**：曾判"双池 3buf 放不下"而误否决双池路线。错在没把 **scalar store 省 C_lds（8704B）** + **`_CS=1024` 省 bank-pad（5120B）** 组合起来算。单独算每个都不够、组合才够；单独评估会**假阴性**关掉真路。凡涉及 LDS 容量卡点，先把所有省空间手段叠加后再判可行性。
@@ -41,10 +43,8 @@
 - 紧跟 `s_waitcnt vmcnt(N>0)` + `v_readfirstlane` + `s_mov_b32 m0` + `buffer_load_lds`
 - 若 `private_segment == 0` 但仍 race：看 SGPR 是否 spill 到 VGPR lanes（`v_writelane` / `v_readlane`）——lane ops 不走 vmcnt，不会 race。
 
-### （已废弃的早期尝试，勿用）双管齐下法
-早期（gpt_oss v1）方案 A/B 已被 reviewer 明确否决（见下方"死胡同"），不是真正修法：
-- A) 降 spill：`-mllvm -sink-insts-to-avoid-spills=true` + 保留 `tile.reserve_pinned_regs()`
-- B) prologue 2-step：`buffer_load_lds` 拆成 `buffer_load → VGPR → ds_write`，配 `-mllvm -amdgpu-enable-merge-m0=true`
+### （已废弃的早期尝试，勿用）
+> 早期（gpt_oss v1）双管齐下法（A 降 spill flag + B prologue 2-step）已被 reviewer 否决，不修根因，逐条见下方「死胡同」列表；定案修法见修法一/二/三。
 
 reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pressure 下不该 spill。出现 spill 是 kernel 写法逼出来的，去 kernel 源头改。绕通道、加 flag、占 pinned 区都是把症状藏起来。"** 真正的定案修法是下面的修法一/二/三——从源头消除 VGPR spill，reg notes 要求 `private_segment_fixed_size=0` / `vgpr_spill_count=0`。
 
@@ -66,10 +66,7 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
 - `__half(float)` 是单条硬件 `v_cvt_f16_f32` 但 bf16 无对应；gfx950 有 `v_cvt_pk_bf16_f32`（pack 2 fp32→2 bf16 硬件 round）。
 - truncate vs round-to-even 半位精度差、SNR 不变。
 
-### 三类 race 速查表（本卡是类 1；类 2/3 详情见下方「gfx950 HW-walled 死路」章节「三类 race 速查表」）
-| 类 | 冲突指令对 | 触发 | 修法 | commit |
-|---|---|---|---|---|
-| (1) vmcnt FIFO | scratch_load vs buffer_load_lds（wave 内） | spill>0 单次即 race | 消 VGPR spill（SGPR 化地址 / outer 解析 ptr） | abd3833 |
+> 完整三类 race 速查表见下方「gfx950 HW-walled 死路」章「三类 race 速查表」。本节修法（消 VGPR spill）对应类 1（vmcnt FIFO race，commit abd3833）。
 
 ### 死胡同（不能同时拿 0 race + PR HEAD perf，reviewer rejected 列表）
 - ❌ 别再试：`__noinline__ compute_tile` → **-25%**（args 通过 scratch 传，反而制造更多 spill）
@@ -82,7 +79,7 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
 - ❌ 别再试：`tile.reserve_pinned_regs()` 多处调用 → 占用 pinned 区的 hack，不解决"为什么编译器要 spill"
 - ❌ 别再试：Prologue 2-step（即使只在 prologue）→ 同上根因，counter 通道分工被破坏
 
-来源: gpt_oss_myskill/gfx950-vmcnt-race-debug/SKILL.md（早期版，类 1 的 A/B 修法已被下方 gpt_oss2 版否决）；gpt_oss2/myskill/gfx950-vmcnt-race-debug/SKILL.md（现行版，类 1 定案修法一/二/三 + 类 2/类 3，commit abd3833/bb48d3f/d7b149a）
+来源: gfx950-vmcnt-race-debug/SKILL.md（早期版，类 1 的 A/B 修法已被现行版否决）；gfx950-vmcnt-race-debug/SKILL.md（现行版，类 1 定案修法一/二/三 + 类 2/类 3，commit abd3833/bb48d3f/d7b149a）
 
 ## SRD/寻址坑：readfirstlane 必须 pin SGPR、大-G int32 溢出静默错、sched_barrier load-bearing
 
@@ -99,9 +96,7 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
   - descriptor 范围太大或 offset i32 溢出 → chunk buffer resource，或在 truncate 前加宽算术（i64）
   - 修后重跑：失败 shape + 一个相邻边界 shape。
 
-- **create_buffer_resource 的 max_size 坑**：`max_size=True` 会 OOB 读垃圾。必须用 `max_size=False, num_records_bytes=...` 精确给范围。WHY：max_size 把 descriptor 范围拉满，越界读进相邻内存。
-
-- **（相关 FlyDSL/gfx950 fp8 硬约束）**：`Vec.to(Float8E4M3FN)` 走 `arith.truncf`，后端不 lower；fp8 cast 用 `fx.rocdl.cvt_pk_fp8_f32`（2 f32→2 fp8/op）。`cvt_scalef32_pk8_fp8_bf16` 在 gfx950 报 `Cannot select` 不可用。
+- **create_buffer_resource 的 max_size 坑**：`max_size=True` 会 OOB 读垃圾（把 descriptor 范围拉满，越界读进相邻内存）。必须用 `max_size=False, num_records_bytes=...` 精确给范围。（与「gfx950 HW-walled 死路」章 fp8 ISA 小节同条，此处保留 WHY；fp8 cast 等其余硬约束见该小节。）
 
 来源: 08-deadends.md, 04-tn-wgrad-kernel.md, 02-nt-fwd-kernel.md, oob-detection/SKILL.md, flydsl-sync/SKILL.md
 
@@ -206,9 +201,9 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
 ### 测试局限与 MFMA 操作数
 - **全 1 隔离测试**：`query/key/value.fill_(1.0)` 下 softmax 概率全相等、PV 输出=1.0，任何偏差暴露 layout/寻址 bug。❌ **别只靠全 1 测**：均匀值无论顺序都对，测不出 V/P 操作数错位，需另测非均匀输入。
 - **MFMA 操作数顺序**：`mfma(LHS, RHS, acc)` —— LHS→M 维，RHS→N 维。QK 中 K 是 LHS、Q 是 RHS。搞错就是 layout 大错。
-- **FP8 容差**：与上方「低精度容差假门」章节一致——FP8 PV MFMA 相对 bf16 参考 ~0.03 max error 为固有误差非 bug，容差用 `atol=5e-3`；per-row vs per-tensor Q 量化不匹配差 1-3%；常见 scale bug 为 `v_scale` 被应用两次（prob scaling 一次、PV 后一次）。
+- **FP8 容差 / 量化粒度不匹配 / v_scale 双应用**：见本卡「低精度容差假门」章（FP8 PV MFMA ~0.03 max error 固有、atol=5e-3、per-row vs per-tensor 差 1-3%、v_scale 被应用两次）。
 
 来源: debug-flydsl-kernel/SKILL.md, attention/optimization-directions.md
 
 ---
-来源: 10-grouped-wgrad-4wave-3buf.md, 05-dead-ends.md, gpt_oss_myskill/gfx950-vmcnt-race-debug/SKILL.md, gpt_oss2/myskill/gfx950-vmcnt-race-debug/SKILL.md, 08-deadends.md, 04-tn-wgrad-kernel.md, 02-nt-fwd-kernel.md, oob-detection/SKILL.md, flydsl-sync/SKILL.md, gfx950-vmcnt-race-debug/SKILL.md, verify-accuracy/SKILL.md, debug-flydsl-kernel/SKILL.md, fp8-gemm-bench/SKILL.md, attention/optimization-directions.md
+来源: 10-grouped-wgrad-4wave-3buf.md, 05-dead-ends.md, gfx950-vmcnt-race-debug/SKILL.md, 08-deadends.md, 04-tn-wgrad-kernel.md, 02-nt-fwd-kernel.md, oob-detection/SKILL.md, flydsl-sync/SKILL.md, verify-accuracy/SKILL.md, debug-flydsl-kernel/SKILL.md, fp8-gemm-bench/SKILL.md, attention/optimization-directions.md

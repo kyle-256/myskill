@@ -42,7 +42,8 @@
 ## FlyDSL tracer 字面 if/for 坑：编译期常量分叉必须在外层 Python 作用域选好
 
 ### 字面 if 被 rewrite 成 scf.if，即使条件是编译期常量
-- `@flyc.kernel`/`@flyc.jit` 装饰的函数体（含内部嵌套 `def` 如 `_do_tile`）源码里字面出现的 `if`/`for` 会被 AST-rewriter 转成设备侧控制流（scf.if/scf.for），**哪怕分支条件是纯 Python 编译期常量**（如 `trans_b`）。想按编译期常量分叉行为，必须在外层未被追踪的 Python 作用域先选好分支（生成不同闭包 / 调用不同模块级函数），内核体内只做函数调用，**不能写字面 `if trans_b`**。
+- （`@flyc.kernel`=设备内核体、`@flyc.jit`=host launch wrapper，定义见 methodology/09）
+- `@flyc.kernel`/`@flyc.jit` 装饰的函数体（含内部嵌套 `def` 如 `_do_tile`）源码里字面出现的 `if`/`for` 会被 AST-rewriter 转成设备侧控制流（MLIR scf dialect 的 `scf.if`/`scf.for`，即在 GPU 上运行的分支/循环，而非编译期 Python 分叉），**哪怕分支条件是纯 Python 编译期常量**（如 `trans_b`）。想按编译期常量分叉行为，必须在外层未被追踪的 Python 作用域先选好分支（生成不同闭包 / 调用不同模块级函数），内核体内只做函数调用，**不能写字面 `if trans_b`**。
 - 裸 python `if _flag:` 会让**两个分支都被 trace**（例如两个 SharedAllocator → `Only one SharedAllocator` 报错）。编译期分支必须写 `if const_expr(_flag):` 才走单一分支。
 - ❌ 别再试：把 NN/NT 两个 4-wave 编译函数硬合并、在 `_do_tile` 里写 `if trans_b`。先 NameError（变量只在某个 scf.if 分支可见）；改闭包写法后，重复调用同一已编译 `@flyc.jit` 函数时又触发 FlyDSL 全局漂移检测报错（`_WL_ASM_CACHE_3BUF` 在 trace 期间被 mutate，和首次编译快照对不上）。**最终定案：拆成两个独立编译函数**，只共享跟 `trans_b` 无关的辅助函数（如 `_grouped_4wave_tile_scan`）。
 
@@ -58,7 +59,7 @@
 ### Python `data = next_data` 不是 phi
 - FlyDSL 里 Python 级 `data = next_data` 重绑定**不产生 loop phi**：两个名字别名同一 SSA 值，load 被当循环不变量外提（hoisted）。同理 Python 级 `for _pi in range(N)` 被 trace 成 N 份平铺副本再由 LLVM 重卷，交换对 MLIR 不可见。
 - 预取只在预取值**穿过 `init=` 和 `yield`** 时才生效。**Python swap 不是 phi。**
-- ❌ 局限：scf.for 的 `iter_args` 目前只能 carry 简单值，**无法 carry ping-pong buffer 状态**（多值 carry 不支持）。
+- ❌ 局限：`iter_args` 可同时 carry **多个**简单 SSA 值（标量 / vector / i32 / i64 / index），不支持的是把 ping-pong buffer 对象 / 32-vec 的 list 作为**单个** iter_arg carry（见 methodology/09 "loop-carried state 携带规则"，其 PA decode 范例即携带 15 个 loop-carried 值）。
 
 ### 前端 if/for 语义限制（纯 Python 合法但和 MLIR 构造冲突）
 - 分支局部定义：值只在某个 `if`/`else` arm 内定义、arm 外使用 → **静默破坏 MLIR result typing**。必须把定义提到分支上方，或 yield 单一 merged 值。
@@ -71,9 +72,9 @@
 ### 循环变量名残留被 JIT 折叠成常量
 - `for s in range_constexpr(4)` 结束后 Python 的 `s=3` 仍留在作用域，紧接着写 `s=(grow>>4)&3` **可能被折叠成常量 3**（变量名冲突导致 trace 折叠）。preshuffle 索引里的子块变量**必须改名为 `sub`** 而非复用 `s`。
 
-### dynamic scf.for loop-carry LDS 触发 lowering bug + 单值 carry 限制
-- 两条链式 dynamic `scf.for` loop-carry LDS shared-ptr 会触发 lowering bug：`unrealized_conversion_cast fly.ptr→llvm.ptr<3>` remained live（只能 balanced/无 tail 才跑）。❌ 别再试。
-- 动态 `scf.for` 只能 loop-carry **单个 MLIR 值**，carry 不了 32 个 vec 的 list（同上 iter_args 多值 carry 限制）。
+### dynamic scf.for loop-carry LDS 触发 lowering bug + 单 iter_arg 复合值限制
+- 两条链式 dynamic `scf.for` loop-carry LDS shared-ptr 会触发 lowering bug：`unrealized_conversion_cast fly.ptr→llvm.ptr<3>` remained live（只能 balanced/无 tail 才跑）。❌ 别再试（如遇需按当前 flydsl 版本复验）。
+- 动态 `scf.for` 每个 iter_arg 只能是**单个 MLIR 值**（可有多个 iter_arg），carry 不了 32 个 vec 的 list 塞进一个 iter_arg（同上 iter_args 复合值限制）。
 - module-level fn 里的 `if`（如 `if wave_m==1`）不被 AST 改写，会 `bool()` dynamic 报错；**conditional-barrier 必须 inline 在 kernel body**。
 
 ## FlyDSL 前端编写坑：buffer offset 单位/SmemPtr view cache/absf 缺失/DLTensorAdaptor
