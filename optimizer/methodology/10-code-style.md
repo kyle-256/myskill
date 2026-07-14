@@ -1,6 +1,37 @@
 # 代码风格与工程规范
 
-> 类别: 方法论 · 主题标签: code-style, naming, gemm_helper, primus-turbo-layers, git-rebase
+> 类别: 方法论 · 主题标签: code-style, naming, gemm_helper, primus-turbo-layers, git-rebase, code-review, dead-code
+
+## ★ code review 硬要求(提交/评审前逐条过,任一不过即打回)
+
+> **基本要求 = 代码简洁 + 最大化复用。** 下面是硬门禁,写完/评审时逐条核;细节展开见本卡后续小节与 pitfalls/10。
+
+**1. 简洁(dead code / 冗余 = 打回)**
+- 无死代码:未用的变量 / 函数 / import / 分支 / env 旋钮全删。ruff 抓不到未用函数,自己 `rg '<name>\b'` 全仓搜,**0 命中即删**。
+- 无冗余:能一行别写三行;有等价现成写法就别重写;删掉实验路径 / 探针 / 注释掉的旧代码。
+- 生产旋钮 hardcode 成生产值,删所有 `PT_*` 实验 env 与调试变体。
+
+**2. 多复用(先 grep 再写)**
+- 写任何原语前先 grep `gemm_helper.py` 与最接近的既有 kernel:`ceildiv` / `xcd_remap_pid` / `S2RLoader` / `G2SLoader` / `mask_a_tail` / `emit_wholeloop_tile` 等,**有就必用**,别另造。
+- 新 kernel 变体**照抄**最接近的既有模式(命名 / 错误处理 / dispatch grid / group_n band),不自造结构。
+
+**3. 注释:短 · 只英文 · 不留过程**
+- 注释**一律英文**,禁中/日文。
+- **单块 ≤5 行**(>5 行连续注释 / docstring 即打回),1-2 句讲清。
+- 注 **WHY 不注 WHAT**;推导 / 实测数字(dB · TFLOPS · MxNxK)/ 日期 / 多方案权衡 → 进 commit message · memory · `tuning_results/`,**绝不进源码**。
+
+**4. 无调试信息(rg 0 命中才放行)**
+- 放行前 `rg -i 'debug|tmp|临时|verified|实验|print\(|# TODO'` 必须 **0 命中**。
+- 无 `# debug` / `# tmp` / 注释掉的旧代码 / 裸 TODO(无 issue 号)/ 调参备忘 / benchmark 数字。
+- 临时探针脚本(`_*.py` / `opt_*.py`)**绝不 git add**,只留本地。
+
+**5. 命名 & 魔术数**
+- 跟 turbo 命名(`_grouped_<noun>` / `_wgrad_<verb>_<variant>`),别自造缩写。
+- 禁魔术数:tile / BLOCK 从 shape 推导。
+
+**6. 风格 & 放行门**
+- `ruff check` + `ruff format --check` 全绿;**不用 `--no-verify`**。flydsl 闭包 B023 用「默认参数绑定 loop 变量」消除、别加 noqa(见 pitfalls/12)。
+- 改动对整除-K 编译期 no-op,老 shape SNR 零回归;author=`kyle-256 <Kyle.Zhao@amd.com>` 无 coauthor,仅用户明确要求时 commit/push。
 
 ## turbo/FlyDSL 代码风格:英文注释、命名规范、复用 helper、五层垂直切片
 
