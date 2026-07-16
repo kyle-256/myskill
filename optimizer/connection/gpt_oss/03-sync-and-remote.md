@@ -15,7 +15,7 @@
   rsync -azh --exclude-from=.rsync-exclude -e "$PWD/.ssh-chi.sh" \
     "$PWD/tensorwise/Primus-Turbo/" root@chi2762:/mnt/vast/kyle/code2/Primus-Turbo-tensorwise/
   ```
-- `-e "$PWD/.ssh-chi.sh"`：ssh 包装脚本，经跳板机连当前节点（rsync + ssh 跳板）。**当前活跃节点 = chi2762**（2026-07-08 从 chi2811 迁移，chi2811 被 atom-bench 占满 8 卡）。chi2810 曾被 SGLang 8 卡全占且盘满，用前必按 02-pick-free-gpu 核实。code2 是共享 NFS，换节点后远端 repo 路径不变（`root@<node>:/mnt/vast/kyle/code2/...`）。
+- `-e "$PWD/.ssh-chi.sh"`：ssh 包装脚本，经跳板机连当前节点（rsync + ssh 跳板）。**当前活跃节点 = chi2798**（2026-07-14 取代 chi2762）。改远端最稳做法：本地改 sync/mxfp4 后用 `cat 文件 | ./.ssh-chi.sh root@chi2798 "docker exec -i mlperf_gptoss bash -lc 'cat > 容器路径'"` 直推容器文件再 md5 对齐（绕开 rsync 路径歧义）。chi2810 曾被 SGLang 8 卡全占且盘满，用前必按 02-pick-free-gpu 核实。code2 是共享 NFS，换节点后远端 repo 路径不变（`root@<node>:/mnt/vast/kyle/code2/...`）。
 - `--exclude-from=.rsync-exclude`：排除 `.git`、`*.so`、`build`、`venv`。
 - **canonical 本地镜像**（git）：`sync/mxfp4/Primus-Turbo`（分支 `dev/kyle/flydsl_mxfp4_compute`）、`sync/tensorwise/Primus-Turbo`；也涵盖 FlyDSL/turbo 子树。
 - **WHY 必须先 rsync 再测**：改本地 `sync/mxfp4/Primus-Turbo`（或 FlyDSL/turbo）后不推远端，远端（当前 chi2762）会一直编译**旧二进制**，所有 ISA/perf/SNR 结论都对着旧代码 → 假象。血泪教训：改完先 rsync 再测。

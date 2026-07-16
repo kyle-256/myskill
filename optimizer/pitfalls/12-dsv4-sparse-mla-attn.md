@@ -25,7 +25,13 @@
 | flash cr128 | 395.3 | 292.1 |  | pro cr128 | 400.3 | 294.4 |
 | | | |  | **MEAN** | **509.7** | **319.5** |
 
-- SNR:cr4 路径 99.0dB(fast_path/_FMAX0 纯累加高精);banded/cr0/cr128 55-78dB,均 ≥ 门槛(pro cr4 ≥62.5dB)。
+- SNR:cr4 路径 ~53dB(fp32-eager 真值:fwd o 52.9/lse 146/dq 52.8dB,就是 bf16 精度,与其他 shape 一致);banded/cr0/cr128 55-78dB。⚠️旧记「cr4 99dB」是 stale,别信。
+
+## ⚠️ cr=4 两个 NaN bug(已修,2026-07-14)——见 [[project_dsv4_cr4_nan_fix]]
+- **Bug1(fwd fast_path)**:`_mb[0]=crossgrp_max(lm_f0)` 首 key-pair 全 masked(query t<96)→ -inf → exp2(+inf) → 前 96 token o=NaN/lse=+inf(lse +Inf 行=96×H)。**修**=floor `maxnumf(crossgrp_max,0)`(dsa_fwd.py 两处),speed-neutral。**生产 S=4096 只受此 bug。**
+- **Bug2(bwd dq race)**:`build_bwd_dq`(topk<512 路径)在 TOPK=384(cr4 S=1024)有非确定 cross-wave race(NaN 数逐次变)。**修**=pvk32 门槛 512→384(dsa_bwd.py `_get_dq`+`dq_folds_delta` 两处耦合改),补 barrier 无效。**仅 S=1024 小 seq 受影响**(S=4096 topk≥512 本就走 pvk32)。
+- **Bug3(bwd dkv misdispatch,小 seq)**:`is_cr128=(num_kv>total_tokens)and(topk<=256)` 裸判在 S≤512 把 cr4(随机 pool topk=256)误判成 cr128→走闭式因果 pool gather→dkv 全错(S=512 dkv 1.0dB)。**修**=加确定性-pool 条件 `total_tokens%npool==0 and total_tokens//npool>=64`(cr4 pool_cr=4<64 落 CSR;真 cr128≥64 仍闭式)。**仅 S≤512;S=4096 topk>256 本就 CSR。** 来自 wenx PR#417 第三修复(我最初 zip 只有前两个),commit 350ec3f5。
+- 验证工具=`test_accuracy.py`(fp32 eager,自带 6 shape,import 指向生产包即可);远端跑必 `rm -rf /root/.flydsl/cache`。
 - **dsv4 fwd/bwd 结构上 ~2.3× dense flash-attn** = sparse gather/scatter 税(interm+gather 过 2× 的 [T,topk,D] tensor,dense 无此步)。这是当前算法维度的特征,不是"到头"——见下「开口」。
 
 ## ✅ 已部署的赢(默认开)

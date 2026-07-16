@@ -38,6 +38,16 @@
 - gfx950 同理:128 仍 `64%64=0` 冲突,**+1 → 64.5** 消。
 - 最小 padding = `bank_count/elem_size_bytes`(最坏情形),**通常 1-4 足够**。
 
+### ds_read_tr16 转置读 bank 冲突:width-64 XOR/padding 全无效,唯一解=width-128 + pack-128
+attention bwd 的 tr16 转置读(`ds_read_tr16_b64` 喂 GEMM2 A-operand)有顽固 bank 冲突,**通用 XOR/padding 全部无效**,根因与解法(2026-07 gpt_oss meta dkdv 实测):
+- **根因数学**:`bank = (row*STRIDE + swz_col)/2 % 32`。bf16 时 **STRIDE=head_dim=64 → row*64/2 = row*32,%32 = 0 → row 项彻底消失** → 一条 tr16 读的 16 行同 col 全撞同一 bank。这就是"XOR/padding address-invariant 修不了"假象的真因——不是 HW 转置固定,是 STRIDE=64(=2×bank数)让行偏移归零。
+- **width-64 里 XOR 上限 4-way(~19%)**:col 占 bank 的 bit1-2,要错开 16 行须把 row 的 swizzle 位推到 bit3+,而 XOR mask 值域 <64 只能容 `(row&3)<<4`(4 个不同)→ 4-way。`(row&7)<<3` 带 bit2 与 col 重叠也回落 4-way。**别再在 width-64 里试 XOR/padding/mult-8**。
+- ★**唯一解 = 加宽 LDS 行到 128 + `mask=(row&7)<<4`**:值域 0-112 装进 128,`/2` 落 bit3-5,**完全避开 col 的 bit1-2 → 0.00% conflict**(实测,dk/dv 位一致)。mult-16 对 16/8/4-wide 所有读写合法。
+- ⚠️ 但**天真加宽废一半 LDS + 2× HBM 读**(DMA 每行读 128 列半数垃圾)→ 反慢 +5%。cache-dedup(垃圾列 `col & (head_dim-1)` 回读真实数据命中 L2)收回到 +3%,仍慢。
+- ★★**PACK-128(零浪费终解)**:关键洞察 **`phys_row*128/2 %32 = 0` → bank 与物理行号完全无关**。→ **2 个真实 logical row 塞进一个 128-block,bank 不变(仍 0%),LDS 回到 width-64 大小 + 1× HBM 读**。映射:`_pblk(r)=((r>>3)<<2)|(r&3)`(物理 block),半区由 mask bit6 决定(低行 `r&4=0`→[0,64),高行→[64,128));DMA 每 block 读两个真实行(`logical_row=8*(block>>2)+(block&3)+half*4`,`col=position^mask` 保证 <64)。读端 `_a_idx`/`_read_tr` 按 `_pblk(row)*128` 寻址。
+- ★★★**消 conflict ≠ 变快(红鲱鱼判据)**:MFMA-延迟受限的内核(MfmaUtil<40%、VALUBusy 高但非 issue-bound、SQ_WAIT 主要来自 MFMA 依赖链),**把 bank conflict 从 19%→0% 速度纹丝不动**(实测 coop 21.7%→4.4% 同速、pack128 0% 与 baseline 19% schrd 同级)。真正变快来自 **1× HBM + `s_setprio(1)` 包 MFMA**(s_setprio 单独在 baseline 中性,叠 pack-128 上净超 baseline −1.2~1.9%)。**先用 `LDSBankConflict=100*SQ_LDS_BANK_CONFLICT/GUI/CU_NUM` 派生指标确认是否真 bank-bound,再决定要不要碰 swizzle**;latency-bound 的话 swizzle 是纯计数改善、零性能。
+- 坑:width-128/pack-128 改的是 **DMA 路径(coop_dma_tile)+ 读端寻址**;`_coop_load`(enable_dma=False 的 VGPR staging 回退)若不同步改会读错。测 fast+DMA 用对格式的脚本(dq/dkdv 默认 fast_exp2 可能不同,喂错 lse 格式 → 全 NaN,见 02-correctness)。
+
 ### 藏 LDS 写延迟(增大 write-read 距离)
 - 在 `ds_write` 后、`s_waitcnt lgkmcnt(0)` 前插**独立**工作。优先级:
   1. 下一阶段 global load(`buffer_load` 异步 ~300+ cycle)

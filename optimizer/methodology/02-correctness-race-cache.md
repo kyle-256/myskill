@@ -9,6 +9,11 @@
 - **SNR = 证能跑对**(数值语义正确,不证同版本)。
 - **det=0(bitwise reproducible)= 证无 race**;determinism rtol=atol=0 bitwise。
 
+### 全 NaN 先查"exp2 模式 vs lse 格式匹配",别当 kernel bug（2026-07 attention bwd 踩）
+- attention bwd 有多 exp2 模式,**每模式要不同的预缩放 lse 格式**:Schraudolph fast → `lse_s23 = lse*(-log2e)*2^23 + (127*2^23−486411)`;poly/exact → 平 `lse*(-log2e)`。**喂错格式 → exp2 溢出 → 输出全 NaN**。
+- 坑:dq 与 dkdv 模块的**默认 exp2 模式可能不同**(dq 默认 `fast_exp2=True`、dkdv 默认 poly)。测试脚本若统一喂 poly 格式 lse,dq 会 NaN 而 dk/dv 正常——**这是测试脚本 bug,不是交付 bug**。查法:用真 wrapper(格式自匹配)跑 `_test_final` 两模式,若那里 dq 正常(fast 35dB/poly 52dB、det bit-identical),则探针脚本的 NaN 是格式不匹配。修:探针里 build 模块的 exp2 flag 与所喂 lse 格式对齐。
+- 一般化:**看到某个输出全 NaN 而同 kernel 其它输出正常时,优先怀疑该输出的输入预处理(格式/缩放)不匹配,而非 kernel 逻辑**。
+
 ### fp8/fp4 SNR 阈值(硬编码在 test/bench,不在 get_tolerances)
 | 类型 | 阈值 | 位置 |
 |---|---|---|

@@ -46,7 +46,10 @@
 | e8m0 scale 广播前 cast Uint8 | ❌静默错 | 高位损坏 match~9% 垃圾;位运算全程 Int32 | pitfalls/05 |
 | atomic 融合 reduce(dense split-K) | ❌实测DEAD | 同地址 HBM atomic 争用串行;split+reduce 是答案 | pitfalls/05 |
 
-## D. attention(dsv4 sparse-MLA)—— 详见 pitfalls/12
+## D. attention —— 优化顺序 playbook 见 methodology/15;实测 win/dead 见 pitfalls/12(dsv4)+13(hd64 dense)
+> 优化前先读 **methodology/15-attention-bwd-optimize**(定 bound→减 MFMA→融串行核→藏延迟→exp2/occ→确定性)。
+
+### D. attention(dsv4 sparse-MLA)—— 详见 pitfalls/12
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |
 |---|---|---|---|
 | s_setprio(fwd / bwd dQ) | ❌实测DEAD | latency-bound,优先 MFMA 饿死 VALU/read | pitfalls/12,09 |
@@ -57,6 +60,19 @@
 | query-blocking(cr128 减 store) | ❌实测DEAD | 2×o_acc>256 arch-VGPR→强制 occ-1,占用损失>store 省 | pitfalls/12 |
 | ✅ pro cr0/cr128 interm(慢 triton ~20%) | ✅开口 | 研究 triton 小 topk tiling/少 launch | pitfalls/12 |
 | ✅ banded-SWA dKV 融合 / hybrid scatter | ✅开口 | 减 interm+gather 的 2× tensor HBM | pitfalls/12 |
+
+## D2. attention(Meta/gpt_oss hd64 DENSE flash bwd,确定性)—— 详见 pitfalls/13
+| 你想试的动作 | 判定 | 一句根因 | 详卡 |
+|---|---|---|---|
+| ✅ drop 冗余 B-GEMM / rho-R 全局修正(dq) | ✅+9.8% | 真结构性减 MFMA,先审计每核有无可丢项 | pitfalls/13 |
+| ✅ odo delta 融合(消独立 delta 核) | ✅+5.3% | 全串行辅助核随 Sq 放大;须 out/dout→q.dtype cast | pitfalls/13,02 |
+| ✅ exp2 软流水(GQA head 轴) | ✅+1.4% | 藏 head h+1 exp2 进 head h GEMM2 shadow | pitfalls/13 |
+| swizzle/pad/prefetch/bank(消 tr16 冲突) | ❌实测DEAD | LDS 4-8× port 富余=latency-bound,非 port-bound | pitfalls/13,05 |
+| P5 shared-GEMM1 融合(dq+dkdv) | ❌实测DEAD | q-outer=det 陷阱→KV-outer BLOCK_KV=64 但融合核 1.95-2.55× 慢 | pitfalls/13 |
+| fp8 GEMM1 operands(FA-3 plain) | ❌实测DEAD | hd64 收缩维短,SNR 28.2<34 破门 | pitfalls/13 |
+| dkdv 拆 dV/dK-only 核(冲 occ3) | ❌实测DEAD | 双份 Q/dO 读+拆分开销>占用率收益(-36%) | pitfalls/13 |
+| LDS 双缓冲 | ⚠regime | 仅长 Skv 边际 +1.25%,短 shape -3.6% | pitfalls/13 |
+| 长 Sq(8192/16384)达 844/866 | ⚠开口(需裁决) | 确定性结构杠杆已 measure-closed;只剩放宽 det 或 research 级新 exp2 | pitfalls/13 |
 
 ## E. autotune / dispatch / grouped-MoE
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |

@@ -15,10 +15,11 @@
 - 写任何原语前先 grep `gemm_helper.py` 与最接近的既有 kernel:`ceildiv` / `xcd_remap_pid` / `S2RLoader` / `G2SLoader` / `mask_a_tail` / `emit_wholeloop_tile` 等,**有就必用**,别另造。
 - 新 kernel 变体**照抄**最接近的既有模式(命名 / 错误处理 / dispatch grid / group_n band),不自造结构。
 
-**3. 注释:短 · 只英文 · 不留过程**
+**3. 注释:短 · 只英文 · 不留过程 · 不 stale**
 - 注释**一律英文**,禁中/日文。
-- **单块 ≤5 行**(>5 行连续注释 / docstring 即打回),1-2 句讲清。
+- **单块 ≤5 行**(>5 行连续注释 / docstring 即打回,含 public API docstring),1-2 句讲清。
 - 注 **WHY 不注 WHAT**;推导 / 实测数字(dB · TFLOPS · MxNxK)/ 日期 / 多方案权衡 → 进 commit message · memory · `tuning_results/`,**绝不进源码**。
+- **★重构删代码后必须同步改引用它的注释/docstring**。融合/删 kernel 类 commit 最易留 stale 注释(如 pad+meta 融进主 kern 后 docstring 仍写"fused pad prologue")。review 必 **grep 被删结构名**(`rg 'pad.{0,3}prologue|<删掉的函数名>'`)确认 0 stale。
 
 **4. 无调试信息(rg 0 命中才放行)**
 - 放行前 `rg -i 'debug|tmp|临时|verified|实验|print\(|# TODO'` 必须 **0 命中**。

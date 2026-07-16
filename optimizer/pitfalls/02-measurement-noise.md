@@ -2,6 +2,11 @@
 
 > 类别: 踩过的坑 · 主题标签: measurement-noise, dvfs, interleaved-ab, regression-gate, clock-throttle, autotune-dispatch, parallel-bench, triton-cache, wrapper-overhead, quant-e2e, raw-op, snr-gate, do-bench, shape-alignment, race, correctness, wgrad
 
+## ★优化口径：EAGER 优先，禁用 cuda-graph 掩盖 host/launch 开销
+
+- **用户硬规则**：grouped GEMM(及同类)性能优化**只看 eager 模式**。不允许用 cuda-graph 的数字来"达标"——cuda-graph 会隐藏 kernel launch 延迟 + inter-kernel gap + host wrapper 开销,把 eager 下真实存在的 overhead 抹掉,是自欺欺人。WHY：真实训练/推理里这些 overhead 对小/短-K shape 是实打实的瓶颈,graph 只是掩盖不是消除。
+- 推论：eager 下的杠杆是**减 kernel 数 / 减 host torch op / 减 launch**(合并 preshuffle、消 F.pad、融合),而不是"反正 graph 会摊掉"。cuda-graph 只用于旁证"某开销是 launch 而非 kernel-exec"(诊断用),**绝不用于报达标数**。
+
 ## 测量噪声地板：run-to-run ~5% / DVFS 功耗受限 / 多轮 interleaved 才可信
 
 **噪声地板的量级（不认清就会把噪声当收益放行）**
