@@ -46,8 +46,8 @@
 | e8m0 scale 广播前 cast Uint8 | ❌静默错 | 高位损坏 match~9% 垃圾;位运算全程 Int32 | pitfalls/05 |
 | atomic 融合 reduce(dense split-K) | ❌实测DEAD | 同地址 HBM atomic 争用串行;split+reduce 是答案 | pitfalls/05 |
 
-## D. attention —— 优化顺序 playbook 见 methodology/15;实测 win/dead 见 pitfalls/12(dsv4)+13(hd64 dense)
-> 优化前先读 **methodology/15-attention-bwd-optimize**(定 bound→减 MFMA→融串行核→藏延迟→exp2/occ→确定性)。
+## D. attention(fwd + bwd)—— 优化顺序 playbook 见 methodology/15;实测 win/dead 见 pitfalls/12(dsv4)+13(hd64 dense)
+> 优化前先读 **methodology/15-attention-optimize**(定 bound→fwd:消/藏 store·_FMAX0·dual-wave / bwd:减 MFMA·融串行核→藏 MFMA 延迟→exp2·occ·确定性)。
 
 ### D. attention(dsv4 sparse-MLA)—— 详见 pitfalls/12
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |
