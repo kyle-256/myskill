@@ -69,6 +69,12 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [gpt_oss/02-run-and-venv](connection/gpt_oss/02-run-and-venv.md) — docker exec 跑法 + mxfp4/tensorwise venv 隔离
 - [gpt_oss/03-sync-and-remote](connection/gpt_oss/03-sync-and-remote.md) — NFS/rsync 规程/FlyDSL 远端为主
 
+### connection/crusoe/ — Crusoe 集群(spur 调度器)连接卡（2026-07-20 搭建）
+- [crusoe/01-access-spur-container](connection/crusoe/01-access-spur-container.md) — 登录(csh坑/host key轮询)+login红线(Guardian杀内存)+spur账号关联+squashfs容器dev box(避JobHoldMaxRequeue)+存储(/shared_nfs/kyle)+FlyDSL pip 0.2.2/build
+
+### connection/smci355/ — smci355 SLURM+docker 节点连接卡（2026-07-20 迁移，chi 跳板挂掉后）
+- [smci355/01-node-setup](connection/smci355/01-node-setup.md) — 直连(.ssh_laptop key/IdentitiesOnly)+sbatch(--partition=Compute-DCPT)+起 kyle_dev(rocm/primus:v26.3)+FlyDSL pip 0.2.2(镜像自带 dev409 缺 expr.math)+meta-attn(FAST=0/FLYDSL_EXTRA_SOURCE_DIRS)+两套 turbo(mxfp4 /opt/venv、tensorwise /opt/venv-tw,CK 从 mxfp4 拷)
+
 > ⚠️ connection/ 是 env-specific 层:只放**你自己环境**的连接卡;相邻/别人的环境(名字相近的容器·盘)严禁在此混入或触碰,见上「环境红线」。
 
 ---
