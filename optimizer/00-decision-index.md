@@ -20,6 +20,7 @@
 | BK128 换 occ=2(mxfp4 K28672) | ❌实测DEAD | occ=2 唯一途径 BK128→g2s 频率翻倍 VMEM-stall 2.7→30%,总 5405→4686 | pitfalls/05 |
 | 缩 tile / 矩形 tile 为抬 occ | ❌实测DEAD | feed-bound worst shape:占用率非杠杆,根因 LDS-feed 带宽 | pitfalls/01,05 |
 | attention 强制 occ(WPEATTR/o_acc 进 AGPR/bf16 o_acc) | ❌实测DEAD | 全 latency-bound,occ-1/2 都填不满;强制必 spill/掉速 | pitfalls/12 |
+| bwd(occ-2)dual-wave / 8-wave / warp-spec / bare-asm cross-head 显式并行 GEMM↔softmax | ❌实测DEAD | occ-2 baseline 已靠两独立 WG 共驻**免费享无屏障跨-WG overlap**;8-wave 单-WG 换成带屏障税组内 overlap,天花板<baseline(dkdv 1029<1116)。净胜改走冷-load 寄存器预取(+1.81%) | methodology/15 · pitfalls/13 |
 | **先做**:判是不是 occ-bound(而非 register/LDS/feed/latency-bound) | — | occ=`512//(arch+agpr)`;`Accum_VGPR_Count=0`+ISA 才权威;多数 kernel 是 feed/latency-bound | methodology/04 · methodology/03 |
 
 ## B. LDS / 数据通路 / store

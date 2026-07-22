@@ -7,7 +7,7 @@
 ## Dense GEMM（Llama-2 7B + 70B，两个都要跑）
 
 - 每模型 4 个 dense 层：`qkv_proj / attn_out / mlp_gate_up / mlp_down`；`trans_b=True`。
-- **M = seq_token × mbs**，mbs ∈ {1, 2, 4}（dense bench 默认三档）。
+- **M ∈ {4096, 8192}**（dense bench 用这两档 token 数；= seq_token × mbs 的常用组合，用户 2026-07-20 明确口径）。
 - N/K 固定如下：
 
 | 模型 | 层 | N | K |

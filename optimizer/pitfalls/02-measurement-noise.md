@@ -7,6 +7,13 @@
 - **用户硬规则**：grouped GEMM(及同类)性能优化**只看 eager 模式**。不允许用 cuda-graph 的数字来"达标"——cuda-graph 会隐藏 kernel launch 延迟 + inter-kernel gap + host wrapper 开销,把 eager 下真实存在的 overhead 抹掉,是自欺欺人。WHY：真实训练/推理里这些 overhead 对小/短-K shape 是实打实的瓶颈,graph 只是掩盖不是消除。
 - 推论：eager 下的杠杆是**减 kernel 数 / 减 host torch op / 减 launch**(合并 preshuffle、消 F.pad、融合),而不是"反正 graph 会摊掉"。cuda-graph 只用于旁证"某开销是 launch 而非 kernel-exec"(诊断用),**绝不用于报达标数**。
 
+## ★小-workload(B=1)热稳态协议：连续满载预热,绝不 sleep 冷却
+
+- **现象(2026-07-21 meta hd64 bwd B=1)**:同一个 kernel、同 config,冷启动 1024TF / 带 `sleep(0.3)` 半冷 727-969 / 连续满载稳态中间值 —— **差 40%**,把 5-14% 的真实缺口完全淹没。根因=B=1 workload 太小,GPU 时钟 boost/衰减 + pipeline 填充状态的瞬态占比巨大。
+- **协议(反直觉但正确)**:①**连续满载预热数秒(WARMS≈3s,循环跑 kernel + sync,绝不 sleep)** → 让时钟 settle 到持续满载稳态、pipeline 填满;②预热后**无 sleep 连续测 REPS≥7 取中位数**。
+- **严禁 sleep 冷却**:`sleep` 让 GPU 掉出满载 pipeline + 时钟回 boost,测量**既不稳又偏低**(连续满载反而更高更稳)。这跟"控热靠 sleep 散热"的直觉相反 —— 反映真实部署(持续满载)的口径就是**连续满载稳态**,不是间歇。
+- **验收/优化前必须先定死这个协议**,否则改一版分不清是优化还是热漂移。参考 [[project_meta_bwd_accept_bench]]。
+
 ## 测量噪声地板：run-to-run ~5% / DVFS 功耗受限 / 多轮 interleaved 才可信
 
 **噪声地板的量级（不认清就会把噪声当收益放行）**

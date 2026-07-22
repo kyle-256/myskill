@@ -31,6 +31,7 @@
 - trace 截断 → `att_buffer_size` 升到 `0xC000000`。
 - `INVALID_SHADER_DATA` → aqlprofile / decoder 版本不匹配，需同时更新。
 - `iteration_range` 不匹配 → 试 `"[0,[1-2]]"`。
+- ❌ 别再试：本容器直接跑 ATT——`/opt/rocm/lib/librocprof-trace-decoder.so` 在 meta-attn-dkdv 的远程 GPU 容器里**不存在**（`find / -iname "*trace-decoder*"` 空），装饰器/ mfma-operand-bubble 根因分析这条路在此环境**基础设施缺失**，不是配置错。想用 ATT 得先解决 decoder 库安装（未探索，可能需要单独装 rocprofiler-sdk 的 trace-decoder 包），否则只能退回 PMC 聚合计数 + 减法探针（见 methodology/03 的 subtractive/HALF 手法）做 stall 归因。
 
 ### ❌ 别再试：靠 code.json 反汇编算占用率（AGPR-blind）
 - `code.json` 只含**单 CU、常是 vgpr-form 的反汇编**，无法给出 accum_vgpr / LDS / SGPR / workgroup size。**AGPR-form-blind 的 ISA 扫描会报 `accum=0`**，从而占用率算错。

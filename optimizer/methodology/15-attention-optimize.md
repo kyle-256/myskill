@@ -19,7 +19,8 @@
   - **triple-buffer** 藏 exposed epilogue store;
   - query-blocking 减 store ⚠ 常 DEAD(2×o_acc>256 VGPR 强制 occ-1,占用损失 > store 省)。
 - **rescale 折叠(_FMAX0)**:softmax 平移不变 → 用 first-pair 固定 max → `alpha=1`,编译器折叠掉 online-rescale 乘法(dsv4 pro cr4 828→933TF,+13%)。当 max 可安全固定时首选。
-- **GEMM↔softmax 并行(dual-wave)**:唯一让 GEMM 与 softmax 真并行的解 = 上游 `flash_attn_gfx950` 两 wave-group **时间复用**(s_barrier 错相位)+ cluster 流水 + `sched_group_barrier`(MFMA 0x8 / VALU 0x2 / **EXP 0x400**,exp2 是 0x400 非 VALU)+ lazy-rescale(见 [[reference_flydsl_flash_gfx950_dualwave]])。重、但 latency-bound fwd 的上限杠杆。
+- **GEMM↔softmax 并行(dual-wave)**:唯一让 GEMM 与 softmax 真并行的解 = 上游 `flash_attn_gfx950` 两 wave-group **时间复用**(s_barrier 错相位)+ cluster 流水 + `sched_group_barrier`(MFMA 0x8 / VALU 0x2 / **EXP 0x400**,exp2 是 0x400 非 VALU)+ lazy-rescale(见 [[reference_flydsl_flash_gfx950_dualwave]])。重、latency-bound **fwd** 的上限杠杆。
+  - ⚠⚠ **BWD occ-2 上 dual-wave/8-wave/warp-spec 常 net-negative,先证再建(决定性,2026-07-21 dkdv 自主 campaign measure-closed)**:占用率=2 的 baseline **本就有两个独立 WG 机会性共驻同 SIMD → 免费享无屏障的跨-WG dual-wave overlap**(一个 WG 卡 barrier 时另一个照发 MFMA 填气泡)。把 4-wave 两独立 WG 合成一个 8-wave 单-WG(warp-spec/stagger)= 把这**免费 overlap 换成带屏障税的组内 overlap**:8-wave NT=2 屏障耦合 MfmaUtil 53→40(-11%);+stagger 错相位能抢回到 1029(+3.5%,证 stagger 机制真有效)但**天花板 1029 仍 < 4-wave baseline 1116**。→ **occ-2 latency-bound bwd 上,dual-wave 只能逼近 baseline 已免费拥有的、无法超越;别投全套重构**。判据:先量 baseline 是否已 occ-2 双-WG 共驻(是→dual-wave 大概率亏)。fwd 常 occ-1(无跨-WG overlap)才是 dual-wave 的正场。
 - **PV 的 tr16 转置读常是 fwd 头号 LDS-read 成本**(dsv4 去 pad 掉 60-67%);b128 减半读被 LLVM "Cannot select" 挡。
 - ⚠ **lazy O-rescale 单独移植常 net-negative**(dsv4 MLA cr4 -31%,pstore 流水冲突)——它是 dual-wave 套件的一部分,别单拆。
 
@@ -31,6 +32,7 @@
 ## 步骤 2 — 藏 MFMA 依赖延迟(fwd/bwd 通用,减不动 MFMA 时)
 - **16x16x32 拆链**:32x32 长串行累加 → 4 条独立 16x16 → MFMA-latency ILP ×4,累加器 VGPR 不变(dkdv 581→632TF)。
 - **operand-bubble 软流水**:下一迭代 exp2/pack 藏进当前 GEMM2 MFMA shadow。**选对轴**(GQA head 轴有肉 +1.4%,dt 轴常负);dq iglp_opt(1) 同理(+0.5% bit-identical,别和回归捆一轮被埋)。
+- **★冷 load 寄存器预取(head 轴,bwd hw-exp 实测 +1.81%)**:每 q-block 的 head-0 lse/delta 是冷 load;把**下一 head 的 lse/delta buffer_load 在本 head GEMM2 的 `dt==DT-1` 处发射**,+32 VGPR carry 只叠最后一个 dt 的 MFMA(spill-neutral、守 occ-2、bit-identical)→ 藏掉 consumer latency。dkdv hw-exp 1114→1134(commit c619847)。⚠**只藏 latency 不消 issue-stall**:若该 load 的 stall 是 VMEM-queue issue-stall(被巨量 Q/dO DMA 占满,ATT 查 col[8]),prefetch/晚发射类结构性无效;cross-q_start 跨 block 提前=neutral(head0 已被自身 Q/dO DMA 的 waitcnt drain 覆盖)。Q/dO DMA 本身 HBM 32B-fraction=0%(全 coalesced)= 纯 latency、occ-2-hidden,别刷 coalescing。
 - **occ-1 核交织**:QK→softmax→PV 三段交织是 occ-1 藏延迟唯一机制,别用批-2-tile 打断(K=32-PV 判死)。
 - **s_setprio(1/0) 包 MFMA-dense 的 GEMM2**:叠结构改动上 +1~2%;单独/GEMM1/连续 span 常中性或负。
 
