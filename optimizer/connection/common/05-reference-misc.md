@@ -54,7 +54,8 @@
 
 ## ISA dump / 反汇编
 - 从 .so 提取 gfx950 code object：`roc-obj-ls` 拿 offset/size → `dd` 切出 `.hsaco` → `/opt/rocm/lib/llvm/bin/llvm-objdump -d --triple=amdgcn-amd-amdhsa --mcpu=gfx950`；寄存器元数据用 `llvm-readelf --notes` 看 `sgpr_count`/`private_segment_fixed_size`/`vgpr_spill_count`。
-- 从 results.db 查寄存器信息：`SELECT ks.KernelName,ki.arch_vgpr_count,ki.accum_vgpr_count,ki.lds_size FROM rocpd_kernel_dispatch kd JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id=ks.id JOIN rocpd_info_kernel ki ON kd.kernel_id=ki.id`。
+- 从 results.db 查寄存器信息（**旧 schema**）：`SELECT ks.KernelName,ki.arch_vgpr_count,ki.accum_vgpr_count,ki.lds_size FROM rocpd_kernel_dispatch kd JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id=ks.id JOIN rocpd_info_kernel ki ON kd.kernel_id=ki.id`。
+- ⚠️**新 rocpd schema(2026-07 rocprofv3 `--output-format rocpd`,实测 chi2774)**：表名带 **session 后缀**(如 `rocpd_info_kernel_symbol_<guid>`)、**无 `rocpd_info_kernel` 表**——VGPR/LDS 已并进 `rocpd_info_kernel_symbol`：列 `arch_vgpr_count`/`accum_vgpr_count`/`group_segment_size`(=LDS 字节)/`private_segment_size`(=scratch/spill)/`sgpr_count`/`kernel_name`。`rocpd_kernel_dispatch_<sfx>` 用 `kernel_id`(非 `kernel_symbol_id`),含 `workgroup_size_x/y/z`+`grid_size_*`(查 wave 数=WG线程/64)。**过滤真内核**:`WHERE group_segment_size>0`(排掉 torch elementwise 的 LDS=0 小核);或按已知 LDS 值锚定 dispatch。**sqlite3 CLI 容器里常没有→用 python `sqlite3`**。跑法:`rocprofv3 --kernel-trace --output-format rocpd -d DIR -o NAME -- python run.py` → `DIR/NAME_results.db`。用途例:算占用率 occ=min(512÷vgpr 的 wave/SIMD, 160KB÷LDS 的 WG/CU × WG内wave/SIMD)——见 [[project_meta_fwd_hd64]] 现役 hd64 fwd occ-4 实测。
 
 ## MFMA 延迟（cycles = 流水深度）
 | 指令 | 延迟 |

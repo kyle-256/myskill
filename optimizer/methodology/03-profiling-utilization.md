@@ -107,6 +107,11 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
 ### 不可信的计数(权威判据在别处)
 - CSV `Accum_VGPR_Count` **恒报 0**。
 - `VGPR_Count` 对 256-VGPR 内核也报 **128 等错值**(如 8-wave wholeloop 内核,真实 num_vgpr=256)。
+  ★**2026-07-27 锐化(meta hd64 bwd 实测)**:它报的是**真值的一半**。所以在 occ-2 内核上
+  **读到 128 就意味着正好压在悬崖上,读到 132 就已经越界**——实测越界即掉约 **8%**,
+  而 **`scratch` 仍是 0(不是 spill)、SNR 仍 bit-identical**,bench 也不报错,**三个常规信号全看不见**。
+  ⇒ **任何会动寄存器压力的重构(hoist 地址、双缓冲、融合、加预取),bench 之前先 dump ISA 看 `.vgpr_count`**。
+  本例三次失败(−7.9% / −16.5% / 掉占用率)全靠这一条才解释得通,否则只会看到"莫名其妙变慢"。
   - 权威 VGPR/AGPR 必须用 `FLYDSL_DUMP_IR` 的 ISA `num_vgpr/num_agpr`。
 - prof_summary 的 "MFMA busy %"(除以 GUI*4)对聚合计数**不成比例(>100%)** → 改用权威派生指标 `MfmaUtil` / `MeanOccupancyPerActiveCU`。
 - 查 VGPR 分配的 rocprofv3 SQL(仅供参考,同样不足信):

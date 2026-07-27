@@ -65,15 +65,26 @@
 ## D2. attention(Meta/gpt_oss hd64 DENSE flash bwd,确定性)—— 详见 pitfalls/13
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |
 |---|---|---|---|
+| ★✅ **XCD-major block_id 解码**(`xcd=bid%8`,每 XCD 一整块 (batch,kv_head)) | ✅dkdv+2.81% / dq+0.54% | per-XCD 私有 L2,让共读同份 K/V 的 GQA WG 相邻(dq L2 hit 86.5→94.8%)。**内层轴 dq 要 kv-head 相邻、dkdv 要 q 相邻,选反=−2.5% vs +2.4%**。⚠推翻旧记的"XCD remap GPU-fault 判负"(那是实现炸了) | pitfalls/13 · methodology/05 |
+| ★✅ **dq 派发降序 q_tile(LPT)** | ✅+2.50% | 因果工作量单调递增且**派发序=list-schedule 序**→长任务优先。⚠**别假设 in-order 最优**:dkdv 恰好已是 LPT 但 dq 是反的 | pitfalls/13 · methodology/05 |
+| ★✅ **冒险锚点减量 per-slot→per-v4** | ✅dq+1.76% / dkdv+0.77% | clamp 是 MFMA→trans 冒险载体(非数值保护),但只需每 v4 一个;其余 slot 靠 inline-asm dead operand 钉序。`v_min` 72→3 / 256→64 | pitfalls/13 |
+| ★✅ **causal-aligned q-tile origin** | ✅+0.96% | tile 数×BLOCK_M 的 padding 别落在因果范围最长的末 tile,下移到 tile 0 → 每 tile 少一个 BLOCK_KV 步(7481→7396 访问) | pitfalls/13 |
+| ★✅ **`llvm.amdgcn.exp2.f32` intrinsic 替手写 asm+锚点**(dq) | ✅−0.79% | intrinsic 本身即编译器可见的累加器读→编译器自插等待周期,锚点粒度问题消失。⚠**别推广 dkdv**(那边 +1.06% 更慢) | pitfalls/13 |
+| ★❌❌ **锚点放大到"组级"**(per-GEMM1a-block / per-mt-pair / min3-group) | ❌**更快但算错** | 快 2.53%/1.79%/0.31%,但 dk/dv **16.9~19.7dB 且 det=FALSE**,**只在 q_split=4·BLOCK_KV=128 或 BLOCK_KV=64 暴露**。★规则:锚点必须读**它保护的那个 v4**,"读遍组内每个 v4"不充分 | pitfalls/13 |
 | ✅ drop 冗余 B-GEMM / rho-R 全局修正(dq) | ✅+9.8% | 真结构性减 MFMA,先审计每核有无可丢项 | pitfalls/13 |
 | ✅ odo delta 融合(消独立 delta 核) | ✅+5.3% | 全串行辅助核随 Sq 放大;须 out/dout→q.dtype cast | pitfalls/13,02 |
 | ✅ exp2 软流水(GQA head 轴) | ✅+1.4% | 藏 head h+1 exp2 进 head h GEMM2 shadow | pitfalls/13 |
+| ✅ q_split 铺满 CU grid(dkdv) | ✅关键 | 旧上限卡 2 CU 空转;qsp≥4 铺满→hw 验收 1/4→2/4(4096 594→702) | pitfalls/13 |
+| ✅ 冷 load 寄存器预取(dkdv 下一head lse/delta) | ✅+1.81% | occ-2 latency-bound 上唯一 register-neutral 净胜(dt==DT-1 发射) | pitfalls/13 |
 | swizzle/pad/prefetch/bank(消 tr16 冲突) | ❌实测DEAD | LDS 4-8× port 富余=latency-bound,非 port-bound | pitfalls/13,05 |
 | P5 shared-GEMM1 融合(dq+dkdv) | ❌实测DEAD | q-outer=det 陷阱→KV-outer BLOCK_KV=64 但融合核 1.95-2.55× 慢 | pitfalls/13 |
 | fp8 GEMM1 operands(FA-3 plain) | ❌实测DEAD | hd64 收缩维短,SNR 28.2<34 破门 | pitfalls/13 |
 | dkdv 拆 dV/dK-only 核(冲 occ3) | ❌实测DEAD | 双份 Q/dO 读+拆分开销>占用率收益(-36%) | pitfalls/13 |
 | LDS 双缓冲 | ⚠regime | 仅长 Skv 边际 +1.25%,短 shape -3.6% | pitfalls/13 |
-| 长 Sq(8192/16384)达 844/866 | ⚠开口(需裁决) | 确定性结构杠杆已 measure-closed;只剩放宽 det 或 research 级新 exp2 | pitfalls/13 |
+| ~~长 Sq(8192/16384)full-causal 达标~~ | ★**已达标(2026-07-27)** | 旧记"确定性杠杆全 measure-closed、只剩放宽 det 或 research 级 exp-overlap"**已被推翻**——真正的开口不在 kernel 体内,在 **grid/派发映射层**(XCD+LPT+padding 对齐 = +7%)与**锚点粒度**(+3.6%)。**没有放宽任何确定性** | pitfalls/13 |
+| ~~收官:perf B4 hw 16/20·fast 18/20~~ | ★**19/20 + 4-square 4/4**(turbo 侧) | 4-square hw 565/765/832/**877**(1.44-2.08×)、fast 4/4;20-config full **9/10**(既有 MI350 CK-det 是 0/10)、SWA 10/10(2.12-3.41×)。唯一未过 `newshape full 2048`=1.37×(98%)。**成果在 `sync/mxfp4/Primus-Turbo`,meta-attn 未移植** | pitfalls/13 |
+| ★**先查 grid/派发层再抠 kernel 体** | ✅方法 | kernel 内部(tile/双缓冲/遍历序)调几周只值 ~1%;XCD-L2 亲和+LPT+padding 对齐 = +7%。清单:①co-resident WG 是否共享同份数据 ②派发序是否=list-schedule 序且工作量单调 ③padding 落在最贵还是最便宜的 tile | pitfalls/13 · methodology/05 |
+| ★**bench 必须镜像部署配置** | ⚠**曾优化错配置** | `_bench_*` 直调 builder 用默认参数,而 `_get_bwd` 部署传另一组(dq block_kv/wpe、dkdv fold_lse)→**差 1.4%**。修法:让 **builder 默认值本身=部署值**,别靠每个 bench 记得传参 | pitfalls/13 · methodology/01 |
 
 ## E. autotune / dispatch / grouped-MoE
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |

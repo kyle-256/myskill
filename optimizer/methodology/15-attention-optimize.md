@@ -24,6 +24,25 @@
 - **PV 的 tr16 转置读常是 fwd 头号 LDS-read 成本**(dsv4 去 pad 掉 60-67%);b128 减半读被 LLVM "Cannot select" 挡。
 - ⚠ **lazy O-rescale 单独移植常 net-negative**(dsv4 MLA cr4 -31%,pstore 流水冲突)——它是 dual-wave 套件的一部分,别单拆。
 
+## ★★ 步骤 0.5 — 先审 grid / 派发映射层(2026-07-27 meta hd64 实测:这层值 +7%,kernel 体内只值 ~1%)
+> **这是本 playbook 里被补上的最大缺口。** 我曾在 kernel 内部(tile 大小、双缓冲、遍历方向)反复调几周只拿到约 1%,
+> 而下面三条加起来 **+7%**,全在 kernel 之外、纯索引/顺序改动、输出 bit-identical。**动 kernel 体之前先过这三问。**
+
+1. **co-resident 的 WG 之间复用的是哪一份数据?让那一维在 XCD 内相邻。**
+   MI355X/MI350 是 **8 个 XCD、L2 各自私有**。`xcd = block_id % 8`(片上实测确认),让每个 XCD 拿一整块
+   `(batch, kv_head)` → 共读同份 K/V 的 GQA WG 落在同一 L2 slice。dq L2 hit 86.5→94.8%、miss −62%;dkdv **+2.81%**。
+   ★**内层最快轴对不同 kernel 是相反的**:dq 要 **kv-head 相邻**、dkdv 要 **q 位置相邻**。选反 = **−2.5% vs +2.4%**。
+   ★门控 `num_kv_heads % num_xcd == 0`,双射性**离线穷举验证**后再上机(naive remap 曾直接 GPU-fault 并被误记为"方向死")。
+2. **派发顺序就是 list-schedule 顺序 —— 工作量单调时用 LPT(长任务优先)。**
+   因果掩码下每 WG 工作量 `(q_tile+1)*BLOCK_M/BLOCK_KV` 单调递增 → 降序 q_tile 派发 = **+2.50%**。
+   ★**别假设 in-order 已最优**:同一份代码里 dkdv 的 in-order 恰好已是 LPT,而 dq 是反的。可先用"N slots/XCD 贪心"离线模拟排序候选。
+3. **padding 落在最贵还是最便宜的 tile 上?**
+   `num_q_tiles*BLOCK_M` 超出 `seq_len_q` 的部分,若锚在 row 0 则**全部浪费在因果范围最长的末 tile**。
+   把原点下移 `floor(pad/BLOCK_KV)*BLOCK_KV` 让 overshoot 落到 tile 0(最短)= **+0.96%**(kv-block 访问 7481→7396)。
+   ★必须是 BLOCK_KV 整数倍且 `BLOCK_M % BLOCK_KV == 0` 以保持对齐;首 tile 夹到 row 0 并加 owned-end store 界(共享行重算但只写一次,det 不变)。
+
+★ 判这层改动看 **`SQ_WAIT_ANY` / `SQ_VALU_MFMA_COEXEC_CYCLES`,不要看 TCC hit%** —— hit 率大涨可以值 0 wall。
+
 ## BWD 专属杠杆:减 MFMA(唯一够大的结构杠杆,优先级最高)
 1. **审计可丢弃的 GEMM / 全局修正项**:第二 GEMM、rho/R 全局 renorm(精度代价常 ~0.2dB 非破门)。dq drop-B-GEMM 实测 **+9.8%**。**永远先做**,纯减法量级大。
 2. **融掉全串行辅助核**:`delta=rowsum(O·dO)`(odo)、interm restage 等串行且随 Sq 放大 → 融进主核。odo delta 融合 **+5.3%**(长 Sq 最大)。★坑:融合核直读 O/dO,wrapper 必须 `out/dout.to(q.dtype)` cast,否则喂 fp32 O → 崩/NaN(见 02)。

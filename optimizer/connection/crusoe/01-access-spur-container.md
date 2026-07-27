@@ -4,6 +4,8 @@
 > 状态: 2026-07-20 首次搭建，端到端跑通(容器起 + torch 2.10/8GPU + flydsl 0.2.2 + dq bench 1100TF + turbo csrc build)。2026-07-22 复用保存的 tar `docker load` 直接起(§4b 一条龙,3-4min,免重装 flydsl)再次实测通。✅=已实测。
 > **当前活节点(2026-07-22): `crsuse2-m2m-289`(job 23379,7天walltime),容器 gpt-oss-docker,meta-attn bwd 全 20-config 验收在此跑通。** 前一节点 `crsuse2-m2m-301`(job 22667)已 06:35 NODE_FAIL 挂掉(见 §9 坑:squeue R 状态滞后)。节点名每次分配都变,跑前先确认活死(§4.0)。
 
+> **⚠️ 2026-07-23 回退提示**：crusoe spur 常排队(sbatch PENDING 卡数分钟)。急用 GPU 时**优先回 chi2774**(经跳板机 `root@149.28.124.225` + `sync/.ssh-chi.sh`,容器 `mlperf_gptoss` 长期 Up,GPU4-7 干净,meta-attn 分支 Primus-Turbo 在容器 `/workspace/code/Primus-Turbo`)。详见 [[../../../../.claude/memory/project_crusoe_env]] 顶部 + [[../../../../.claude/memory/project_chi2811_sync]]。文件传输走 base64→容器 `/root`(见 memory,`docker cp /dev/stdin`/scp-to-NFS/`docker exec -i` 都挂)。
+
 ## 0. TL;DR（一条龙）
 Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur 的 --container-image(那条死路)，用节点自带的 dockerd**。流程：
 1. login: `ssh -i .ssh_laptop/id_ed25519 xianzhao@crs-m2m-cpu-spur-login.crusoe.amd.com`（csh！命令包 `bash -lc`）

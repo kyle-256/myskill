@@ -80,6 +80,22 @@ attention bwd 的 tr16 转置读(`ds_read_tr16_b64` 喂 GEMM2 A-operand)有顽�
 | **2D band (group_n)** | N 切成宽 `group_n` 的竖带,带内再 `GROUP_M` 1D;把 working set(`GROUP_M·A_slab` + `group_n·B_slab`,各 ~2MB)锁进 L2;A 复用 `group_n`×、B 复用 `GROUP_M`× | `GROUP_M=4`, `group_n = n_blocks/8`(band 数=8=#XCD) | **big-N GM4×GN14 → +12%**(L2 51→57.5%,MFMA 34→40%,det1000=0);big-K 也 +1%;square/ffn_down 无回归。commit `7269aebc` |
 | **XCD WG-id remap** | 保持 `chunk_size` 个连续 id 在同 XCD:`chunk_idx*(num_xcds*chunk_size) + xcd*chunk_size + pos`→相邻 tile 共暖 L2 | — | GEMM/attention 有空间局部性时是实打实的 win |
 
+### ★ attention bwd 上的 XCD remap(2026-07-27 meta hd64 实测,单项最大杠杆)
+- **形式**:`xcd = block_id % 8`(片上实测确认此式,别猜),让每个 XCD 拿一整块 `(batch, kv_head)`,
+  使读同一份 K/V 的 GQA work-group 挨在一起。dq 实测 **L2 hit 86.5→94.8%、miss −62%**;dkdv **+2.81%**、dq **+0.54%**。
+- **★★内层最快轴 dq 与 dkdv 必须相反**:**dq 要 kv-head 相邻,dkdv 要 q 位置相邻**(split_idx 最快)。
+  同一个 remap 只是内层顺序选错 = **−2.5% 对 +2.4%**。⇒ 迁移这个 lever 时,
+  **先问"这个 kernel 的 co-resident WG 之间复用的是哪一份数据"**,让那一维相邻,而不是照抄另一个 kernel 的顺序。
+- **门控**:需 `num_kv_heads % num_xcd == 0`,其余 head 数走原解码;双射性**离线穷举验证**(遍历所有部署的 `(B, q_split, tile 数)`)后再上机
+  —— 历史上一次 naive nested-division remap 直接 GPU-fault,曾被误记为"方向死"。
+- **⚠ TCC hit% 不是判据**:hit 率大涨可能值 0 wall。判这类改动看 **`SQ_WAIT_ANY` / `SQ_VALU_MFMA_COEXEC_CYCLES`**。
+
+### ★ 派发顺序 = list-schedule 顺序(同轮发现,+2.50%)
+因果掩码下每个 WG 的工作量 `(q_tile+1)*BLOCK_M/BLOCK_KV` 单调递增,而 dispatcher 按 block_id 顺序发 →
+**派发顺序本身就是 list-schedule 顺序**,于是 **LPT(长任务优先=降序 q_tile)** 直接改善尾部平衡。
+⚠**别假设 in-order 已最优**:同一份代码里 dkdv 的 in-order 恰好已是 LPT,而 **dq 是反的**。
+★可以先用"N slots/XCD 贪心"离线模拟器排序候选再上机(本例模拟预测 +2.30%、实测 +2.9%,模型可信)。
+
 - 2D band 触发条件:大-N shape(N≥2880 / N_BLOCKS_N 够多)才加 `group_n`;`group_n = N_BLOCKS_N//8`(#bands=#XCD)对 big-N 另有 **+8~9%** 口径。big-N 瓶颈是 L2 复用(1D GROUP_M 对每 M-group 重复 stream 整个 B 234MB → L2 51% vs big-K 66%);big-K 的 drain-removal / both-J **❌ 不迁移到 big-N**(短 K 摊不开,both-J 在 big-N 上是噪声)。
 - **band det 中性**:纯 tile→CU permutation,满 band 各占 `num_pid_m·GN` 个 pid、余数成最后一个窄 band,恒为 bijection。
 - **2D autotune gating**:候选 gated `n_blocks>=32 and M//256>=16`(小 M 的 m-block 太少、banding 不划算,走 1D 防回归);winK 块(K≥28672)也 sweep `group_n ∈ {n_blocks/8, n_blocks/4}`。
