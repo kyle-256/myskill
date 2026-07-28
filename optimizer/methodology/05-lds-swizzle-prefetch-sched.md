@@ -171,7 +171,10 @@ attention bwd 的 tr16 转置读(`ds_read_tr16_b64` 喂 GEMM2 A-operand)有顽�
 ### barrier / waitcnt 配套(与调度提示相邻)
 - `fx.gpu.barrier()` = `__syncthreads`(workgroup barrier)
 - **CDNA3 (gfx942)**: `fx.rocdl.s_waitcnt(0)`(单一 waitcnt)
-- **CDNA4 (gfx950)**: 分开 `s_wait_loadcnt(0)` / `s_wait_storecnt(0)` / `s_wait_dscnt(0)`
+- **CDNA4 (gfx950)**: 仍是**统一 `s_waitcnt vmcnt(0)` + `s_waitcnt lgkmcnt(0)`**，**没有**分离的 load/store/ds 计数。
+  - ★**真机勘误(2026-07-28 llvm-mc gfx950 实测)**:早先此处写的「分开 `s_wait_loadcnt/s_wait_storecnt/s_wait_dscnt`」是**错的**——那是 **gfx12(RDNA4)** 的助记符,不是 gfx950(CDNA4)。在 gfx950 上 `s_wait_storecnt/s_wait_loadcnt/s_wait_dscnt/s_wait_kmcnt/s_waitcnt_vscnt` **全部 `instruction not supported`**;只有 `s_waitcnt vmcnt(0)`(编码 `0x70,0x0f,0x8c,0xbf`)与 `s_waitcnt lgkmcnt(0)`(`0x7f,0xc0,0x8c,0xbf`)能汇编。
+  - **后果(与 pitfalls/05 一致)**:load 与 store **共用 vmcnt**,在途 store 占 vmcnt → **无法"只等 load 不等 store"**,任何把 store drip 进主循环的方案都被 vmcnt 串行化(见 pitfalls/05 §gfx950 计数器约束、store-overlap 死路)。
+  - ⇒ 唯一能与 store/cshuffle 的 **lgkmcnt** 链正交的隐藏媒介是 **MFMA**(既不占 vmcnt 也不占 lgkmcnt),见本卡 §「藏 LDS 写延迟」。
 
 ### hot loop 指令比例判据(ISA dump 复盘)
 | 指标 | 好 | 可接受 | 差 |

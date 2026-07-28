@@ -314,5 +314,47 @@ MXFP8 死路速查表——以下方向均已实测判负，勿重试。
   - kernel 模块保持纯净 → JIT 依赖收集不再递归到 torch。
 - **区分维度**: 这是**模块隔离**维度的坑，区别于 pitfalls/07-flydsl-frontend-tracer.md（tracer 字面 if/for）与 pitfalls/11-porting-encoding.md（编码）。同为 JIT 相关但根因不同。
 
+## grouped fp8-tensorwise NT(fwd/dgrad)Shape A big-N/short-K:latency-bound 诊断 + 死路/活杠杆
+
+内核 = `gemm_fp8_grouped_kernel.py` 的 `_compile_grouped_nt`(public `grouped_gemm_fp8_tensorwise_flydsl_kernel`)。**Shape A = gpt-oss gate_up fwd K=2880 N=5760**(big-N/short-K,E=32,M_TOTAL=131072);Shape B = down fwd K=5760 N=2880(long-K/small-N,已强)。8-wave(WG=512)、persistent 路径。
+
+### ★ gfx950 统一 vmcnt 真机勘误(2026-07-28 llvm-mc gfx950 实测,推翻别处误记)
+- gfx950 **只有** `s_waitcnt vmcnt(0)` + `s_waitcnt lgkmcnt(0)`;`s_wait_storecnt/s_wait_loadcnt/s_wait_dscnt/s_wait_kmcnt`(gfx12 助记符)与 `s_waitcnt_vscnt`(gfx11 助记符)**全部 `instruction not supported`**。
+- ⇒ load 与 store 共用 vmcnt,**无法"只等 load 不等 store"**;把 store drip 进主循环必被 vmcnt 串行化。这是"store 藏在 load 后"整类死路的硬件根因(与本卡 §mxfp4 4-wave 胖形状 store 暴露一致)。methodology/05 §waitcnt 配套曾误写 gfx950 有分离计数,已修正。
+
+### ★ Shape A 是 latency/dependency-bound(不是 compute/feed/bank-bound)—— PMC 判据
+rocprofv3 派生指标(crsuse2-m2m-328,200 iter balanced,NT kernel):
+| 指标 | 值 | 读法 |
+|---|---|---|
+| MfmaUtil | **44-48%** | MFMA 单元空闲 ~55% → **非 compute-bound**,有大量 MFMA 产能可填 |
+| MemUnitStalled | **0.02-0.09%** | 内存管线几乎不 stall → **非 HBM/feed-bound** |
+| LDSBankConflict | **0-2%** | 可忽略 → swizzle 是红鲱鱼(铁律),别碰 |
+| VALUBusy | 11-13% | 低 → 非 VALU-bound |
+| MeanOccupancyPerActiveCU | ~2.0 waves/SIMD | = 8 waves/CU = **1 WG/CU** |
+- 资源:VGPR=120-128、SGPR=112、Scratch=**0**(无 spill)、LDS=**131-139KB/WG**。
+- **占用率被 LDS 锁死 1 WG/CU**(160KB ÷ 131KB = 1;VGPR 128 本可容 4 waves/SIMD,LDS 才是 binding)。第 2 个 WG 需 LDS≤80KB → 抬 occ 死路。
+- 综合:8-wave 协作**同一 tile lockstep** → 全部同时撞 epilog → cshuffle 串行链**完全暴露**;MFMA 空闲一半但内存不 stall = 在等依赖链(operand latency + epilog lgkmcnt)。
+- ⚠ **MemUnitBusy 在 gfx950 rocprofv3 1.1.0 不存在**(只有 MemUnitStalled);别请求,会 "Unable to find counter"。
+
+### 死路(勿重试)
+- ❌ **PT_NT_PFETCH prefetch-forward**(把下一 tile 的 g2s 提前到本 tile epilog 藏 store):真机 byte-exact 但**净负**(bal −0.78/skew −1.75/empty −1.65)。根因=fill(g2s)与 store 同占 **vmcnt** 无 overlap(见上 gfx950 统一 vmcnt)。已回滚干净。**暴露成本是 cshuffle 的 ds 串行链(lgkmcnt)不是 fill。**
+- ❌ store 藏在 load 后(任何 flavor):gfx950 统一 vmcnt,同上。
+
+### ✅ 已交付杠杆:monotonic group-carry(commit 4e15c6ce),增益 ∝ E/K
+- persistent 路径把 per-tile O(G) group-find scan 换成 LDS tiles-prefix-sum + forward-only carry(`PT_NT_CARRY=1`);ds_read 只在**真跨组边界**发生(摊 <1/tile),把 group-find 移出 feed-bound 的 tile 路径。
+- **before/after 自比(drift-immune)**:gpt-oss Shape A **+7.7~9.6%** / Shape B +2.0~2.8%(byte-exact SNR 69.4)。跨模型 **增益 ∝ E/K**:Kimi-K2 down **+107.84%**、DeepSeek-V3 down +78%、Qwen3-30B +47~55%;**Mixtral E=8 ≈0%**(专家太少,autotune 选同 config,mism=0 ratio~1.0 是合法而非碰撞)。→ 高-E MoE 的主优化。
+
+### ✅ 剩余活杠杆(目标 Shape A ×1.20 vs ASM,当前 ×1.10):epilog cshuffle lgkmcnt 链 与 下一 tile MFMA overlap
+- 天花板≈**+14.6%**(暴露的 epilog),能把 ×1.10 → ×1.26 越过目标。
+- 机制:cshuffle = `ds_write → s_waitcnt lgkmcnt(0) → ds_read → buffer_store`。lgkmcnt 链与 **MFMA 正交**(MFMA 既不占 vmcnt 也不占 lgkmcnt),且 PMC 证 MFMA 有 55% 空闲产能 + 内存不 stall → 把下一 tile 的 K-loop MFMA 灌进本 tile epilog 的 lgkmcnt 空窗理论可赢。**这与 PT_NT_PFETCH 死路机制不同**(那个藏的是 store 的 fill/vmcnt,这个藏的是 epilog 的 lgkmcnt-drain 到 MFMA)。
+- 难点:tile N+1 的 MFMA 需先做 prelude(g2s→barrier→s2r),g2s 又占 vmcnt 与 store 竞争(chicken-egg);且复用同一 accum VGPR + LDS。需软流水重构 persistent 循环。**未验证,edit→drift-immune A/B 定夺(铁律)**。
+- 现状代码坑:K-loop 里每个 MFMA 后有 `rocdl.s_barrier()`(4/iter,8-wave 全 WG 同步)为 LDS ping-pong 正确性;`_ibar()`(MFMA 前)可用 `sched_schedbar=True` 换成编译期 `sched_barrier(0)` 免运行时 sync。
+
+### 度量方法论:drift-immune before/after 版本 A/B(fp8 DVFS ~37% 漂移)
+- 提取优化前内核为独立模块:`git show <commit>~1:...gemm_fp8_grouped_kernel.py > _nt_base_kernel.py`(绝对 import 保持,helper 未变即可跑)。
+- 同进程 import 两个 public entry(new/old),position-balanced interleave(每 rep 交替 a,b/b,a)。
+- **碰撞守卫**:两版定义同名 flydsl 闭包,若 JIT 缓存串了 old 会跑 new 的 kernel → byte-identical **且** ratio~1.0。判据:`mism==0 且 ratio≠1.0` = 真 byte-exact 调度胜;`mism==0 且 ratio~1.0` = 疑碰撞(或 autotune 选同 config,如 Mixtral E8)。
+- 探针:`_probe_ver_nt.py`(Shape A/B)+`_probe_ver_models.py`(任意 E,K,N)+`_prof_nt_shapeA.py`(PMC 单核启动器)。高-E(E≥256)`num_cu=-1` autotune 合成探针 M_c=G×16384 会 OOM → `pick_numcu(E)=256` 走 persistent 跳过 autotune(见 [[project_grouped_fp8_autotune_oom_highE]])。
+
 ---
-来源: 08-att-root-cause.md, 04-ceiling-analysis.md, project_mxfp4_k28672_ceiling.md, project_mxfp4_epilogue_store.md, flydsl-fp8-gemm-results/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, mxfp8-grouped-gg-devloop/SKILL.md, 08-deadends.md, 05-dead-ends.md, 12-llama-aiter-baseline.md, mxfp8-8wave-devloop/SKILL.md, project_mxfp8_wholeloop_port.md, project_mxfp8_grouped_wgrad_wl.md
+来源: 08-att-root-cause.md, 04-ceiling-analysis.md, project_mxfp4_k28672_ceiling.md, project_mxfp4_epilogue_store.md, flydsl-fp8-gemm-results/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, mxfp8-grouped-gg-devloop/SKILL.md, 08-deadends.md, 05-dead-ends.md, 12-llama-aiter-baseline.md, mxfp8-8wave-devloop/SKILL.md, project_mxfp8_wholeloop_port.md, project_mxfp8_grouped_wgrad_wl.md, project_gptoss_nt_fwd_dgrad_opt(2026-07-28 PMC/gfx950-waitcnt 实测)

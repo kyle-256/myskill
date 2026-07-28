@@ -251,5 +251,12 @@ tar 在共享盘 → 任何节点 `docker load` 即用，省去重装 flydsl/重
 - meta-attn dq bench(flydsl 0.2.2)：**dq ~1096–1164 TF**(Sq 2048/4096/8192/16384，hw-exp 16x16x32，B4 Hq128 Hkv16 D64 Skv16384)，dkdv ~1100–1147 TF ✅
 - tensorwise csrc build(gfx950)进行中/可复现 ✅
 
+## 11. PMC / rocprofv3 工具链(crsuse2-m2m-328,gfx950,2026-07-28 实测)
+- `rocprofv3` **1.1.0** / rocm-7.2.1;`llvm-mc` = `/opt/rocm/lib/llvm/bin/llvm-mc`(AMD LLVM 22.0.0git,`-mcpu=gfx950 -show-encoding` 验指令是否 lower)。
+- 用法(文件队列 job 内):`rocprofv3 --pmc <派生指标...> -d <NFS路径> --output-format csv -- /opt/venv-syncv3/bin/python -u <script>`。`-d` **必须落 NFS `/workspace/code/...`**(容器 /tmp 会清)。
+- **派生指标可按名请求**:`MfmaUtil VALUBusy MemUnitStalled LDSBankConflict MeanOccupancyPerActiveCU`(自动多趟回放绕过 ≤3 raw-counter/组、err38)。CSV = `<out>/<host>/<pid>_counter_collection.csv`,每 dispatch 一行(含 `Kernel_Id/VGPR_Count/Accum_VGPR_Count/SGPR_Count/LDS_Block_Size/Scratch_Size/Counter_Name/Counter_Value`);量大(几 MB)→ 节点侧 python 聚合按 Kernel_Id 取均值,别整传回。
+- ⚠ **`MemUnitBusy` 在 gfx950 rocprofv3 1.1.0 不存在**(报 "Unable to find counter"),只有 `MemUnitStalled`。判 feed/latency-bound 用 MfmaUtil(空闲%)+ MemUnitStalled(≈0=非带宽限)+ LDSBankConflict 组合。
+- 判据速记:MfmaUtil 低 + MemUnitStalled≈0 + LDSBankConflict≈0 = **latency/dependency-bound**(等依赖链,非带宽非计算);此时 swizzle/加宽/prefetch 多为红鲱鱼(铁律),真杠杆是缩依赖链或跨-tile overlap。
+
 ---
-来源: 本 session (2026-07-20) 迁移 Crusoe 全程实测 + crusoe_user_guide 摘录。
+来源: 本 session (2026-07-20) 迁移 Crusoe 全程实测 + crusoe_user_guide 摘录;§11 = 2026-07-28 Shape A PMC 诊断实测。

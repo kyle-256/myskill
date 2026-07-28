@@ -22,6 +22,32 @@
 - 本地风格检查全过，但 PR CI 仍报**无关文件**失败=PR 分支落后 main，**不是 formatter 的锅**。
 - 解法：fetch `origin/main` → merge 进 PR 分支 → 重跑检查 → push merge commit。
 
+## ★★清理探针时误删产品文件：`git diff --name-only` 对未跟踪文件是盲的(2026-07-28 实测)
+
+清掉 campaign 留下的 32 个 `_` 探针时,我用"只保留那两个产品文件"的方式重建分支,
+**连带删掉了 `primus_turbo/flydsl/utils/attn_helper.py`(104 KB,自 89b31f29 就在库里,
+03357f91 扩充成现在这样)**,而 `flash_attn_fwd.py` 从它 import 27 个符号 ——
+分支推上去后任何人 clone 都是 ImportError,fwd 完全跑不起来。commit message 里也没提。
+
+**为什么三次自查都没发现**:删掉后它退化成工作区里的**未跟踪**文件,于是
+- `git status` 里混在 `?? _xxx.py` 一堆探针中间,看不出异样
+- **`git diff <base> HEAD --name-only` 只报已跟踪文件**,一个从未入库/刚被删的模块永远不出现
+- 本地跑测试全绿(工作区有那个文件),CI 之外根本发现不了
+
+**正确的自查方式**(删文件/重建分支后必做):
+```bash
+git archive HEAD | tar -x -C /tmp/chk && cd /tmp/chk   # 纯 git 内容,不含工作区
+# 静态解析每个入口文件的内部 import,逐个确认能在树里找到
+```
+只信从 `git archive` 解出来的树,别信工作区。另一个便宜的信号:**同目录的兄弟文件**
+(`gemm_helper.py` 在库、`attn_helper.py` 不在)——这种不对称几乎总是错误。
+
+**补救时的第二个坑**:我第一次补救直接 `git add` 了工作区那份,结果推上去的是
+campaign 改过的版本(比原版多 184 行未验证 knob:LPT_QORDER/PACKED_SOFTMAX/
+CLUSTER_NOP/COMPUTE_BARRIER/P_ANCHOR),而那个 campaign 在 r5 就中止、这些从没被 keep、
+两个 kernel 也都没引用。**恢复被误删的文件要从原 commit 取(`git show <sha>:<path>`),
+不是从工作区拿** —— 工作区那份可能早已被实验污染。
+
 ## 生产化部署坑：backend 签名一致/setdefault 遮蔽/out_fp16 cache key/比较基线错
 
 - **execute/can_handle 签名必须与 sibling backend 完全一致（含 preshuffled 形参）**：dispatcher 走 `execute(**kwargs)`，结构性要求所有 backend（HipBLASLt/AITER/FlyDSL）都声明同一套轴。FlyDSL 的 execute/can_handle 若少了 `preshuffled` 形参会崩；正确写法是声明该形参 + `del preshuffled`（收下但不用）。WHY：kwargs 广播给每个 backend，谁少一个轴谁就 TypeError。
