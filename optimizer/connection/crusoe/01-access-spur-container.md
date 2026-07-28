@@ -60,18 +60,58 @@ Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur
 
 ## ⭐4. 容器 dev box = 节点 dockerd + docker run ✅端到端验证
 
-### 4.-1 ★★怎么在节点上执行命令(2026-07-28 血泪,比 §4.0 更早会踩)
-三条路里**只有两条能用**:
+### 4.-1 ★★★怎么在节点上执行命令(2026-07-28 实测,比 §4.0 更早会踩)
 
-| 方式 | 可用? | 说明 |
+**结论先行:进不去已分配的节点。三条交互式通道全不通,必须用 §4.-2 的文件队列 agent。**
+
+| 方式 | 结果 | 说明 |
 |---|---|---|
-| `srun --overlap --jobid=<已有job> <cmd>` | ❌**陷阱** | rc=128 **且环境残缺** —— 在**确实有 GPU** 的节点上照样报 `/dev/kfd` 不存在、`docker: command not found`,极易误判成"申请到了 CPU 节点"。我为此白跑了好几轮、还一度去找根本不存在的"GPU 分区"。 |
-| 独立 `srun -A amd-primus -p amd-spur -t 5 --exclusive bash /shared_nfs/kyle/xx.sh` | ✅ | 一次性探测/短任务首选,环境完整 |
-| sbatch 脚本体里直接跑 setup + `sleep infinity` | ✅ | 长驻容器首选,见 §4b。**别先 sbatch 占节点再 srun 进去** |
+| node-to-node `ssh <node>` | ❌ | `Permission denied (publickey)`,即便 key 已在共享 home 的 `authorized_keys`、且在 compute 节点上 `ls ~/.ssh/authorized_keys` 可见(home 确为共享 NFS)。原因未查明 —— §1 那套配置法**不管用**。 |
+| `srun --overlap --jobid=<已有job>` | ❌ | **静默失败 rc=128,连错误信息都没有**(spur 对 slurm overlap 支持不完整)。更坑的是它偶尔会返回**残缺环境**下的输出:在**确实有 GPU** 的节点上报 `/dev/kfd` 不存在、`docker: command not found` —— 我因此误判"申请到了 CPU 节点",还去找根本不存在的"GPU 分区"。 |
+| `srun -w <已被占节点>` | ❌ | 节点被 `--exclusive` 独占,新 job 只能 `Pending`,永远等不到。`--oversubscribe` 参数 spur 不认。 |
+| 独立 `srun -A amd-primus -p amd-spur -t 5 bash /shared_nfs/kyle/xx.sh` | ✅ | **只适合一次性探测** —— 它会**新分配一台节点**,不是你已有 job 的那台。别拿它去操作已有容器。 |
+| **文件队列 agent(§4.-2)** | ✅✅ | **唯一能持续驱动已有节点/容器的方式。** |
 
-- ★**node-to-node ssh 实测不通**(`Permission denied (publickey)`),即便 key 已在共享 home 的 `authorized_keys`、
-  且在 compute 节点上 `ls ~/.ssh/authorized_keys` 可见(home 确为共享 NFS)。原因未查明 —— §1 那套 node-ssh
-  配置法要打折看,**别依赖它,用上表的 srun/sbatch 代替**。
+⚠ 别在这三条死路上反复试 —— 已经有两个 session 分别在 node-ssh 和 srun --overlap 上耗掉大量轮次,
+其中一个还得出了"srun --overlap 死路 → node-ssh 是唯一正道"的**错误结论**(两条都不通)。
+
+### 4.-2 ★★文件队列 agent = 唯一可用的持续通道(2026-07-28 端到端验证)
+思路:节点上常驻一个轮询循环,从 NFS 读 `.job` 脚本执行、结果写回。login 侧只需 scp 文件。
+
+**`/shared_nfs/kyle/node_agent.sh`**(sbatch 脚本体里直接 `bash` 它,不要 `sleep infinity`):
+```bash
+Q=/shared_nfs/kyle/q; mkdir -p "$Q"
+echo "[agent] $(hostname) starting $(date)" >> "$Q/agent.log"
+# 1) 起容器(已存在则复用 —— 换 job 重跑时不会重复 docker load)
+if ! docker ps --format '{{.Names}}' | grep -qx gpt-oss-docker; then
+  docker images | grep -q gpt-oss-docker || \
+    docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar
+  docker rm -f gpt-oss-docker 2>/dev/null
+  docker run -d --name=gpt-oss-docker --network=host --ipc=host \
+    --device=/dev/kfd --device=/dev/dri --group-add video \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v /shared_nfs/kyle:/workspace/code \
+    gpt-oss-docker:kyle-20260720 sleep infinity
+  sleep 5
+fi
+echo "[agent] container up: $(docker ps --format '{{.Names}}' | tr '\n' ' ')" >> "$Q/agent.log"
+# 2) 命令队列:*.job -> 执行 -> *.out + *.rc,原文件改名 *.done
+while true; do
+  for f in "$Q"/*.job; do
+    [ -e "$f" ] || continue
+    b="${f%.job}"; bash "$f" > "$b.out" 2>&1; echo $? > "$b.rc"; mv "$f" "$b.done"
+  done
+  sleep 3
+done
+```
+**用法**(从本地/login 侧):
+```bash
+scp ... mytask.job xianzhao@<login>:/shared_nfs/kyle/q/mytask.job   # 投递
+sleep 5 && RSH 'cat /shared_nfs/kyle/q/mytask.out; cat /shared_nfs/kyle/q/mytask.rc'  # 取结果
+```
+`.job` 内容就是普通 shell,里面爱怎么 `docker exec gpt-oss-docker bash -lc '...'` 都行。
+✅ 实测:投递后 3 秒内执行,返回 `crsuse2-m2m-328 / MI355X / torch 2.10.0 gpus 8 / rc=0`。
+★ 好处:换节点/重启 job 只需重投 sbatch,队列目录在 NFS 上跨节点存活;容器复用不重复 load。
 - ★★**多层引号地狱**:本地 bash → ssh → csh → `bash -lc` → srun → bash,内联命令里的 `"` `$` `|` 被层层吃掉。
   实测:`head -8` 被当成选项报错、`grep -ciE "kfd|dri"` 被拆成两条命令、`awk "{print \$1}"` 直接语法错、
   `sinfo -o "%20P %6a"` 格式串整个消失。**一律把命令写成脚本 scp 到 `/shared_nfs/kyle/`,远端只执行文件名。**
