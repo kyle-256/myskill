@@ -2,8 +2,14 @@
 
 > 类别: 连接 · 主题标签: crusoe, spur, slurm, docker, dockerd, sbatch, srun, account, rocm-primus, flydsl, venv, ssh, gpt-oss, bench
 > 状态: 2026-07-20 首次搭建，端到端跑通(容器起 + torch 2.10/8GPU + flydsl 0.2.2 + dq bench 1100TF + turbo csrc build)。2026-07-22 复用保存的 tar `docker load` 直接起(§4b 一条龙,3-4min,免重装 flydsl)再次实测通。✅=已实测。
-> **当前活节点(2026-07-28): `crsuse2-m2m-328`(job 3150,7天walltime),容器 gpt-oss-docker 已起、MI355X 已验证。** 节点名每次分配都变,跑前先 `squeue -u xianzhao` + 确认活死(§4.0)。
-> 历史:`crsuse2-m2m-289`(job 23379,2026-07-22,meta-attn bwd 20-config 在此跑通)、`301`(job 22667)已 NODE_FAIL。
+> **★怎么找到自己当前的活节点**(节点名每次分配都变,别记死值):
+> ```bash
+> RSH 'squeue -u xianzhao'          # 拿 JOBID + NODELIST;ST 必须是 R
+> RSH 'squeue -j <JOBID>'           # 返回空 = job 已终止(别信上一条的 R,它滞后~2min,见 §4.0)
+> RSH 'srun --overlap --jobid=<JOBID> --pty true'   # ❌ 别用这个探活,见 §4.-1
+> RSH 'srun -A amd-primus -p amd-spur -t 2 bash /shared_nfs/kyle/probe_node.sh'  # ✅ 探活/探 GPU
+> ```
+> 没有活 job 就按 §0 第 3 步重新 sbatch 一个。**只认自己的 job** —— `squeue -u xianzhao` 里别人的节点不要碰。
 
 > **🚨 2026-07-28 更正:跳板机挂了,chi 全线不可达 —— 下面这条回退路线暂时无效。**
 > `149.28.124.225` **本身** SSH 超时,而 `sync/.ssh-chi.sh` 是靠 ProxyCommand 经它中转的,
