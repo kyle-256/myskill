@@ -2,6 +2,8 @@
 
 > 类别: 连接 · 主题标签: docker-exec, HIP_VISIBLE_DEVICES, flydsl-cache, venv, venv隔离, PEP660-editable, checkout映射
 
+> ★★ syncv3(wgrad skew)三-repo/三-venv 环境 + `source activate` 串环境血泪坑 → 见 **04-syncv3-env-pythonpath.md**。规程一句话:**直接 `/opt/venv-<x>/bin/python`,严禁 source activate,跑前先 `import primus_turbo;print(__file__)` 验证 repo**。
+
 ## 远端容器内跑法:docker exec + HIP_VISIBLE_DEVICES
 
 - **通用调用格式**:`./.ssh-chi.sh root@chiXXXX "docker exec -e HIP_VISIBLE_DEVICES=$G mlperf_gptoss bash -lc '...'"`。跳板脚本 `.ssh-chi.sh` 进节点 → `docker exec` 进容器 `mlperf_gptoss` → `bash -lc` 跑命令。

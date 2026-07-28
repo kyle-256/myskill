@@ -2,17 +2,33 @@
 
 > 类别: 连接 · 主题标签: crusoe, spur, slurm, docker, dockerd, sbatch, srun, account, rocm-primus, flydsl, venv, ssh, gpt-oss, bench
 > 状态: 2026-07-20 首次搭建，端到端跑通(容器起 + torch 2.10/8GPU + flydsl 0.2.2 + dq bench 1100TF + turbo csrc build)。2026-07-22 复用保存的 tar `docker load` 直接起(§4b 一条龙,3-4min,免重装 flydsl)再次实测通。✅=已实测。
-> **当前活节点(2026-07-22): `crsuse2-m2m-289`(job 23379,7天walltime),容器 gpt-oss-docker,meta-attn bwd 全 20-config 验收在此跑通。** 前一节点 `crsuse2-m2m-301`(job 22667)已 06:35 NODE_FAIL 挂掉(见 §9 坑:squeue R 状态滞后)。节点名每次分配都变,跑前先确认活死(§4.0)。
+> **当前活节点(2026-07-28): `crsuse2-m2m-328`(job 3150,7天walltime),容器 gpt-oss-docker 已起、MI355X 已验证。** 节点名每次分配都变,跑前先 `squeue -u xianzhao` + 确认活死(§4.0)。
+> 历史:`crsuse2-m2m-289`(job 23379,2026-07-22,meta-attn bwd 20-config 在此跑通)、`301`(job 22667)已 NODE_FAIL。
 
-> **⚠️ 2026-07-23 回退提示**：crusoe spur 常排队(sbatch PENDING 卡数分钟)。急用 GPU 时**优先回 chi2774**(经跳板机 `root@149.28.124.225` + `sync/.ssh-chi.sh`,容器 `mlperf_gptoss` 长期 Up,GPU4-7 干净,meta-attn 分支 Primus-Turbo 在容器 `/workspace/code/Primus-Turbo`)。详见 [[../../../../.claude/memory/project_crusoe_env]] 顶部 + [[../../../../.claude/memory/project_chi2811_sync]]。文件传输走 base64→容器 `/root`(见 memory,`docker cp /dev/stdin`/scp-to-NFS/`docker exec -i` 都挂)。
+> **🚨 2026-07-28 更正:跳板机挂了,chi 全线不可达 —— 下面这条回退路线暂时无效。**
+> `149.28.124.225` **本身** SSH 超时,而 `sync/.ssh-chi.sh` 是靠 ProxyCommand 经它中转的,
+> 所以 **chi2798 / chi2774 / chi2811 全部连不上**。症状是 `Connection timed out during banner exchange`,
+> 看着像节点故障、实为跳板故障 —— 我据此误判"chi2798 节点挂了",让一个 campaign 空等 3.5 小时。
+> ★**诊断顺序:先单独试 `ssh root@149.28.124.225`,再怀疑节点。**
+> ~~⚠️ 2026-07-23 回退提示:crusoe spur 常排队,急用 GPU 时优先回 chi2774~~(跳板恢复后才重新适用):
+> chi2774 经跳板 + `sync/.ssh-chi.sh`,容器 `mlperf_gptoss` 长期 Up,GPU4-7 干净,
+> meta-attn 分支 Primus-Turbo 在容器 `/workspace/code/Primus-Turbo`。
+> 详见 [[../../../../.claude/memory/project_crusoe_env]] + [[../../../../.claude/memory/project_chi2811_sync]]。
+> chi 侧文件传输走 base64→容器 `/root`(`docker cp /dev/stdin`/scp-to-NFS/`docker exec -i` 都挂)。
 
 ## 0. TL;DR（一条龙）
 Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur 的 --container-image(那条死路)，用节点自带的 dockerd**。流程：
 1. login: `ssh -i .ssh_laptop/id_ed25519 xianzhao@crs-m2m-cpu-spur-login.crusoe.amd.com`（csh！命令包 `bash -lc`）
 2. 账号关联一次：`spur accounts -i add user name=xianzhao account=amd-primus`
-3. `sbatch ... --exclusive --wrap="sleep infinity"` 占一个裸节点(**不带** container flag)→ `squeue -u $USER` 拿节点 N
-4. `ssh N`(node-ssh，key 已在共享 home) → **首选:从保存的 tar 直接起**(flydsl 0.2.2/egg-fix/双 venv 全烤进镜像,免重装):`docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar`(24G,~3-4min,**后台 nbg 跑**)→ `docker run -d --name=gpt-oss-docker ... -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260720 sleep infinity`。**兜底**(无 tar):`docker pull rocm/primus:v26.3` + §6 重装 flydsl。
-5. `docker exec gpt-oss-docker bash -lc '...'` 干活。coding base = `/shared_nfs/kyle`(=容器内 `/workspace/code`)。⚡ **一条龙脚本见 §4b**。
+3. ★**sbatch 脚本体里直接跑 setup + `sleep infinity`**(**不带** container flag),一步到位 —— **别** `--wrap="sleep infinity"` 占完节点再想办法进去,那条路会撞上 §4.-1 的 `srun --overlap` 陷阱、而 node-ssh 又不通。
+   ```bash
+   #SBATCH -A amd-primus -p amd-spur --qos=amd-primus-qos --exclusive -t 7-00:00:00
+   #SBATCH -o /shared_nfs/kyle/kyle.out
+   bash /shared_nfs/kyle/node_setup.sh
+   sleep infinity
+   ```
+4. `node_setup.sh` 里 **从保存的 tar 直接起**(flydsl 0.2.2/egg-fix/双 venv 全烤进镜像,免重装):`docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar`(25G,~3min)→ `docker run -d --name=gpt-oss-docker --network=host --ipc=host --device=/dev/kfd --device=/dev/dri --group-add video -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260720 sleep infinity`。进度看 sbatch 的 `-o` 输出文件。**兜底**(无 tar):`docker pull rocm/primus:v26.3` + §6 重装 flydsl。
+5. 干活:短命令用独立 `srun ... bash /shared_nfs/kyle/xx.sh`(见 §4.-1),容器内用 `docker exec gpt-oss-docker bash -lc '...'`。coding base = `/shared_nfs/kyle`(=容器内 `/workspace/code`)。⚠ 那里目前**只有 `meta-attn`,没有 `Primus-Turbo`** —— 要跑 turbo 得先把整个仓(**含 `.git`**)传过去。⚡ 一条龙脚本见 §4b。
 
 ## 1. 登录 ✅
 - host `xianzhao@crs-m2m-cpu-spur-login.crusoe.amd.com`；key **`/workspace/code/.ssh_laptop/id_ed25519`**(pub=`xianzhao@amd.com`)。首次把该 pub 加进 login `~/.ssh/authorized_keys`(共享 NFS home，一次全集群生效)：`echo 'ssh-ed25519 AAAA... xianzhao@amd.com' >> ~/.ssh/authorized_keys`。
@@ -37,6 +53,31 @@ Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur
 - 负载：`sinfo -p amd-spur`(常 100+ idle)。
 
 ## ⭐4. 容器 dev box = 节点 dockerd + docker run ✅端到端验证
+
+### 4.-1 ★★怎么在节点上执行命令(2026-07-28 血泪,比 §4.0 更早会踩)
+三条路里**只有两条能用**:
+
+| 方式 | 可用? | 说明 |
+|---|---|---|
+| `srun --overlap --jobid=<已有job> <cmd>` | ❌**陷阱** | rc=128 **且环境残缺** —— 在**确实有 GPU** 的节点上照样报 `/dev/kfd` 不存在、`docker: command not found`,极易误判成"申请到了 CPU 节点"。我为此白跑了好几轮、还一度去找根本不存在的"GPU 分区"。 |
+| 独立 `srun -A amd-primus -p amd-spur -t 5 --exclusive bash /shared_nfs/kyle/xx.sh` | ✅ | 一次性探测/短任务首选,环境完整 |
+| sbatch 脚本体里直接跑 setup + `sleep infinity` | ✅ | 长驻容器首选,见 §4b。**别先 sbatch 占节点再 srun 进去** |
+
+- ★**node-to-node ssh 实测不通**(`Permission denied (publickey)`),即便 key 已在共享 home 的 `authorized_keys`、
+  且在 compute 节点上 `ls ~/.ssh/authorized_keys` 可见(home 确为共享 NFS)。原因未查明 —— §1 那套 node-ssh
+  配置法要打折看,**别依赖它,用上表的 srun/sbatch 代替**。
+- ★★**多层引号地狱**:本地 bash → ssh → csh → `bash -lc` → srun → bash,内联命令里的 `"` `$` `|` 被层层吃掉。
+  实测:`head -8` 被当成选项报错、`grep -ciE "kfd|dri"` 被拆成两条命令、`awk "{print \$1}"` 直接语法错、
+  `sinfo -o "%20P %6a"` 格式串整个消失。**一律把命令写成脚本 scp 到 `/shared_nfs/kyle/`,远端只执行文件名。**
+- **分区认知**:全集群**只有 `amd-spur` 一个分区**(254 节点),GPU 节点就在里面。login 主机名里的 `cpu`
+  (`crs-m2m-cpu-spur-login`)只表示 login 机自身是 CPU 机,**不代表分区没 GPU** —— 别被它误导去找"GPU 分区"。
+- 探测脚本模板(放 `/shared_nfs/kyle/probe_node.sh`):
+  ```bash
+  echo "HOST=$(hostname)"; echo "KFD=$(ls /dev/kfd 2>/dev/null && echo yes || echo no)"
+  echo "DRI=$(ls /dev/dri 2>/dev/null | wc -l)"; echo "DOCKER=$(command -v docker || echo none)"
+  ```
+  健康 GPU 节点应返回 `KFD=/dev/kfd yes` / `DRI=129` / `DOCKER=/usr/bin/docker`。
+
 ### 4.0 跑前先确认节点活死(2026-07-22 血泪)⚠️
 `squeue` 的 `R` 状态**会滞后 ~2min** —— 节点 NODE_FAIL 后 squeue 快照仍可能显 `R`(301 实测:06:35:06 NODE_FAIL,而 06:33 快照还是 `R 4:56:34`,信了它会拿死节点跑/或以为数据有效)。**别信 squeue 的 R**:
 - 确认死活:`squeue -j <JOBID>`(返回空=job 已终止)+ `spur accounts`/账务库看 `NODE_FAIL`;或直接 `bash ~/dx.sh <NODE> <脚本里第一行 hostname>` 看是否连得上并落在预期节点。
@@ -135,7 +176,8 @@ tar 在共享盘 → 任何节点 `docker load` 即用，省去重装 flydsl/重
 - **finder 归属**：`pip install -e .` 会把 editable finder(`__editable___primus_turbo_..._finder.py` 的 MAPPING)写进"当前 python 的 venv"。用错 python(venv-tw/bin/pip=老python)会写进 /opt/venv 污染 mxfp4。修法：直接 sed 两 venv finder 的 MAPPING 路径改回各指各 repo(无需重 build)。
 
 ## 7. 存储 ✅
-- `/shared_nfs`(50T 集群共享)→ coding base `/shared_nfs/kyle`(和 /shared_nfs/<user> 放一起)；容器里挂到 `/workspace/code`。
+- `/shared_nfs`(50T 集群共享)→ coding base `/shared_nfs/kyle`(和 /shared_nfs/<user> 放一起)；容器里挂到 `/workspace/code`。**跨节点存活**,换节点只需重 `docker load + run`,代码/harness/镜像 tar 都不用重传。
+  ⚠**2026-07-28 实测那里只有 `meta-attn` 和 `images/`,没有 `Primus-Turbo`** —— 要跑 turbo 相关(如 fwd campaign)必须先把整个仓传过去,**含 `.git`**(campaign 要做 git 操作)。
 - `/home/xianzhao`(5T NFS)→ ssh key/脚本/日志，别放大模型。
 - `/mnt/m2m_nobackup`(compute 本地)→ 大模型 + docker 存储；`/mnt/m2m_nobackup/huggingface/` 有预置。
 
