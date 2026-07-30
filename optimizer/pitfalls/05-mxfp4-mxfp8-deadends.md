@@ -476,6 +476,15 @@ logical B/A 恒为 1/gm）；而 band 的 A 足迹 = `gm × BLOCK_M × K` 字节
 - ⇒ 下一步不是继续调门限，而是**让 cfg cache key 带上一个粗粒度的分布描述子**（如 max_group_tiles/mean_group_tiles 分桶），
   好让同一 shape 的 balanced 与 skew 走不同的 band。⚠ 该描述子必须**在 device 上算**——round 3 已定死"不得引入 host D2H 检查"。
 
+### ★★ 收官轮 L2-miss 分维归因:证伪「scale-thrash」,超额 miss 是**算子回取**,下一刀在 LDS→VGPR 不在 DRAM 字节(2026-07-30 PMC 实测)
+本核 NT 上 L2 miss 比 tw 高 +28%(55.66M vs 42.04M ≈ +387 MB/call)。此前假说「两条 E8M0 scale 流拿不到 L2 复用、是超额 miss 主因」被**直接测量证伪**:
+- **subtractive pin 探针(只塌某流的 L2 足迹、指令流/grid/请求数逐条不变,ΔTCC_MISS 即该流份额)**,`dgrad gate_up heavy`、7 pin 模式 × 2 counter 组:A-scale **+0.076%** / B-scale **−0.012%** / A+B scale **−0.338%(=超额 miss 的 1.4%)** / A-data **−0.214%(0.9%)** / B-data **−0.401%**。**四条地址流合计 ≤4%** ⇒ 13.57M 超额 miss **不由任何单条流的足迹拥有**;scale 每 band 只要 A 368 KB + B 553 KB,完全驻留得下,根本不 miss。
+- 佐证:把两条 scale 流**整体钉成 cache-resident**(P1)拿 **+1.43% 上界**,但拆开看只 ~1/3 是 cache 足迹(discriminator「足迹塌掉但活值全留」+0.54%),另 **~0.89% 是地址算术塌成常量**(死码/live-range 缓解,不是 L2)。非临时提示 scale(H1)反 **−1.69%**——scale 本就享 L2 复用,提前 evict 更亏。
+- ❌ **别再做 scale 的 tile-major / cache-line 共置重排**:实测定价 **~0.002% wall**(scale 占 387 MB 超额的 ≤1.4%,而 387 MB 全消掉本身只值 ≤0.18% wall——见下方能量记账),在 0.25% gm 噪声地板以下两个数量级,**未落盘**。
+- ❌ **别再在本核上削 DRAM 字节**:超额 miss 全走**本地 HBM**(`TCC_EA0_RDREQ` 恒等 `TCC_EA0_RDREQ_DRAM`、`TCC_EA0_RDREQ_32B=0` ⇒ 无 MALL、**无 32B 半行浪费**,没有 strided/部分行可削);单次调用能量 = 1400 W × 1.6014 ms = **2.242 J**,DRAM 只占 **0.8~1.6%**。⚠ 顺带标定:本核 `TCP_TCC_READ_REQ` 是 **128 B 粒度**(125.3 B/req)、写是 **32 B sector**(31.9 B/req)——与 pitfalls/13 那个 64 B 的形状不同,引流量时按核校准。
+- ✅ **下一刀 = LDS→VGPR 读放大(满额兑现的能量类)**:实测 **0.504 pJ/FLOP vs mxfp8 MFMA 峰值 ~0.28 ⇒ 只 55% 能效**,缺的那一半在 LDS→VGPR 通路——每 call 6144 tile × 45 iter × 64 KB = **17.7 GB 进 LDS**,按 wave_n×4 / wave_m×2 **读出 35~70 GB**(~1~2 pJ/B = 35~140 mJ = 能量的 **1.6~6%,是整条 DRAM 超额杠杆的 10~30 倍**)。⇒ N10(ISA region 分段量那 254 个 VGPR 的构成、把非累加器活值压到 ≤128)→ N1(256×512/1024 线程,每 LDS 字节喂的 MFMA 翻倍),是唯一同时减读放大与 tile 数的杠杆。
+- ⚠️ **`xcd`/`gn` 轴在 min shape 上已惰性(≠上方 `gm` 轴——`gm` 是已 ship 的 K-band lever,min 上仍值 +1.1%)**:N4 三栏尺子(功耗全钉 1400 W)量 xcd 1/4/8 × gn 0/2/4 全落 ±0.15% wall ⇒ wall=energy/1400 W,这两轴不改 energy。逐条判负:H4 全局 xcd=8 **−1.6%**(miss −20.4% 但 cyc +5.3%)、H5 按 band 宽分档 xcd=8 净负(`*_down heavy` −3%)、xcd=1@NT cyc −0.43% 但 wall 中性、gn>0@K=5760 惰性(K=2944 上 gn 才是 −1.6~7.2% 的活 lever,见上方 2D band 段)。
+
 ### ⚠️ 静态 ISA 直方图会被「边界象限变体复制」灌水，只有 steady-state 窗口可比
 - 现象：mxfp8 wgrad 的 "mainloop" 段 7581 条指令 / 1152 MFMA = **6.6 条/MFMA**，NT 只有 4546 / 1104 = **4.1 条/MFMA**，看上去 wgrad 主环多背 60% 的地址算术。
 - 真相：wgrad 有 **4 个边界象限变体**（M+N 两侧）、NT 有 2 个（半-N），tile 体在 ISA 里被复制了 4 份/2 份，而**每次执行只走其中一份**。取 `mfma[8..40]` 的 steady-state 窗口后：wgrad 106 条/33 MFMA = 3.2，NT 111/33 = 3.4，**两者其实相当**。

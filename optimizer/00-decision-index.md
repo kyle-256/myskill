@@ -47,6 +47,8 @@
 | whole-loop(WL)移植进生产 | ❌用户裁定 | 2500 行 bare-asm 不可维护;occ=1 结构上限,per-K 才是生产路径 | pitfalls/05 |
 | 优化 quant kernel 撬 e2e(grouped) | ❌实测DEAD | quant 绝对占 35-46% 但 e2e 中性;缺口在 gemm(occ=1 上限) | pitfalls/05 |
 | e8m0 scale 广播前 cast Uint8 | ❌静默错 | 高位损坏 match~9% 垃圾;位运算全程 Int32 | pitfalls/05 |
+| scale 流 tile-major/cache-line 共置重排 | ❌实测DEAD | subtractive-pin 证伪「scale-thrash」:四条地址流合计 ≤4% 超额 miss,scale 本就驻留;定价 ~0.002% wall | pitfalls/05 |
+| 在功耗墙(≥99% TBP)核上继续削 DRAM 字节 | ❌实测DEAD | 387 MB 超额全消掉只值 ≤0.18% wall(DRAM 占能量 0.8~1.6%);★**下一刀=LDS→VGPR 读放大**(55% 能效,缺口 10~30× 于 DRAM 杠杆) | pitfalls/05 · methodology/12 |
 | atomic 融合 reduce(dense split-K) | ❌实测DEAD | 同地址 HBM atomic 争用串行;split+reduce 是答案 | pitfalls/05 |
 
 ## D. attention(fwd + bwd)—— 优化顺序 playbook 见 methodology/15;实测 win/dead 见 pitfalls/12(dsv4)+13(hd64 dense)
@@ -133,6 +135,7 @@
 | 把 `M_per_group` 烘成编译期常量 / `assert M%BLOCK==0` | ❌实测DEAD | MoE 变长分布,静态划分崩 | pitfalls/06 |
 | `BLOCK_M=128`(grouped/dense config sweep) | ❌实测DEAD | grid 写死 /256 → 少启动块假象,真实 1.55× 慢 | pitfalls/05,06 |
 | per-shape `num_xcd` / 旧 `m_total<=2048` gate | ❌实测DEAD | overfitting 噪声 / 误判高-G MoE 走 masked | pitfalls/06 |
+| grouped/MoE 核用 `num_xcd>1` 连续块 remap(照抄 dense) | ❌实测DEAD·skew | 连续 tile 整段绑一个 XCD ⇒ hot expert 压到单 XCD;wgrad band-cyclic+xcd=8 是 skew 崩溃主因(修=group-major+xcd=1,+26%/min 0.474→1.005)、NT xcd=8 同源 down-heavy −3% | methodology/08 · methodology/05 |
 | `set_*_backend(BackendType.FLYDSL)` | ❌DEAD | FLYDSL 未注册进 BackendType | pitfalls/06 |
 
 ## F. 正确性 / 数据构造(先读,否则静默错)
