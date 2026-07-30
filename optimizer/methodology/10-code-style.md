@@ -134,3 +134,29 @@ git commit
 
 ---
 来源: remote-sync/SKILL.md, pr-merge-gate/SKILL.md, CLAUDE.md, format-code/SKILL.md, SKILL.md, develop-feature/SKILL.md
+
+
+## ★ 批量清注释必须用「AST 签名不变」守门(2026-07-30 实测)
+
+一次交付前清理要改 145 处注释。按 review 给的 snippet 直接做字符串替换,**10 条会静默改到代码** ——
+两条当场炸出 SyntaxError(删掉了 `while ...:` 那一行、删断了模块 docstring),另外 8 条不报错但已改坏语义。
+根因:注释与代码同行(行尾注释)、或 snippet 的边界正好切进 docstring/语句。
+
+**守门器**(每条编辑单独校验,不过就丢弃该条):
+```python
+def sig(src):                      # 剥掉所有 docstring;注释本就不进 AST
+    t = ast.parse(src)
+    for n in ast.walk(t):
+        if isinstance(n,(ast.Module,ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
+            b = getattr(n,"body",None)
+            if b and isinstance(b[0],ast.Expr) and isinstance(b[0].value,ast.Constant) \
+               and isinstance(b[0].value.value,str): n.body = b[1:]
+    return ast.dump(t)
+# cand = 应用一条编辑后的源码
+if sig(cand) != sig_before: skip()   # ★ 动到代码 → 拒绝这条
+```
+把「清理前」的签名固定住,所有注释编辑做完再断言一次,等于给整批改动上了**代码零变更**的形式保证。
+配合最后一次同卡交织 A/B(实测逐轮 +0.12/0.00/−0.07%)就能确认 codegen 也中性。
+
+★ 另外两条:①改 docstring 要**从 AST 取 col_offset 自动补缩进**,手写缩进必错(嵌套 6 层的 docstring 是 16 空格);
+②删函数/整块用 **AST 的 `lineno/end_lineno`**,别用 review 给的行号 —— 前面每删一处,后面的行号就全变了。

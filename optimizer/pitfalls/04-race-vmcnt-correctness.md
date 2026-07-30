@@ -11,6 +11,11 @@
 - **多池 partial-drain 的 vmcnt 必须按所有 3buf 池的写总数 `sum = nsa + nsb` 计算**，不能只算第一个池。`_n_outstanding = nsb` 是 bug：2 池都 3buf 时实际延迟 `2×nsb = 8` 条写，但只 drain 4 条 → 留未 accounted 的 in-flight 写 → **1/30000 race**。
   - 修法靠 emit 顺序 + 正确 vmcnt(sum)：把 distance-2 安全的 B 池排**最后** emit，`vmcnt(sum)` 恰好留 B 池在飞、把 distance-1 的 A 池**全 drain**。
 
+- ★★ **距离够 ≠ tail 可以随便放长：在飞 tail 长度本身是安全旋钮**（2026-07 mxfp8 grouped NT 实测）。把 A1 池从距离 1 改成距离 2（每条 g2s 有整整一个 K-iter 落地余量）后，按**发射顺序**推算 `vmcnt(2*(NA+NB))=8`（= 留整整一迭代的 8 条在飞）是充分的 —— 但实测 **race**：N=2944 与 N=5632 上重复跑的输出有 134~389 行/131072 不一致、maxabs 16.0。把 tail 收回**距离-1 流水原本的值** `vmcnt(2*NA+NB)=6`（= 一迭代的发射数减去最早那一组）后，4 个 shape × 4 次重复**全部逐字节一致**，且距离-2 的性能收益仍在。
+  - 根因 = 本卡下方已记录的 **gfx950 vmcnt 乱序退役**：`vmcnt(N)` 只保证"在飞 ≤N"，**不保证退役的是最老的 N 条**。所以"按发射顺序算够"是不充分条件；tail 越长，被需要的那条写还在飞的概率越高。
+  - **可操作规则**：tail ≤ 一次迭代的 g2s 发射数 **减去最早发射的那一组**；要放宽必须实测重复一致性，别靠推理。
+  - ★ **bench 的 det 门抓不到**：窄 shape（本例 g=2/mg=1024/N=256 对齐）上 `det=True` 照常通过、`ok=true` 照常给分，只有**计时用的宽 shape**（N=2944/5632）重复对比才暴露 → 改 vmcnt/barrier 的轮次必须自带宽 shape 重复探针（同 pack=4 的 512 对齐坑，「确定性门 ≠ 正确性门」）。
+
 - **byte-exact 排除法必须组合所有省空间手段再算**：曾判"双池 3buf 放不下"而误否决双池路线。错在没把 **scalar store 省 C_lds（8704B）** + **`_CS=1024` 省 bank-pad（5120B）** 组合起来算。单独算每个都不够、组合才够；单独评估会**假阴性**关掉真路。凡涉及 LDS 容量卡点，先把所有省空间手段叠加后再判可行性。
 
 ### ❌ 别再试（HW-walled 死坑，partial-drain 相关）
@@ -26,6 +31,20 @@
 - **scratch_load（编译器 SGPR spill 回填）和 buffer_load_dwordx4...offen lds（LDS-direct GMEM→SMEM）都走 vmcnt，但两者之间 vmcnt 不保证 FIFO。**
 - 编译器对 spill 发的 `s_waitcnt vmcnt(N>0)` 不安全——scratch_load 可能还在飞，`v_readfirstlane` 读进 stale value → `s_mov_b32 m0` 用 stale m0 → 下一条 buffer_load_lds 写到错 LDS 地址 → SMEM 错位 → MFMA 污染 → bit 不一致。
 - **只在 SGPR pressure 触发 spill 时暴露**（无 spill 时不出现）。
+
+### ★★ 手写的 partial `vmcnt(N)` 在 spill≠0 时语义失效(2026-07-30 hd64 fwd 实测)
+
+上面那条是**顺序**问题(两类 load 之间 vmcnt 不保 FIFO);这条是**计数**问题,独立且更容易漏:
+scratch 的 load/store 与你的 DMA **共用同一个 vmcnt 计数器**,所以一旦 spill≠0,
+`vmcnt(1)` 就不再等于"还有 1 个 DMA 在飞",落后的一组会读到已被覆写的 K/V。
+
+- 踩证:一个改动把 spill 从 2 推到 22 dword,此后手写的 partial drain 全部错位;
+  把常数换成 `vmcnt(0)` 反而换出**完全不同**的失效签名,再把 DMA 往后挪则两组都坏 —— 三次都不是相位算错。
+- ⇒ **规程:凡是依赖 partial `vmcnt(N)` 的 kernel,`spill != 0` 时一律把 N 视为不可信;
+  先把 spill 压到 0,再谈"是不是相位错了"。** 反过来说,调这类常数前必须先看 ISA 的 spill 计数。
+- 相关但不同的一条:**以指令条数写死的 `vmcnt` 常量会随 CTA 波数失配** —— `NUM_DMA_K+NUM_DMA_V` 只在
+  某个 `dma_wave_reps` 下等于"一个 tile 的指令数",波数翻倍后同一常量会多放一个 tile 在飞。
+  签名是"输出全对、det=True、多形状全过",三个常规信号**全部放行**;改 CTA 波数后必须按 **tile** 而不是按指令数重算。
 
 ### race harness（如何复现/统计）
 - `repro_race_*.py`：`ref=kernel(inputs)` 后循环 `kernel` + `torch.testing.assert_close(out, ref, rtol=0, atol=0)` 严格 bit-exact 统计 races。

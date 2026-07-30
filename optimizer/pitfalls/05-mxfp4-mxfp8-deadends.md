@@ -158,6 +158,29 @@
 - 5 探针（无 g2s / 无 ds_read refill / 无两者 / 无 scale / WL_SC128）全 ≈ baseline 3053-3104 → 纯 MFMA-bound，去任何 memory 操作都不提速。
 - ❌ WL_SC128 dwordx4 2-K-pack scale 实现完成但 SNR -1.3（确定性索引 bug 未调），速度 3097 vs SC_VGPR-dwordx2 3099 完全中性 → 默认保留 **SC_VGPR dwordx2**（正确同速）。
 
+### ❌ 别再试（2026-07-29 实测，grouped mxfp8 NT 上第二次独立验证）：改 A/B-scale 的投递路径
+本卡上面两节（「scale_pack/opsel 生产不适用」「scale-128 dwordx4 无提速」）的结论在 **grouped** NT
+(fwd/dgrad) 上同样成立，且此前的 campaign 计划把它当成头号杠杆连发三轮——**先核对 ISA 再动手**：
+- ★ **前提本身是假的**：计划书写「ISA 里 `buffer_load_dword`(4B 窄) 111 条就是 `ScaleS2R` 的 A-scale
+  投递」。实测 `SA_TILES = BLOCK_M//64 = 4` ⇒ `ScaleS2R.load(vec_width=4)` **早就是
+  `buffer_load_dwordx4`**；`kernel_grouped_mxfp8_nt_1` 的**主循环里窄 load 数 = 0**，那 69 条全在
+  prologue 的 `_load_go` group-offset 扫描里（而 prologue 指令数已判负，见本卡下文 +0.07%）。
+  ⇒ 「把 A-scale 加宽成 dwordx4」这条指令**等于什么都不做**。**引用 ISA 计数前先按 region 分段**
+  （`methodology/03`），全 kernel 直方图会把 prologue 的税记到主循环头上。
+- 三个投递路径变体，drift-immune 14-config bench 全部落在噪声内（base gm 1.08492/1.08459 两次）：
+  | 变体 | gm | NT 八配置几何 |
+  |---|---|---|
+  | 预取距离 1 iter → 整个 pack-group（照搬 methodology/11 的 dense「大-K scale group 预取」）| 1.08433 | +0.17% |
+  | 三条 scale dword 摊到 pack-group 的三个 K-iter（每 iter 恒 9 条 VMEM，而非 8/8/8/11）| 1.08483 | +0.08% |
+- ★ **根因（新事实，解释了为什么预取距离没用）**：`wait_barrier` 每个 K-iter 收一次
+  `s_waitcnt vmcnt(_NB_DRAIN)`，而 **scale 的 `buffer_load` 到 VGPR 和 g2s 的 `buffer_load...lds`
+  共用同一个 vmcnt**。所以无论把 scale load 提前几个 iter 发，它都会被**本迭代的 drain 强制退役**
+  ⇒ scale 预取距离的**上限恒为 1 个 K-iter**，加大距离在 ISA 上不可表达。要真正拉长只能抬 drain 的
+  tail，而那正是 `pitfalls/04` 实测出 race 的动作 → **这条路封死，别再花轮次**。
+- regime 佐证：`fwd down balanced` 每 WG 每 K-iter 从 global 搬 64KB，全核有效读 ≈10.5 TB/s
+  （> HBM 峰值）⇒ 该核是 **L2/LLC 带宽 + 复用率**主导，不是 scale-load 延迟主导。下一批杠杆应指向
+  「减字节 / 提 L2 复用」，不是 scale 投递。
+
 ## MXFP8 whole-loop 移植整体死路：occ=1 结构天花板+vendored 严禁
 
 ### 硬约束：BK256 LDS 超容 → 只能 BK128
@@ -247,7 +270,99 @@
   - **BLOCK_M=128**：少启动块假象，真实 **1.55x 慢**（见上 §BLOCK_M=128 少启动块假象，完整机制+数字）。
   - **band-swizzle**：`group_n>0` / `gm=8` 略慢或崩 **1.5x**。
 - **preshuffle 只占 3.5%（15.5us / ~3.4 TB/s）非瓶颈**。
-- 唯一有效 lever 是**调度局部性（xcd/gm/gn），已被 autotune 吃掉**。
+- ~~唯一有效 lever 是调度局部性（xcd/gm/gn），已被 autotune 吃掉~~ → **⚠️ 已证伪，见下条**。
+
+### ⚠️ 勘误（2026-07-29 实测）：grouped MX fwd/dgrad 的真 lever 是 per-tile O(G) 索引解码，不是调度局部性
+- 上条「唯一有效 lever 是调度局部性」**不成立**。mxfp8 NT 核（`_build_grouped_mxfp8_nt_kernel`）每
+  tile 有两处 **O(G)=32** 的向量 group-find 扫描（入口 `total_tiles` + 每 tile 的组解码），实测是隐形大税：
+  | 指标 | O(G) 原状 | O(1) 探针 | tw NT 参考 |
+  |---|---|---|---|
+  | SQ_INSTS_VALU | 225.3M | **109.8M** | 138.1M（**反超参考**）|
+  | SQ_INSTS_VMEM | 41.7M | 32.2M | 19.9M |
+  | buffer_load（ISA/tile） | 307 | 213 | 228 |
+  | v_cmp + v_cndmask | 299 | 74 | ~0 |
+  | `private_seg_size` | **16 B（有 spill）** | **0** | 0 |
+  | s_barrier | 185 | 185（未动）| 123 |
+- 生产落地（单扫描 + SGPR 前缀单调比较 + `_tree_add_i32` log-G 归约 + 两张前缀停 LDS、per-tile 各一次
+  `ds_read`）实测 fwd/dgrad 八配置 **+1.3~5.4%**；subtractive 探针上界 +5.3~19.1%（**上界≠可达**）。
+- ★ 本卡 §grouped fp8-tensorwise NT 里的「✅ 已交付杠杆：monotonic group-carry（commit 4e15c6ce，+7.7~9.6%）」
+  就是同一修复的 tensorwise 版；**mxfp8 NT 长期没拿到它**。⇒ 通用规律：**MFMA 指令数与参考逐条相等时，
+  首要嫌疑是索引/解码开销**，不是调度旋钮。
+- ★ 补充定量（2026-07-29,drift-immune 交替 A/B）：在唯一的弱 shape(`down`)上把 `(gm,xcd,gn)` 共 **14 个 cfg**
+  测完,**没有一个**能在 balanced+skew 双点都赢 base 1.5%;`gn>0`(2D N-band)一律差 **1.6~7.2%**;`gm=8` 虽在
+  down 双点快 0.6~1.0%,但在 `fwd gate_up` 慢 **2.97%** → 改全局 base 净负,per-shape 硬编码 = 本卡判负的
+  overfit。⇒ **调度旋钮在该核已无可采纳增益,真杠杆是索引解码 / scale 投递 / 边界半区。别再扫。**
+- 配套坑（2026-07-29 实测）：① `BufferCopy128b`/dwordx4 加宽 `group_offs` 取数**净负 −1.4%**（每次物化
+  4 个 VGPR 只用 2 个）；② gfx950 每 wave ~102 SGPR，2×(G+1)=66 个活跃标量就溢出 → 前缀必须停 LDS；
+  ③ 别把 A-scale slab 前缀简化成 `m_start_pad>>6`（组起点 32 对齐而非 64 对齐时静默数值错，det 与
+  bench 正确性门都抓不到）。
+
+### ⚠️ 勘误（2026-07-29 实测）：grouped **wgrad** 的 `pack=4` 是真杠杆（+5~9%），但有隐式 512 对齐契约
+- 本卡 §scale_pack / opsel byte-pack 判负的是 **dense per-K 核**（sa/sb 已提前一拍预取，scale-tax≈0）。
+  **grouped 变长-K wgrad 不适用该结论**：其 scale load 没被藏住，`pack=1` 时 `SQ_INSTS_VMEM`/WG **3947**
+  vs tw 2944。改 `pack=4`（op_sel 选字节）实测 per-WG VMEM **3947→3387（−14.2%）**、总量 18.19M→15.61M
+  （tw 14.80M，基本追平）、MFMA/VALU 不变、SALU +19%（**独立标量端口，不计价**）→ wgrad 六配置
+  **+4.7~9.3%**，geomean +2.7%。教科书式「窄标量 load 换 SALU 解码」。
+- ★★ **契约雷区**：K 维打包默认要求每组收缩起点是 `pack×128=512` 的倍数；非对齐时 SNR 崩到
+  **4.09dB / −2.44dB**，而 **det=True 与 preshuffle=False==full 逐字节一致照样成立** → 这两个门抓不到
+  （**确定性门 ≠ 正确性门**）。真实 MoE 的 per-expert token 数不会 512 对齐。
+- ✅ 正解（已落地）：**每组从自己的收缩起点独立打包**，闭式基址 `kp0(ks0,g) = ks0//pack + g`、
+  行组步长 `k128p = k128//pack + G`（`+g/+G` 就是每组可能留下的那一个残缺 dword；由
+  `floor(a/p)+ceil(n/p) <= floor((a+n)/p)+1` 保证各组区域不重叠）。对齐负担全落在**不计时的**
+  preshuffle 里，主核只多一次整数加 —— 比写 `[G+1]` 基址表更省（计时区零额外 load）。
+  实测 16 个形态（含「128 对齐非 512」「单个奇起点」「空组首/中/尾」「G=32 ragged」×
+  {256 对齐 OUT_M, 半边界 OUT_M}）全部 **55.56~55.64dB**，且 `pack=1` 与 `pack=4` 输出**逐字节相同**。
+
+### ✅ 已交付杠杆（2026-07-29 实测）：输出边界半 tile 的象限跳过（wgrad M+N 侧、NT N 侧）
+- 适用判据（编译期）：`OUT % BLOCK != 0 and OUT % BLOCK <= BLOCK/2` → 末块的后半区**全是 padding**，
+  该 tile 的 acc01/acc10/acc11 象限 MFMA 与其 LDS 读是纯废功。gpt-oss 的 2944 / 5760 都是 `x.5×256`，
+  M 与 N 两侧同时命中。
+- 落地形态：把 tile 体包成取 `quads=(qm,qn)` 的闭包，用 `_readfirstlane_i32(block_m/n)` 做**标量
+  (wave-uniform) 分支**选变体（tw 的 `_HALF_BND` 同一惯用法）。★ **g2s / s_barrier / vmcnt 等待序列在
+  各变体间必须逐条相同** —— 只删 ds_read + MFMA，不碰同步，就完全避开 pitfalls/04 的 race 面。
+- 纸面 vs 实测（**上界≠可达**再一次）：wgrad down 象限数 529/576 → 省 8.16%，gate_up 1035/1104 → 6.25%；
+  **实测 wgrad 六配置 +1.3~4.1%**（down 侧 +3.6~4.1%、gate_up +1.3~3.1%）、geomean +1.27%，兑现率 ~50%
+  （省了 MFMA 但 barrier / g2s / LDS 往返照旧）。NT 只 N 侧（2.17~4.35% 纸面）→ min_speedup +1.9%。
+- 落地注意：被跳过的象限**照旧无条件 store**（保持零初始化，行/列全落在 `StoreC` 的 clamp 区外），
+  比按象限分支 store 更省事且不引入前端作用域坑（见 pitfalls/07 §scf.for 体抽取丢外层名字）。
+- ★ **续刀二（2026-07-29 实测）：空相位的 rendezvous 对也能跟着象限一起删,但只在 NT 核有收益**。
+  被跳过的象限留下的那对 pre/post-MFMA barrier 夹着一个**空相位**,跟着象限一起门掉(`if const_expr(_full)`
+  / `if qn == 2`)是安全的 —— 该象限在这个变体里根本不读 LDS,守 WAR 的是 c00 之后那个 barrier,且整个 WG
+  取同一变体。NT 半-N 体 8→5 barrier/K-iter:`fwd/dgrad down balanced` +1.0~1.5%、gm +0.13%(**保留**)。
+  同一手术搬到 wgrad(23/144 tile 命中 (1,1)/(1,2)/(2,1) 三个变体)**判负**:gm 1.0850 vs base 1.08492
+  (0.00%),wgrad 六配置几何 1.1370 vs 1.1393,`gate_up heavy` 1.320 vs 三次 base 的 1.342/1.347/1.353。
+  ⇒ **wgrad 的边界 tile 只有半/四分之一的 MFMA,本来就提前收工、不在关键路径上**;NT 是一 tile 一 WG、
+  半-N tile 占 down 的 1/12 且 feed-bound,才吃得到。**判据:先问被优化的 tile 在不在 makespan 上。**
+- ★ **续刀(2026-07-29 实测)：上面「vmcnt 序列必须逐条相同」是保守起手,不是终点**。半区的 g2s 也能删,
+  但**只在 NT 核成立**：NT 半-N 变体删掉 b1 半区的 g2s + drain `2*NA+NB`(6)→`2*NA`(4),`fwd/dgrad down
+  balanced` 0.985/0.988 → **1.005/1.006**、gm +0.6%、**min 0.985→1.003（14/14 过验收线）**;同一手术在
+  **wgrad 核净负 −0.09% gm（六配置持平~−1.6%）已回滚** —— wgrad 的 A1 是 stage `k+1` 的**距离-1池且最先
+  发射**,删它必须同步收 drain,省下的 DMA 被更早的等待吃回去。**先看被删池的距离与发射位次,再决定要不要删。**
+
+### ❌ 别再试（2026-07-29 实测）：mxfp8 grouped NT 的 C-store 缓存旋钮与 barrier 削减
+- ❌ **plain 标量 C-store 加 `cstore_aux=1`（非临时/write-once 提示）**：8/8 个 NT 配置一致变慢
+  **−0.2~−1.7%**（gm −0.46%），同 run 的 wgrad 六配置不动 → 系统性判负而非噪声。
+  根因：mxfp8 的 plain store 是**每 lane 2 字节**的 `buffer_store_short`；非临时提示让每个 2B 写绕过
+  L2 合并 → partial-line 事务暴增。**该旋钮只在 128b 向量化 store 下才成立**（tw 正是与 CShuffle 同用）。
+- ❌ **`store_cshuffle=True` + `cstore_aux=1` 一起开**（照搬 tw 的 `_NT_PERSIST_BIGN=(16,32,True,1)`）：
+  gm **−1.08%**，`fwd/dgrad down heavy` 各 −2.7%。→ 源码注释 "NET-NEGATIVE for mxfp8" 在**加了 nt 提示后
+  重新成立**；单开 store_cshuffle 仍是中性（见本卡上文）。mxfp8 NT 不是 store-bound，两条都别再花轮次。
+- ❌❌ **删掉 NT 主环里 MFMA *之前* 的 rendezvous barrier（8/K-iter → 5/K-iter，正好对齐 tw 的 123）**：
+  gm **1.0657→1.0304（−3.3%）**，8 个 NT 配置全跌 **−2.6~−6.9%**（SNR/det 仍过）。
+  - 正确性推理是对的（守 LDS WAR 的是 MFMA **之后**那个 barrier —— 此刻各 wave 的 s2r 读已被 MFMA 的
+    `lgkmcnt` 等待排空；MFMA 之前那个不提供任何额外顺序），但**pre-MFMA rendezvous 是承重的调度装置**：
+    去掉后各 wave 相位漂移，MFMA 突发不再对齐，发射/LDS 争用的损失远大于省下的同步。
+  - ★ **勘误 methodology/03 的「barrier 数 ≤ 参考」对标判据**：barrier 计数差**不能**直接当成可回收的
+    同步税。mx NT 185 vs tw NT 123 的 62 个差额里，至少 63 个（21 iter × 3）是**负收益可删项**。
+    要动 barrier，先问它是「顺序约束」还是「相位对齐装置」——后者删了就掉速。
+- ❌❌ **合并 MFMA 相位来减 barrier（4 个象限相位 → 2 个,每 K-iter 8 barrier → 4）**：gm **−1.6%**
+  （1.0610→1.0442）,8 个 NT 配置全跌 **2~5%**。这是上一条的**第二次独立验证**——换一种减法（不是删 barrier
+  而是合并相位）同样掉速 ⇒ 「一象限一 barrier 对」的粒度本身就是**波间相位对齐装置**,粗化后两个 wave 同时
+  争同一资源、ILP 下降。**mxfp8 NT 的 barrier 结构别再动,除了连相位语义一起重设计。**
+- ❌ **利用 fwd 里 A/B 同张量把 prologue 的 group-offset 取数减半**（`go_out_div`/`go_pad_div` 别名检测,
+  省掉 33×2 次窄 `buffer_load` 中的一半）：gm 1.0603→**1.0610（+0.07%,噪声）**。⇒ NT prologue 的取数条数
+  **不在关键路径上**（该核是 latency/同步 bound,不是 VMEM 发射端 bound）;而且它是**只在 bench 的 fwd 形态
+  成立的 bench-specific 优化**,已整条移除。**别再往 prologue 指令数上花轮次。**
 
 ## MXFP8 B-comb sizing / col 已转置 [K,M] / scale_pack 来源歧义穿线
 
@@ -292,6 +407,79 @@ MXFP8 死路速查表——以下方向均已实测判负，勿重试。
 | ❌ quant 128B 整 cache line 写 (旧 v2, BM=128) | 各 lane 写满 128B，无跨-lane 合并 | 慢 0.58–0.98× |
 | ❌ quant wave 跨-lane 合并转置写 (旧 v3) | 双趟 scale 也暂存 LDS（错误做法） | 慢 0.42–0.61× |
 | ❌ BLOCK_K=256 移植 MoE grouped GEMM | MoE 是 BW-bound，BLOCK_K=256 回退 | 回退变慢 |
+| ❌❌ grouped NT/wgrad **persistent grid**（grid 截到 num_cu + stride loop） | 见下方"两次独立判负" | NT 0.70–0.81×；wgrad +11~18% 更差 |
+
+### ❌❌ persistent grid：两次独立判负，第二次已排除「per-tile 解码成本」这个混淆项
+- 一测（2026-07 round 10，NT）：`num_cu=256`，K=2944 慢 **25.6%**、K=5760 慢 **37.1%**。当时的怀疑是"persistent 把 O(G) 入口扫描从每 tile 一次降到每 CU 一次，应该赚"，结果反向。
+- 二测（同 campaign，per-tile 解码已换成 lane-resident 表 ⇒ 每 tile 只剩 1 条 ballot + 5 条 `v_readlane`）：`_probe_nt_persist.py` 单进程交织，3 shape × 2 分布 × 3 swizzle cfg，persistent **全部 0.70–0.81×**，与一测**几乎逐点相同**。
+- ⇒ **结论从"入口扫描不是 per-tile 固定成本的大头"硬化为"persistent 的亏损与解码成本无关"**。该核 occ=1（LDS 128 KB/WG），非 persistent 时 CU 空出来立刻换下一个 WG，persistent 并不能多重叠任何东西，却额外背上 `scf.for` tile 循环的活跃值与流水重填。**两个核都别再走截 grid 这条路去摊固定成本。**
+- ✅ 附带复核（同一次探针）：swizzle base `(bm,gm,xcd,gn)=(256,4,4,0)` 在 6 行里 5 行最优或持平，`gm=8` 只在两行 balanced 上快 0.4~1.1% 而在别处输 —— 与 round 5 的 14-cfg 结论一致，别为单 shape 硬编码。
+
+### ❌ 别再试（2026-07-30 实测）：NT prologue 的三条「省一次内存往返」改法 —— prologue 是带宽限而非延迟限
+基线 gm 1.10638 / min 1.03563（同 session 两次复测 1.10655 / 1.10638，极差 0.017%），wgrad 六配置作漂移对照。
+- ❌ **把 K-iter 0 的三条 scale load 提到 prologue 最前面**（想把首条 MFMA 的 `WAIT[vmcnt(0)]` 换成部分 drain）：
+  `WAIT[vmcnt(0) lgkmcnt(6)]` 确实变成 `WAIT[vmcnt(12) lgkmcnt(6)]`，但 **`private_seg_size` 0 → 28、
+  `num_vgpr` 254 → 256**，gm **1.0946（−1.08%）**、NT 八配置几何 −1.82%。根因：该核 254/256 VGPR **零余量**，
+  拉长 12 个 scale VGPR 的活跃区间就换来每 tile 一次 scratch 往返。**动这个核的任何活跃区间前先看 spill。**
+- ⚪ **同一改法收窄到只跨 stage-1**（scale 排在 k=0 与 k=1 两批 g2s 之间）：spill 回到 0、`num_vgpr` 254 保持，
+  首条 MFMA 变 `WAIT[vmcnt(1)]`，gm **1.10493**、NT 几何 1.08114（基线 1.08200，wgrad 对照同步 −0.22%）⇒ **噪声内**。
+- ⚪ **两段 prologue g2s 合并成一次突发**（k=0 与 k=1 写的是不相交的 LDS 池，先发满 16 条 DMA 再 drain；
+  barrier 条数不变，第二个 drain 仍用主环那条已验证的 `_nd` 余量）：ISA 确认
+  `G2Sx4 … G2Sx12 BAR WAIT[vmcnt(14)] BAR WAIT[vmcnt(6)] BAR`，spill 0，gm **1.10483**、NT 几何 1.08111
+  —— 与上一条**逐位相同**，即少一次串行 drain **完全没有兑现**。
+- ⇒ **结论：该核 prologue 的两次 drain 不是两次可省的延迟，而是同一份带宽的两次计费。** 与
+  pitfalls/03「prefetch 治不了 L2 capacity thrash」同源。**别再花轮次在 NT prologue 的发射顺序/drain 合并上**；
+  剩下的开口在**减字节**（更大 tile / scale 物理布局），不在减延迟。
+
+### ✅ 已交付杠杆（2026-07-30 实测）：NT 的 `GROUP_M` band 宽度必须**按 K 分档**，一个全局 gm 会系统性亏待长-K shape
+`GROUP_M` 决定一条 M band 的宽度：B 每条 band 被完整 stream 一次 ⇒ **B 流量 ∝ 1/gm**（与 shape 无关，
+logical B/A 恒为 1/gm）；而 band 的 A 足迹 = `gm × BLOCK_M × K` 字节，**只有 K 是 shape 相关项**。
+⇒ **同一个 gm 在不同 K 上落在 4 MB per-XCD L2 slice 的两侧**，最优值必然随 K 变。
+
+`_bench_campaign_mxfp8.py` 真尺子实测（每格都是全 14 配置 bench，非竞速点）：
+
+| shape | band@gm4 | gm=2 | gm=4 | gm=8 | gm=16 |
+|---|---|---|---|---|---|
+| `dgrad gate_up heavy` N=2944 **K=5760**（min 配置） | **5.62 MiB ✗** | 1.010 | 1.036 / 1.041 | **1.045 / 1.045 / 1.047** | 1.031 |
+| `dgrad gate_up balanced` 同 cfg_key | 5.62 MiB ✗ | 1.071 | — | **1.089 / 1.093** | 1.064 |
+| `fwd gate_up balanced` N=5760 **K=2944** | **2.88 MiB ✓** | 1.089 | **1.122** | 1.086 | — |
+
+* **两条曲线都单峰,但峰不在同一个 gm**:K=2944 峰在 4、K=5760 峰在 8。**四点(2/4/8/16)把 K=5760 的峰夹死在 8。**
+* 机制自洽:K=2944 时 gm 4→8 把 band 从 2.88 MiB 推过 4 MiB slice ⇒ 丢 A 驻留,亏 3.0%;
+  K=5760 时 gm=4 的 5.62 MiB **已经**越线 ⇒ 再宽也没有更多可丢的驻留,只剩 B 流量减半的净赚,+1.1%;
+  gm=16(22.5 MiB)开始亏,说明 band 太宽后 **launch 序的组内局部性**反过来吃掉了 B 的节省。
+* ⚠ **别把它读成"A band 必须 ≤ 4 MB"这条简单规则** —— 那条规则预测 K=5760 应当选 gm=2(2.81 MiB 回到线内),
+  **实测 gm=2 是全场最差(1.010,比 gm=4 还差 2.5%)**。B 流量项在这里压过驻留项;
+  **能同时解释四个点的只有"gm 的最优值是 B 流量与 A 驻留的折中,且折中点随 K 移动"**。
+* **落地**:`_gnt_nt_candidates(N, K)` 用 `4*256*K > 4 MiB` 这个**物理阈值**分档 cand[0](另一档留作 cand[1]),
+  候选数仍 4;K=2944 三个 shape 的候选表**逐字节不变**(零回归面),只有 K=5760 那个 cfg_key 换基准。
+  ✅ 前提是 **`cfg_key = (N, K, G, ...)` 含 K**,所以两档互不干扰;若某核的 cfg_key 不含 K,先补上再分档。
+* ⇒ **通用教训:凡是"一条 band 复用一个操作数、另一个操作数按 band 数重 stream"的 swizzle,
+  band 宽度的最优值都是 K(收缩维)的函数,拿单一 K 扫出来的 gm 不能当全局默认。**
+  round 5 那次 14-cfg 扫描**只在 K=2944 上做**,所以把 K=5760 的 gm=8 漏掉了 —— 判负清单要记扫描时的 K。
+
+### ⚠️ grouped MX NT 的**全局** `gm=8`：对 min 配置是 +1.1%，但全局净负 —— 且 autotune 竞速点复现不出 bench 的判据
+2026-07-30 在真 bench 上强制 `gm=8`（单候选，绕过竞速）：gm **1.10404（−0.21%）**、min **1.04659（+1.06%）**。逐配置：
+`dgrad gate_up heavy` 1.036 → **1.047（+1.1%，这正是 min 所在配置）**、`fwd gate_up balanced` 1.122 → **1.086（−3.0%）**，
+其余六个 NT 配置 ±0.5% 以内。**与 round 5 记的「gm=8 在 down 快 0.6~1.0%、在 fwd gate_up 慢 2.97%」
+六轮之后仍逐点吻合到 0.03pp** ⇒ 该 KB 条目经受住了三次内核大改（距离-2 池 / prologue 强度削减 / lane-resident group-find），**可信**。
+- 关键结构事实：这两个配置**属于不同的 autotune cfg_key**（`fwd gate_up` 是 N=5760/K=2944，
+  `dgrad gate_up` 是 N=2944/K=5760），所以"一个 gm 服务全部"并不是硬约束 —— 硬约束是**同一 cfg_key 要同时服务
+  balanced 与 heavy 两个分布**（cfg cache key 不含分布），而 `dgrad gate_up` 恰好 balanced 想要 gm=4（+0.6%）、
+  heavy 想要 gm=8（+1.1%）。
+- ❌ 别再试：**把竞速采纳门从"每点都赢 1.5%"换成"几何均值赢 1.5% + 单点回退上限 1%"**（gm 1.10648 / min 1.03679，
+  与基线同为噪声）—— 因为 `dgrad gate_up` 上 gm=8 的两点几何只有 +0.25%，**够不到任何高于噪声地板的门限**。
+- ❌ 别再试：**把竞速 base 播种成 gm=8 再让 gm=4 竞争回来**（gm **1.10217，−0.38%**）：
+  `fwd gate_up balanced` 停在 1.086 没被换回 1.122 ⇒ **竞速的 canonical 点（2048 / 8192 tokens per group）
+  复现不出 bench 的 4096 tokens/group 在 N=5760 上的判据**。这是本条最有价值的发现：
+  **该 autotune 竞速对 N=5760 shape 的采纳判据与生产不同源**，任何指望竞速自己发现 gm 的做法都会落空。
+- ⇒ 下一步不是继续调门限，而是**让 cfg cache key 带上一个粗粒度的分布描述子**（如 max_group_tiles/mean_group_tiles 分桶），
+  好让同一 shape 的 balanced 与 skew 走不同的 band。⚠ 该描述子必须**在 device 上算**——round 3 已定死"不得引入 host D2H 检查"。
+
+### ⚠️ 静态 ISA 直方图会被「边界象限变体复制」灌水，只有 steady-state 窗口可比
+- 现象：mxfp8 wgrad 的 "mainloop" 段 7581 条指令 / 1152 MFMA = **6.6 条/MFMA**，NT 只有 4546 / 1104 = **4.1 条/MFMA**，看上去 wgrad 主环多背 60% 的地址算术。
+- 真相：wgrad 有 **4 个边界象限变体**（M+N 两侧）、NT 有 2 个（半-N），tile 体在 ISA 里被复制了 4 份/2 份，而**每次执行只走其中一份**。取 `mfma[8..40]` 的 steady-state 窗口后：wgrad 106 条/33 MFMA = 3.2，NT 111/33 = 3.4，**两者其实相当**。
+- ⇒ round 9 的"引用 ISA 计数前必须按 region 分段"要再收一层：**分段之后还要看 steady-state 窗口**，`[mfma0, mfmaN]` 整段包含所有谓词变体，是静态计数不是动态计数。
 
 关键区分（别把制胜招误判成死路）：
 - ❌ 别再试 **大 BM 但不合并** 的 quant 写（旧 v2 BM=128 各 lane 写满 128B 无跨-lane 合并）。但**大 BM 配合 LDS 合并才是制胜招**——死的是"大 BM 不合并"，不是"大 BM"本身。

@@ -154,6 +154,38 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
 | **Memory-bound** | HBM BW 近 roofline/peak + MFMA-issue ratio 低 + 大 K 小 M*N;L2 命中差;LDS bank conflict 或 VMEM latency counter 高 | bigger tiles / async G2S / L2-XCD locality / split-K / preshuffle |
 | **Compute-bound** | MFMA-issue ratio 高但吞吐低 + BW slack;指令混合应以 MFMA 为主但 issue 效率差;VALU 相对 GEMM 意图偏高 | wider-K MFMA atom / 减少动态 MFMA 数 / accumulator 放 AGPR / 抬 occupancy |
 | **Stall-concurrency-bound** | HBM 和 MFMA **都**低于 roofline 但 GPU 忙;occupancy 因 VGPR/LDS/barrier/wave-limit 压力低;高 s_barrier/s_waitcnt;scratch/spill 非零 | LDS ping-pong overlap / sched hints / bank-conflict swizzle / 修 prefetch depth |
+| **Power/clock-bound** | **负载中** sclk 明显低于 boost(实测 hd64 fwd 1713 MHz vs 液冷 2.4 GHz)且 power ≥90% TBP(1346 W / 1400 W) | 降每单位工作的指令数与搬运量;⚠**所有 util 百分比必须按实测 sclk 折算**,否则会低估 util 20%(51% vs 63%)并把「买时钟」记成「省周期」 |
+
+**★ 采 sclk/power 是 profiling 的第 0 步(本项 KB 曾连续 10 轮漏掉,把 util 算错 20%)**:
+```
+(WARMS=14 REPS=3 python -u <bench>.py >/tmp/b.log 2>&1 &); sleep 30
+for i in 1 2 3 4; do rocm-smi -d <gpu> --showclocks --showpower | grep -iE "sclk|socket"; sleep 1; done
+```
+在-时钟峰值 = `#SIMD × FLOP/cyc/SIMD × 实测 sclk`。**每个候选都要单列 sclk 一栏**:
+TF 涨了但 sclk 也涨了,先把时钟贡献扣掉再判「省周期」。
+⚠ 反例修正:「dense fwd 在功耗墙上 ⇒ 指令效率优化被掩盖」只对了一半——确实在墙上(96% TBP),
+但省周期依然有效(hd64 fwd 的 row-sum 上 MFMA:总 +1.85% 中时钟只占 +0.66%,**省周期 +1.19%**)。
+
+★★ **占用率类改动在功耗墙下会被时钟回吐,符号是负的**(hd64 fwd r14,与上面那条正好互补):
+occupancy 2.985 → **3.978** waves/SIMD,功耗纹丝不动(1352 → 1353 W = 96.6% TBP),
+但 sclk **1710 → 1654 MHz(−3.3%)**,wall 只 +0.50% ⇒ 反解**省周期 +3.9%**。
+机制:并发度上升 ⇒ 每拍同时发射的 MFMA 更多 ⇒ 每拍功耗更高 ⇒ DVFS 压频。
+⇒ 判据:**占用率候选必须报 sclk**。只看 TF 会把一个 +3.9% 的周期改动读成 +0.5% 而错误放弃;
+  反过来,在**没到功耗墙**的 kernel 上同样的改动应当拿到接近全额的周期收益。
+
+★★ **在 ≥99% TBP 上「省周期」只兑现约 45%,「省能量」拿满额 —— 排杠杆时按这个折算率排序**
+(grouped mxfp8 NT,campaign 20260729 round 11 同 shape 同探针前后对照):
+周期口径 tw/mx 1.0315 → **1.0858**(+5.3%),但 wall 只 1.0172 → **1.0392**(+2.2%)⇒ **兑现 45%**。
+机制:mx 变快后瞬时功耗更高,DVFS 又把它的 sclk 压低 2.5%(mx 与 tw 的时钟差 1.39% → 4.3%)。
+round 12 用同一探针复核,逐点复现:mx 0.9083/0.9115 ms @ **1909.6/1899.3 MHz** @ **1396.0/1397.6 W**,
+tw 0.9451/0.9460 ms @ 1992.1/1987.6 MHz @ 1382.1/1383.1 W ⇒ wall 1.0392 / cycle 1.0858,**99.7% TBP**。
+⇒ 该折算率是这一族 kernel 的**稳定常数,不是一次性观测**;排杠杆时:
+**「减字节/减能量」按全额计价,「减周期/减指令」按 45% 计价**。
+pJ/FLOP:mx 0.5581~0.5607 vs tw 0.5749~0.5759 ⇒ **功耗高 ≠ 效率低**,mx 只是把同样的工作做得更快。
+⇒ 同样纸面收益下,**减访存/减 L2 miss(省能量)优先于减指令/减延迟(省周期)**:前者同时降功耗,
+不会被 DVFS 回吞;后者要打对折。pitfalls/13 只写了「省请求=买时钟」的正向,这是它的反向补充。
+⚠ 另:**功耗高 ≠ 效率低**。同一对照里 mx 的 pJ/FLOP 0.5601 优于 tw 0.5758 —— 它功耗更高只是因为
+把同样的工作做得更快(功率 = 能耗/时间),别拿 W 读数当效率判据。
 
 ### 健康阈值(起点,非定律)
 
@@ -187,6 +219,14 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
   - 「gfx950 k=32 双倍 bf16 率」roofline 头 → 落地被数据布局(tr16 转置读 =4bf16/lane=k16)锁死到「必须 2-tile 批」,批税吃光收益。
   - 去-padding「代理测量」判 DMA 负 → 其实测的是 tr16 bank-conflict,不是 DMA 本身;真 per-rank-DMA 保 padding 从没被那个代理覆盖(**代理≠真实现**)。
   - **∴ 探针只告诉你「某成本是否在关键路径」(值不值得投入去攻),不告诉你「去掉它是否可实现」。可达头只有真实现 + bench 能定;纸面 op-count 预判(如 bpermute≫store)与探针天花板一样常错。**
+- ★ **铁律要精确到「对 *时间* 的上界」——对 *指令数* 纸面数账是可精确兑现的**(2026-07 mxfp8 grouped 实证):
+  边界象限跳过的纸面比 12/11.5 = 1.043478,PMC `SQ_INSTS_MFMA` 实测 mx/tw = 36,175,872/34,668,544 = **1.04348,逐位吻合**;
+  但换算成**时间**只兑现 ~50~60%(省了 MFMA,barrier / g2s / LDS 往返照旧)。⇒ 用 op-count 预测**指令数**可以当准数,
+  预测**时间**必须打 0.5~0.6 折,再 edit→bench 确认。
+- ★ **上界也会*低估*:当一处改动顺带消掉了别的成本时,实测可以反向突破纸面预测**。同 campaign 两例:
+  ① 按 MfmaUtil 比值 0.956 预测「追平参考只有 +4.6% 余量」,消掉 per-tile O(G) 扫描后实测 **+5.3~19.1%**(因为
+  同时消掉了 tile 开头的串行依赖链与 spill);② 按 traffic 上界 2.1% × 50~60% 兑现率预测 +1.0~1.3%,半-N 边界
+  tile 删 B 侧 g2s 实测 **+2.0%**(删的是 DMA,而该 tile 恰是 feed-bound)。⇒ **上界是双向不准的,别用它判负。**
 
 ## ATT trace 做 stall 根因:MFMA operand bubble 记在 MFMA 头上而非 waitcnt
 
@@ -271,6 +311,34 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
 | MFMA 利用率 <50% | memory-bound | — |
 | MFMA 间多 s_nop | 流水气泡 | 交错 load / 调 scheduler |
 | 高 cycle buffer_load | TA 阻塞 | 减并发 load / 查合并 |
+
+## ★铁律:≥2 waves/SIMD 时,per-wave 的「簇再平衡」是吞吐不变量
+
+把一段 VALU 工作从 wave 内"忙"的 cluster 搬到"闲"的 cluster(经典手法:塞进访存 cluster 的 LDS 延迟窗口、
+或塞进 MFMA-bound cluster 的影子里)**改变的只是单 wave 的关键路径,不改变每-SIMD 的资源需求总量**。
+SIMD 上有 2-3 个 wave 共享同一套 VALU/MFMA 管线时,别的 wave 早就在填那个"空档",搬迁买不到东西。
+
+hd64 fwd 实测(3 waves/SIMD,A=1127.0 TF):把 row-sum 从 issue-bound 的 QK 簇搬走 →
+搬到 PV 簇 **−3.08%**(它其实在关键路径上)、搬到访存簇 **−0.10%**;而**删掉**同一批指令 **+6.4%**。
+
+⇒ 判定顺序:①先用减法探针量出"每省 1 个管线周期换多少 wall"的**边际系数**(hd64 fwd = **0.46**;
+  旧记 0.49 来自一个 SNR 崩掉的脏探针,已作废——**探针 SNR 不过就不能拿它的 wall 定价**);
+②只有能**真减总周期**的改动才排上日程;③"这个 cluster 看起来很闲"不是理由 —— 那是别的 wave 的工作区。
+⇒ 推论:cluster/schedule 类改动的正确期望是 **±0**,测到 ±0 不代表实现错了,代表这类杠杆在此 regime 无效。
+
+**★ 2026-07-29 补一条方向性(hd64 fwd r25,4 waves/SIMD)**:不变量说的是「搬迁买不到东西」,
+**不是「两个簇等价」**。同族的三次实测(把一个 tile 的整套 softmax = 32 exp + 16 cvt + 4 row-sum MFMA
+搬进 PV 簇)= **4 waves −0.33% / 3 waves −0.89%**,而 ISA 上编织是完美的(串行段消失、s_nop_stall 18→28)。
+根因:PV 簇的 8 条 MFMA **影子里已经藏了 16 条 `ds_read_b128` + 2 个 DMA 发射**,而 QK 簇的 8 条 MFMA
+只藏 8 条 `ds_read`,VALU 槽是空的。⇒ **搬迁前先数目标簇 MFMA 影子里已有多少条访存/VALU**;
+往已经饱和的簇搬 = 负,往有空档的簇搬 = ±0(仍然不是收益来源)。
+⇒ 同轮另一条:**「完美编织」本身不产生收益**。同一批 VALU 在 wpe=3 上编织成功值 +1.23%(r24),
+在 wpe=4 上换个簇编织值 −0.33% ⇒ **编织类结论必须标注测量时的 waves/SIMD,不可跨档外推**。
+
+### 边际系数怎么量(比 roofline 可靠)
+减法探针要**只删条数、不换语义框架**(例:把 32 元素 fold 改成 2 元素 fold,保留下游 pack/MFMA 链防 DCE),
+再按 `Δwall% ÷ (waves_per_simd × Δ指令 × 拍/指令 ÷ 每-SIMD 迭代耗时)` 归一。
+系数 ~1 = 纯 issue-bound;~0.5 = 与另一条管线部分重叠;~0 = 该管线不是约束。
 
 ---
 来源: flydsl-fp8-gemm-tuning/SKILL.md, 10-8wave-scvgpr.md, flydsl-kernel-authoring/SKILL.md, agpr_rawasm_progress.md, project_mxfp4_epilogue_store.md, gemm-optimization/SKILL.md, 07-benchmarking.md, 07-benchmark.md, capture-kernel-trace/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, kernel-trace-analysis/SKILL.md, tool-rocprof/SKILL.md, diag_4w_vs_8w.md, prefetch-data-load/SKILL.md, gemm/overview.md, programming-model.md, 08-att-root-cause.md, project_mxfp4_k28672_ceiling.md, lds-optimization/SKILL.md

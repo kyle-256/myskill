@@ -64,6 +64,14 @@
 ### 前端 if/for 语义限制（纯 Python 合法但和 MLIR 构造冲突）
 - 分支局部定义：值只在某个 `if`/`else` arm 内定义、arm 外使用 → **静默破坏 MLIR result typing**。必须把定义提到分支上方，或 yield 单一 merged 值。
 - 前端会把 if 分支体抽成 `__then_*`/`__else_*` 函数；分支内引用的名字若定义在外层可能触发 **NameError**。标量/向量类型不匹配、Python int 出现在需 DSL 值处也是常见 wizard 报错。
+- ★ **同一机制的 `scf.for` 版（2026-07-29 实测）**：嵌套 `def` 里若含**运行期** `for _c in range(<runtime>)`，
+  前端抽取循环体时只捕获**循环自身引用到的**外层名字；**只在循环之后**才用到的外层名字会掉出闭包，
+  变成该 `def` 的局部名 → 运行到那行报 `UnboundLocalError: cannot access local variable 'X'`
+  （注意报的是 *local*，不是 free variable，很容易误以为自己写了赋值）。
+  - 踩证：把 mxfp8 wgrad 的 chunk 主环包进 `_run(quads)` 闭包，`store_c`（只在环后用）当场炸；
+    同一闭包里 `k_iters` / `acc00` / `mfma` / `a_g2s`（环内也用）全部正常捕获。
+  - 解法：把**环后代码留在父作用域**（或显式传参 + 返回值，同本卡「不要 mutate 捕获变量」）。
+    只把「含运行期 for 的循环本体」放进嵌套 def，epilogue/store 别跟进去。
 - 不要在嵌套 helper 里 mutate 捕获的外部变量（只读闭包 OK，写要走显式参数 + 返回值）。
 - 避免 early return：不要把 `return`/`yield` 放进 if/else 分支（前端靠单一显式出口确定结果类型）。
 - 有副作用 / 循环携带值 / 分支局部定义的**运行时分支**，应拆成 local helper 并把 `if` 包进 local `@flyc.jit` dispatch 函数里调用，不能直接写在 kernel 体内。
@@ -108,6 +116,11 @@
 
 **嵌套 helper 不要 mutate 捕获的外层变量**
 - `@flyc.kernel`/`@flyc.jit` 内的嵌套 helper 可读捕获值，但不应 mutate 捕获的外层变量——显式传值并返回更新后的 state。
+
+**跨 lane 原语可以直接调，但别用 `llvm.TruncOp` 收 i64**
+- `rocdl.update_dpp / ballot / readlane / readfirstlane`、`llvm.intr_ctpop` 在 flydsl 里都能直接 emit（wave64 的 `ballot` 必须 `res=i64`；`readlane` 的 lane 参数允许传 Python int）。
+- ⚠️ 该 build 的 `llvm.TruncOp.__init__(self, res, arg, overflowFlags, *, loc, ip)` 是**三个位置参数**，按 `(res, arg)` 两参调用直接 `TypeError: missing 1 required positional argument`。**用 `arith.trunci(target_type, value)`**（`flydsl.expr.arith`，签名 `(out, in_, *, overflow_flags=None)`，稳定）把 `ctpop` 的 i64 收成 i32。
+- DPP 前缀扫描要求**满 EXEC**（放 kernel 入口、任何分叉之前），`bound_ctrl=True` 让移入的 lane 贡献 0，就不用再修 bank_mask。
 
 ## FlyDSL ThrVal/atom layout 静默错：#1 静默产错结果 bug 源
 

@@ -110,6 +110,23 @@ AITER 有 per-shape 选 128×128 / 192×256 / 256×512… 在本架构（gfx950 
 - ISA 实测 8w whole-loop 已占满 256 VGPR 零余量：32 vec4 accs(128)+ 24 operand frags(96)+ 6 scale + ~26 地址 temp ≈ 256。
 - ❌ 别再试 naive register-prefetch(+96 第2套 frag)：352>256 → occ 掉 → 512线程 WG 无法单 CU 驻留，内核起不来。架构性死路。
 
+### ★★ 「加波数、不加每波 tile」有一条前置条件：现有 num_vgpr 必须 ≤ 512/(新 waves per SIMD)
+
+pitfalls/13 的 GQA-sharer 合并（16 波 / 1024 线程出双倍 tile，**每线程累加器数不变**）常被当成"绕开累加器
+VGPR 墙"的通用范式。它的前提在那张卡里没写出来：**那个 kernel 当时跑在 128 VGPR/wave**，4 waves/SIMD 的
+预算正好也是 128，所以加波是免费的。
+
+反例（grouped mxfp8 NT，campaign 20260729 round 12 实测 ISA）：
+`kernel_grouped_mxfp8_nt_1` = **num_vgpr 254 / num_agpr 0 / spill 0 / group_segment 131,072 B /
+max_flat_workgroup_size 512**。8 波 = 2 waves/SIMD ⇒ 预算 512/2 = 256，**254 已经吃满、余量 0**。
+改 16 波 ⇒ 4 waves/SIMD ⇒ 预算 512/4 = **128**，而累加器单独就 256×512/1024 = **128 dword/lane**，
+operand frag + scale + 地址一个都放不下（需要 4×254 = 1016 ≫ 512 的 SIMD 文件）。
+⇒ **动手前先 dump `.num_vgpr` 乘上目标 waves/SIMD 跟 512 比**，这一步比 LDS 账重要得多：
+本例 goal 里算了半天 LDS 池（而且算错了，见下），真正的硬墙在寄存器上，LDS 根本没轮到。
+⚠ 顺带勘误：该核 LDS 是 **8 池 × 16,384 B**（`LDS_BLOCK_M/N = BLOCK_M/N // 2 = 128`，
+`a_lds = b_lds = 128×BLOCK_K = 16,384`），不是"4 池 × 32,768 B"——**池粒度必须从源码的
+`LDS_BLOCK_*` 反推或 dump `group_segment_fixed_size`，别按 BLOCK_M×BLOCK_K 拍脑袋**。
+
 ### A operand 1-deep 预取 (APF=1) — 双重死
 - ❌ 别再试 APF=1：每个 i32x4 A frag=4 VGPR，a0p+a1p+a0n+a1n = **128 VGPR 仅 A** → Scratch spill(332)，且有 K 相关 tail race(SNR 15.3 崩)。
 - 被 register-bound 墙挡死：1-deep A 预取需 +64 VGPR，raw 的 VGPR 上限只有 256-128(AGPR)=128，加后 **300>256** 破 1 wg/CU。

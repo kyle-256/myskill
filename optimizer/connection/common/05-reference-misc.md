@@ -107,5 +107,25 @@
 - rocprofv3/rocprof-compute mechanics 在 `primus-turbo-develop/run_profile/tool-rocprof/SKILL.md`；项目结构/build/test/benchmark/integration 和 quick-validation 模板在 `primus-turbo-develop/SKILL.md`；历史 tips 在 `agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md`（backend 目录小写，如 TRITON→triton）。
 - poll cap：benchmark 因 timeout 转后台时（此 kernel family 常 30-90 min），用重复 sleep<=900s(15 min) 窗口，绝不一次 multi-hour sleep。窗口间重查 terminal 文件/artifact（grep 最新 `TestID:`、`wc -l` CSV、查 exit_code）。连续两次无进展当 hung 处理（OOM/driver errors），别盲 sleep。
 
+## ★ gfx950 VALU 发射速率(2026-07-29 hd64 fwd campaign 实测,推翻若干纸面记载)
+
+判法:同一 kernel 只换一条指令的**种类**(条数不变)或**删掉固定条数**,按每-SIMD 归一算边际拍数。
+
+| 指令 | 实测每条占 VALU 拍 | 证据 |
+|---|---|---|
+| `v_add_f32` / `v_mul_f32` | 4(全速率基准) | 干净 VALU 地板探针 −520 发射拍 → +16.6% wall,边际系数 **0.46** 拍 wall/拍 VALU(旧记 0.49 来自 SNR 崩掉的脏探针,已作废) |
+| `v_exp_f32`(TRANS) | **≈8,half-rate** | PMC 直接分解:`SQ_ACTIVE_INST_VALU` 1091.7 拍 / 206.7 条,扣掉 MFMA 后解出 8.14 拍/条。⚠ 早期用「换成同条数 `v_mul` 只 +1.9%」推出的「≈全速率」是**代换探针的假象**(差额被重叠吃掉),见 pitfalls/13 |
+| `v_pk_add_f32`(2×f32) | **≈8,即毫无吞吐收益** | 46 条 pk_add 替 86 条 add(净减 40 条、vgpr 不变)wall **−1.45%** |
+| `v_dot2c_f32_bf16` | ≈7(half-rate) | 32 条 dot2 替 56 条 add,wall 精确不动 |
+
+⇒ **推论:gfx950 的 64-lane f32 VALU 吞吐是「每 4 拍一条指令」的硬上限,打包(pk_*/dot2)只买代码体积和寄存器,买不到周期。**
+想减 VALU 周期只能**真减指令条数**,或把工作搬到 MFMA/MAI 管线(需付累加器寄存器)。
+
+### ❌ 别再试:`v_dot2c_f32_bf16` 做 row-sum(算错)
+LLVM 为 `llvm.amdgcn.fdot2.f32.bf16` 选的 **VOP2 `v_dot2c` 形式不遵守 `op_sel_hi`**,只把低半 lane 算两次
+⇒ 32 元素求和退化成 2×Σ(偶数项),**误差稳定 6.25% = SNR 23.7~24.1 dB 且 det=False**。
+换 intrinsic(而非 inline asm)、4 路轮转累加器避 SrcC 冒险、末尾补 32 拍 `s_nop` —— 三种修法全无效。
+要做 bf16 点积求和只能显式走 VOP3P `v_dot2_f32_bf16` 并证明 `op_sel_hi` 已置位。
+
 ---
 来源: global-permissions/SKILL.md, flydsl-fp8-gemm-tuning/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, gfx950-vmcnt-race-debug/SKILL.md, lds-optimization/SKILL.md, flydsl-kernel-authoring/SKILL.md, flydsl-tile-programming/SKILL.md, add-target-atom-op/SKILL.md, capture-kernel-trace/SKILL.md, kernel-trace-analysis/SKILL.md, bisect-perf-regression/SKILL.md, FlyDSL/CLAUDE.md, build-flydsl/SKILL.md, build-rocm-image/SKILL.md, gfx950/overview.md, verify-accuracy/SKILL.md, verify-performance/SKILL.md, optimize-loop.md, SKILL.md

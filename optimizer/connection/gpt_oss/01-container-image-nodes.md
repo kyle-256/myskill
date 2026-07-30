@@ -53,11 +53,20 @@ docker run -d --name=mlperf_gptoss \
 ## 从共享盘 tar 恢复容器(首选)
 
 - **首选方式**:从共享盘保存镜像恢复容器,开箱即用 —— 跳过升 triton / 装 flydsl 的一整套步骤。
-- **最新 tar**:`/mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260703.tar.zst`
+- **★最新 tar(2026-07-28,含 syncv3)**:`/mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260728-flat.tar.zst`
+  - 17G 压缩 / 72.4G 解压(zstd -t 已验;tar 头含 `.dockerenv`+完整 rootfs)
+  - 在 20260703 基础上**新增 `/opt/venv-syncv3`**(wgrad skew 优化环境,已 verify `opt/venv-syncv3/bin/python` 在包内),仍含 `/opt/venv`+`/opt/venv-tw`+triton3.7+flydsl/primus_turbo
+  - **⚠️ 这是 `docker export` 扁平单层包(不是 save/load 分层包)**:恢复必须用 `docker import`,不是 `docker load`:
+    ```
+    zstd -dc /mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260728-flat.tar.zst | docker import - mlperf_gptoss:saved-20260728
+    ```
+    然后照本卡上方固定 flag 起容器(run 命令显式带 `sleep infinity`+venv 全绝对路径,不依赖镜像 ENV/CMD,故 import 丢元数据无影响)。
+  - **为什么 export 不 save**:2026-07-28 打包时 chi2798 共享节点 docker 盘 93% 满,`docker save` 需先把整镜像 ~111G 暂存到 `<data-root>/tmp` 再打包→盘不够;11 个容器全 running 无 unused 可删、491G 可回收镜像全属别人不能碰;`docker export` 流式导出 rootfs 不占暂存不碰他人=唯一安全路径。换到有 ~111G 空闲的干净节点可仍走 `docker save`/`docker load` 分层格式。
+- **上一版 tar(layered/load)**:`/mnt/vast/kyle/code2/docker_images/mlperf_gptoss-20260703.tar.zst`
   - 20.3G 压缩 / 93G 解压
-  - 含 triton3.7 + flydsl / primus_turbo,含 tensorwise venv `/opt/venv-tw`
-  - tag:`mlperf_gptoss:saved-20260703`
-- **load 前**:`df -h /var/lib/docker` 确认 >100G 空闲(93G 解压 + 余量),否则 load 失败。
+  - 含 triton3.7 + flydsl / primus_turbo,含 tensorwise venv `/opt/venv-tw`(**无 venv-syncv3**)
+  - tag:`mlperf_gptoss:saved-20260703`;恢复 `zstd -dc <tar> | docker load`
+- **load/import 前**:`df -h /var/lib/docker` 确认 >100G 空闲(解压 + 余量),否则失败。
 - **为什么一拼即 import**:editable 安装(flydsl / primus_turbo)的 python 指针在镜像 rootfs 里;源码 + build 产物(`build-fly/`、`_C*.so`)在 bind mount `/mnt/vast/kyle/code2` 上。两者一拼即可 import。
 - **docker commit 固化范围**:只固化容器 rootfs(pip 包、apt 包、editable 指针、triton 版本);bind mount 上的源码 / build **不进镜像** —— 所以镜像轻、源码始终跟 bind mount 走最新。
 

@@ -20,6 +20,15 @@
   - query-blocking 减 store ⚠ 常 DEAD(2×o_acc>256 VGPR 强制 occ-1,占用损失 > store 省)。
 - **rescale 折叠(_FMAX0)**:softmax 平移不变 → 用 first-pair 固定 max → `alpha=1`,编译器折叠掉 online-rescale 乘法(dsv4 pro cr4 828→933TF,+13%)。当 max 可安全固定时首选。
 - **GEMM↔softmax 并行(dual-wave)**:唯一让 GEMM 与 softmax 真并行的解 = 上游 `flash_attn_gfx950` 两 wave-group **时间复用**(s_barrier 错相位)+ cluster 流水 + `sched_group_barrier`(MFMA 0x8 / VALU 0x2 / **EXP 0x400**,exp2 是 0x400 非 VALU)+ lazy-rescale(见 [[reference_flydsl_flash_gfx950_dualwave]])。重、latency-bound **fwd** 的上限杠杆。
+  - ★**"把 exp2 塞进 MFMA 阴影"这条不迁移到 occ-2 的 bwd**(gpt-oss hd64 round-7/8 三次独立实测):
+    ① `sched_barrier(0)` 强制交错、ISA 确认 MVVVV 模式 → wall **0.00%**;② 精确计数
+    `sched_group_barrier` 把 MFMA:TRANS(0x400)按 1:2 / 2:4 / 4:8 交错、ISA 确认 policy 生效
+    (nop_cyc 222→85)→ **+0.26 / −0.04 / −0.07%,全在噪声内**;③ 给 dkdv GEMM1 加
+    `s_setprio(1)` 抬 MFMA 发射优先级 → **−3.3%**。根因:occ-2 下同 SIMD 常驻的**另一个 WG**
+    已经把阴影填满了(pitfalls/13 §185 同一机制),再排自己的指令不产生新并行,而抬优先级
+    等于饿死那个 peer。⇒ **occ-2 bwd 上 wall ≈ 两个 wave 的发射周期之和,只有"减指令"能动,"重排"不能。**
+    减法探针定价:砍掉 dkdv GEMM1b 每 trip 128 条 `ds_read_b128` 只值 **+0.85%**(≈1.8 cyc/read
+    的纯发射成本)⇒ LDS 延迟本来就藏住了,别再投资"藏 LDS 延迟"。
   - ⚠⚠ **BWD occ-2 上 dual-wave/8-wave/warp-spec 常 net-negative,先证再建(决定性,2026-07-21 dkdv 自主 campaign measure-closed)**:占用率=2 的 baseline **本就有两个独立 WG 机会性共驻同 SIMD → 免费享无屏障的跨-WG dual-wave overlap**(一个 WG 卡 barrier 时另一个照发 MFMA 填气泡)。把 4-wave 两独立 WG 合成一个 8-wave 单-WG(warp-spec/stagger)= 把这**免费 overlap 换成带屏障税的组内 overlap**:8-wave NT=2 屏障耦合 MfmaUtil 53→40(-11%);+stagger 错相位能抢回到 1029(+3.5%,证 stagger 机制真有效)但**天花板 1029 仍 < 4-wave baseline 1116**。→ **occ-2 latency-bound bwd 上,dual-wave 只能逼近 baseline 已免费拥有的、无法超越;别投全套重构**。判据:先量 baseline 是否已 occ-2 双-WG 共驻(是→dual-wave 大概率亏)。fwd 常 occ-1(无跨-WG overlap)才是 dual-wave 的正场。
 - **PV 的 tr16 转置读常是 fwd 头号 LDS-read 成本**(dsv4 去 pad 掉 60-67%);b128 减半读被 LLVM "Cannot select" 挡。
 - ⚠ **lazy O-rescale 单独移植常 net-negative**(dsv4 MLA cr4 -31%,pstore 流水冲突)——它是 dual-wave 套件的一部分,别单拆。
@@ -80,3 +89,14 @@ swizzle/pad/bank(port 富余)、LDS 预取/双缓冲(occ 已藏 DMA;长 Skv 偶�
 - LDS 转置读/bank:methodology/05(ds_read_tr16、pack-128、bank 红鲱鱼)
 - profiling:methodology/03(PMC bound 判定、subtractive/SKIPST 探针)
 - occupancy:pitfalls/01、methodology/04
+
+
+## ★ 判"某杠杆对某 regime 无效"前,先确认那个 regime 的其它杠杆状态一致(2026-07-30 实测)
+
+hd64 fwd 收官时踩到:GQA sharer merge 在 full-causal 上 +1.8%,在同形状 SWA 上 **−12%**,于是差点被门控成
+"窗口下不划算"。真因是**当时 SWA 还被挡在 `_FMAX0` 固定 max 之外**,仍走 online softmax;把固定 max 放开给 SWA 之后,
+同一个 merge 在 10 个形状里 8 个转正,那条窗口门控随即被撤销。
+
+⇒ **regime 之间的杠杆是耦合的**:A 在 regime R 下判负,可能只是 R 缺了 B。正确做法是先把公共杠杆对齐,再测 A。
+⇒ 附带教训:一个门控条件如果**注释里给不出理由**(这里 `window_left < 0`),多半是当初圈定在被优化的形状上的
+**scope 残留**,不是物理约束 —— 值得当成开口去试。softmax 的平移不变性与掩码无关,SWA 完全可以吃固定 max。

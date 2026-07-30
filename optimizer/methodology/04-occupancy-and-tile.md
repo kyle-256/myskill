@@ -32,6 +32,11 @@
 - **Joint co-saturation**:联合选 tile shape + MFMA 指令宽度 + waves/SIMD,让 **VGPR+AGPR 预算、LDS footprint、matrix-unit issue rate 同时饱和**,而不是某一资源先饿死其他资源。
 - 对编译后 AMDGCN 做 **VGPR liveness pass**(找 dead VGPR 窗口、把 boundary 以上的寄存器 remap 进空洞)可在下一个占用边界抬升 waves/SIMD。
 - `next_free_vgpr` 步进边界:**64 / 73 / 85 / 102 / 128 / 170 / 256**。
+- ★ **这些边界要再被 CTA 波数向下对齐一次**(2026-07-29 hd64 fwd r25):占用率的分配粒度是 **workgroup**,
+  一个 W-wave 的 WG 给每个 SIMD 放 `W/4` 个 wave,所以实际 waves/SIMD 只能是 `W/4` 的整数倍。
+  例:8-wave CTA ⇒ 只有 **2/4/6/8** 可达,`alloc ≤102` 算出来的 `floor(512/102)=5` 会**向下取整回 4,一分不涨**;
+  该形状的下一档是 **6 waves ⇒ alloc ≤85**。⇒ **定「降到 N 个寄存器」的目标之前,先用 CTA 波数把
+  `floor(512/alloc)` 对齐到可达档位**,否则会花整轮去省一批买不到东西的寄存器。
 
 ### Occupancy-starved 直接信号:tile 数 < CU 数
 

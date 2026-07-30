@@ -25,6 +25,26 @@
 | 30:1 skew | 1162 → 1592(−46% → **−26%**) |
 | vs Triton skew | 1.18× → 1.62×(FlyDSL band-cyclic 更均衡) |
 
+#### ⚠️ 适用条件勘误:band-cyclic 只在 `num_xcd=1` 时才是均衡杠杆(2026-07-29 实测)
+上表数据来自 **fp8-tensorwise TN wgrad 核且 `num_xcd=1`**。在 **grouped MXFP8 变长-K wgrad**
+(`mxfp8_grouped_kernel.py` `_build_grouped_mxfp8_wgrad_kernel`)上叠 `xcd_remap_pid(...,8)` 后,
+band-cyclic 反而是 **skew 崩溃的主因**,不是解:
+- 机制:`bg = idx//BAND; group = bg%G` 把 hot 组的第 3 个 M-band 排到 dispatch 序列 **67% 处**
+  (G=32 时 bg=64/总 96),贪心表调度 makespan ≈ 0.67×ideal + 最长 tile ≈ **1.9×ideal**;
+  `xcd_remap_pid(pid,TOTAL,8)` 再把连续逻辑 tile **整段**绑到同一 XCD → XCD0 拿最热的 12 组、
+  XCD7 拿最冷的 12 组,跨 XCD 8 路不均。PMC 佐证(down heavy vs balanced):
+  MeanOccupancyPerCU **1.96→0.80**、MfmaUtil 59.3→24.5、MemUnitStalled <0.1%、LDSBankConflict 0
+  → 纯负载不均,不是内存/occ 瓶颈。
+- 改 **group-major(`interleave=False`)+ `xcd=1`**(两处共 2 字符)实测:
+  geomean(tw/mx) **0.8062→0.9864**、min **0.4743→0.9277**,wgrad 六配置全部 ≥1.00;
+  down heavy 0.474→1.005(**+112%**)、balanced 也一起变好(0.955→1.001)。
+- WHY group-major 更好:group-major 序 == **LPT(最长作业优先)**,只要 token 直方图按组号递减
+  (真实 MoE / bench `_alloc` 都成立),hot tile 在 t≈0 发出;`xcd=1` 让连续 pid 走 HW 的 XCD
+  round-robin(pid%8)→ 每个 XCD 均分每组 tile,组内 `group_m=4` band swizzle 仍保 L2 复用。
+  tw 侧候选表早已写死此点(`_WGRAD_4WAVE_CANDS` + 注释 "xcd=1 keeps group-major tile order")。
+- ★ **教训:NT(fwd/dgrad)与 wgrad 的最优 dispatch 参数不可互抄**——mxfp8 wgrad 用 xcd=8 是照抄
+  NT 参数踩的坑。band-cyclic 的适用条件是 `num_xcd=1`。
+
 ### masked vs persist(K-loop body 分叉)
 - **masked chunked(大-M,per-group m_total/G > 1536)**:outer runtime `scf.for over ceildiv(k_iters, chunk)` × inner `range_constexpr(chunk)` 的 **4-buffer 流水**。over-run 由 per-group SRD `num_records` clamp 到 0(无需 host cap)。`chunk=8`,每 chunk 8 个 K-iter 全展开。
 - **persist(小-M,per-group m_total/G <= 1536)**:`_wgrad_loop_body_pipe`,**2-stage prefetch**(prologue prefetch K-tile 0,per-iter prefetch K+1 overlap 当前 MFMA)。短 contraction 下 masked 的 chunk over-run 是废功,persist 精确跑完自己 M_g。

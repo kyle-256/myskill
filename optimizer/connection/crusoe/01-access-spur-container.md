@@ -28,7 +28,7 @@ Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur
 2. 账号关联一次：`spur accounts -i add user name=xianzhao account=amd-primus`
 3. ★**sbatch 脚本体里直接跑 setup + `sleep infinity`**(**不带** container flag),一步到位 —— **别** `--wrap="sleep infinity"` 占完节点再想办法进去,那条路会撞上 §4.-1 的 `srun --overlap` 陷阱、而 node-ssh 又不通。
    ```bash
-   #SBATCH -A amd-primus -p amd-spur --qos=amd-primus-qos --exclusive -t 7-00:00:00
+   #SBATCH -A amd-primus -p amd-spur --qos=amd-burst-qos --exclusive -t 7-00:00:00   # ★burst 池,别用 amd-primus-qos(16 节点上限,见 §3)
    #SBATCH -o /shared_nfs/kyle/kyle.out
    bash /shared_nfs/kyle/node_setup.sh
    sleep infinity
@@ -53,8 +53,13 @@ Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur
 **Login Node Guardian 杀超内存进程**(实测 `spur image import` 吃 35G 被 kill+告警邮件)。→ 重负载(build/跑测/镜像) **一律在 compute 节点**；login 只做 sbatch/squeue/scancel/scp/rsync 轻活。
 
 ## 3. spur / slurm + 账号 ✅
-- `srun`/`sbatch`/`squeue`/`scancel`/`sinfo` 都在；`salloc`→`spur alloc`；`sacctmgr`→`spur accounts`。
-- 账号 `-A amd-primus`、分区 `-p amd-spur`(全集群唯一，256 台共享)、`--qos=amd-primus-qos`(**只 sbatch 收；srun 不收 --qos/--pty**)。
+- `srun`/`sbatch`/`squeue`/`scancel`/`sinfo` 都在(都是 `spur <子命令>` 的符号链接);`salloc`→`spur alloc`;`sacctmgr`→`spur accounts`(登录机上没有独立 sacctmgr,用 `spur accounts show qos/account/...`)。
+- 账号 `-A amd-primus`、分区 `-p amd-spur`(全集群唯一,254 台共享)。
+- **★★★ QOS 选 `amd-burst-qos`(弹性池),别用 `amd-primus-qos`(2026-07-28 实测定案)**:
+  - `amd-primus-qos` GrpTRES **node=16** —— 这是 amd-primus 组共享的硬上限,组里别人占满了你就 **Pending(Reason=QOSGrpNodeLimit)**,哪怕集群里几十台 idle 也拿不到。之前被卡数小时的根因就是它。
+  - `amd-burst-qos` GrpTRES **node=128** / 每用户 **node=32** —— 弹性 burst 池,能吃到其它 pool 的空闲机。`spur accounts show qos format=name,grptres,maxtrespu` 可复核所有 QOS 上限。
+  - **实测**:`sbatch -A amd-primus -p amd-spur --qos=amd-burst-qos -N1 -t ... <脚本>` 直接被接收,job 秒落 idle 节点(crsuse2-m2m-153),`Reason=None` 零排队。参考来源=Primus `run_deepseek_v4_flash.sh`(dev/tas/deepseek-v4-phase2)里 `export SLURM_QOS=amd-burst-qos`。
+  - 用法:sbatch 脚本头写 `#SBATCH --qos=amd-burst-qos`(**只 sbatch 收 --qos;srun 不收 --qos/--pty**)。其它 QOS 上限见 `spur accounts show qos`(amd-general=8 / amd-spur-qos=8 等)。
 - **必须先账号关联**否则全报 `not associated with account`：`spur accounts -i add user name=xianzhao account=amd-primus`(~10s 生效)。验证 `srun -t1 -A amd-primus -p amd-spur hostname`。查成员 `spur sshare -a | grep <user>`。
 - 负载：`sinfo -p amd-spur`(常 100+ idle)。
 
@@ -124,6 +129,51 @@ sleep 5 && RSH 'cat /shared_nfs/kyle/q/mytask.out; cat /shared_nfs/kyle/q/mytask
   ```
   健康 GPU 节点应返回 `KFD=/dev/kfd yes` / `DRI=129` / `DOCKER=/usr/bin/docker`。
 
+### 4.-2b ★★同节点多并行队列 = 主队列被队友长任务串行堵住时的正解(2026-07-28 实测)
+**症状**:文件队列 agent 是 `while true; for f in $Q/*.job; do bash "$f"; done` —— **单目录 = 严格串行**。
+队友(或另一个 agent-team teammate)投了个长 bench(如 `_bench_gptoss_20b.py`,跑几分钟),
+你后投的 job 全部排在它后面干等,`.job` 迟迟不变 `.done`。**别误判成"agent 死了"**:
+`ls -lat $Q/*.done | head` 看最近完成时间、`tail $Q/<前面那个job>.out` 看它是否还在出数——
+还在写 = 正常串行,不是卡死。
+
+**❌ 别为了躲队列去 `sbatch` 一台新节点** —— 白占一台 `--exclusive` GPU 节点 + 多花 ~3min `docker load`,
+纯浪费(踩证:2026-07-28 我因此误申请 job 4601,被当场喊停)。节点已经在跑(job 3198 / 328),
+容器 `gpt-oss-docker` 已 Up —— 要的是**在这台已起的节点上再挂一个并行队列**,不是换机器。
+
+**✅ 做法:同一节点上再起一个只盯 `q2` 的后台 agent 循环**(容器复用,**不 docker load、不新节点**):
+1. `node_agent2_loop.sh`(**只有循环体**,去掉 §4.-2 里的 docker load/run —— 容器已在):
+   ```bash
+   Q=/shared_nfs/kyle/q2; mkdir -p "$Q"
+   while true; do
+     for f in "$Q"/*.job; do
+       [ -e "$f" ] || continue
+       b="${f%.job}"; bash "$f" > "$b.out" 2>&1; echo $? > "$b.rc"; mv "$f" "$b.done"
+     done
+     sleep 3
+   done
+   ```
+2. **bootstrap job 投进主队列 `q`**(node-ssh/srun --overlap 都是死路,主队列是上节点的唯一通道 →
+   bootstrap 这一次仍要过主队列、等它空出一个 slot;此后 q2 就独立并行了):
+   ```bash
+   # a0_boot_agent2.job —— 名字用 a0 前缀让它在 glob 里排最前,主队列一空立刻先跑它
+   mkdir -p /shared_nfs/kyle/q2
+   pgrep -f node_agent2_loop.sh >/dev/null && { echo "agent2 already running"; exit 0; }
+   nohup bash /shared_nfs/kyle/node_agent2_loop.sh >/shared_nfs/kyle/q2/agent2.boot.log 2>&1 &
+   sleep 1; echo "agent2 launched pid=$!"
+   ```
+   `nohup ... &` 让循环在**节点 host 后台常驻**,bootstrap job 立刻返回、主 agent 继续;q2 循环独立活着。
+3. 之后自己的活全投 `q2`,和队友的主 `q` **两个 agent 并行**(各自内部仍串行,跨队列互不阻塞)。
+
+**关键点/坑**:
+- **GPU 隔离**:两队列的 job 各自 `docker exec -e HIP_VISIBLE_DEVICES=...` 指**不同卡**,别撞
+  (如主队列队友用 GPU2,你 q2 用 GPU4,5)。同容器多 exec 并行没问题,GPU 各占各的。
+- bootstrap **必须过主队列一次**(唯一上节点通道);若主队列正卡在长 bench 上,这一次仍得等它跑完。
+  想彻底免等只能等那个 slot —— 但一旦 agent2 起来,后续**永久并行**,一劳永逸。
+- `pgrep -f node_agent2_loop.sh` 幂等守卫,重复投 bootstrap 不会起第二份。
+- 想要 N 条并行队列就 N 个 `qN` + N 个 loop(各自 `Q=` 改掉)。队列目录都在 NFS,跨节点存活。
+- ⚠ **区分 §4b 的 sbatch agent(带 docker load,换节点用)vs 本节的 loop-only agent(容器已在,纯加并行度)**:
+  换了节点(容器没了)用前者;同节点加队列用后者。
+
 ### 4.0 跑前先确认节点活死(2026-07-22 血泪)⚠️
 `squeue` 的 `R` 状态**会滞后 ~2min** —— 节点 NODE_FAIL 后 squeue 快照仍可能显 `R`(301 实测:06:35:06 NODE_FAIL,而 06:33 快照还是 `R 4:56:34`,信了它会拿死节点跑/或以为数据有效)。**别信 squeue 的 R**:
 - 确认死活:`squeue -j <JOBID>`(返回空=job 已终止)+ `spur accounts`/账务库看 `NODE_FAIL`;或直接 `bash ~/dx.sh <NODE> <脚本里第一行 hostname>` 看是否连得上并落在预期节点。
@@ -136,7 +186,7 @@ compute 节点自带 **dockerd + containerd**(本地存储 `/mnt/m2m_nobackup/do
    #!/bin/bash
    #SBATCH -A amd-primus
    #SBATCH -p amd-spur
-   #SBATCH --qos=amd-primus-qos
+   #SBATCH --qos=amd-burst-qos
    #SBATCH -N1
    #SBATCH --exclusive
    #SBATCH -t 24:00:00
@@ -159,7 +209,7 @@ compute 节点自带 **dockerd + containerd**(本地存储 `/mnt/m2m_nobackup/do
 引号地狱解法:脚本落 `/shared_nfs/kyle`(login 端 base64 写,node-host 后台跑),全程不嵌引号。
 ```bash
 # ①login 端: 提交占节点 → 拿 NODE
-sbatch -A amd-primus -p amd-spur --qos=amd-primus-qos -N1 --exclusive -t 12:00:00 -J kyle_box \
+sbatch -A amd-primus -p amd-spur --qos=amd-burst-qos -N1 --exclusive -t 12:00:00 -J kyle_box \
   --output=/home/xianzhao/logs/box.%j.out --wrap="sleep infinity"
 squeue -u xianzhao -o "%i %T %N"            # 拿 NODE(如 crsuse2-m2m-301)
 # ②login 端: 把下面脚本写到 /shared_nfs/kyle/_load_run.sh(用 base64 -d 落地,避免引号)

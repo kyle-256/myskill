@@ -98,6 +98,14 @@ attention bwd 的 tr16 转置读(`ds_read_tr16_b64` 喂 GEMM2 A-operand)有顽�
 
 - 2D band 触发条件:大-N shape(N≥2880 / N_BLOCKS_N 够多)才加 `group_n`;`group_n = N_BLOCKS_N//8`(#bands=#XCD)对 big-N 另有 **+8~9%** 口径。big-N 瓶颈是 L2 复用(1D GROUP_M 对每 M-group 重复 stream 整个 B 234MB → L2 51% vs big-K 66%);big-K 的 drain-removal / both-J **❌ 不迁移到 big-N**(短 K 摊不开,both-J 在 big-N 上是噪声)。
 - **band det 中性**:纯 tile→CU permutation,满 band 各占 `num_pid_m·GN` 个 pid、余数成最后一个窄 band,恒为 bijection。
+- ★★ **1D `GROUP_M` 的最优 band 宽度是收缩维 K 的函数,不能用单一 K 扫出来当全局默认**
+  (2026-07-30 grouped mxfp8 NT 实测,见 pitfalls/05 §GROUP_M 按 K 分档)。两项互相拉扯:
+  ① **B 流量 ∝ 1/gm**(B 每 band 重 stream 一次;logical B/A 恒 = 1/gm,**与 shape 无关**);
+  ② **band 的 A 足迹 = `gm × BLOCK_M × K` 字节**,越过 **4 MB per-XCD slice** 就丢 A 驻留 —— **只有 K 是 shape 项**。
+  ⇒ 同一个 gm 在 K=2944 上 band 2.88 MiB(线内,峰在 gm=4)、在 K=5760 上 5.62 MiB(已越线,峰移到 gm=8)。
+  实测 min 配置 gm 2/4/8/16 = 1.010 / 1.036 / **1.045** / 1.031,单峰。
+  ⚠ **别简化成"A band 必须 ≤ 4 MB"**:按那条规则 K=5760 该选 gm=2,而 gm=2 实测最差(1.010)—— B 流量项压过驻留项。
+  ⇒ 做法:autotune 的 cfg_key **必须含 K**,再用 `gm*BLOCK_M*K > 4 MiB` 这个物理阈值给 cand[0] 分档,候选数不变。
 - **2D autotune gating**:候选 gated `n_blocks>=32 and M//256>=16`(小 M 的 m-block 太少、banding 不划算,走 1D 防回归);winK 块(K≥28672)也 sweep `group_n ∈ {n_blocks/8, n_blocks/4}`。
 - **persistent kernel** 要 remap 的是 **PERSISTENT work-id,不是 `blockIdx.x`**。
 

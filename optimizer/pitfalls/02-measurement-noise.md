@@ -180,3 +180,23 @@
 
 ---
 来源: remote-sync/SKILL.md, pr-merge-gate/SKILL.md, 08-deadends.md, optimize-handoff/SKILL.md, optimize-loop.md, flydsl-fp8-gemm-tuning/SKILL.md, flydsl-fp8-gemm-tuning/07-benchmarking.md, fp8-gemm-bench/SKILL.md, 04-ceiling-analysis.md, flydsl-fp8-gemm-results/SKILL.md, 07-benchmarking.md, 10-grouped-wgrad-4wave-3buf.md, gpu-fleet-tuning/SKILL.md, 14-fused-preshuffle-e2e.md, mxfp8-grouped-gg-devloop/SKILL.md, project_mxfp8_wholeloop_port.md, 05-dead-ends.md, project_mxfp4_epilogue_store.md, verify-accuracy/SKILL.md, project_wgrad_occ_feed_bound.md, gfx950-vmcnt-race-debug/SKILL.md
+
+
+## ★★ 小形状先证伪「内核慢」:很可能是 host enqueue 慢(2026-07-30 实测)
+
+hd64 fwd 在 Hq=64/Sq=Skv=1024/B=4 上 wall 84 µs,怎么调都不动。**判据一句话:把序列长度扫一遍,
+S=128/256/512/1024 全是 ~80 µs —— 工作量差 64 倍而时间不变,就不可能是内核里的任何东西。**
+
+分三层量:
+```python
+a=torch.cuda.Event(True); b=torch.cuda.Event(True)          # ① wall(含等 GPU)
+a.record(); [r() for _ in range(60)]; b.record(); torch.cuda.synchronize()
+t0=time.perf_counter(); [r() for _ in range(60)]; t1=time.perf_counter()   # ② host enqueue(不等 GPU)
+rocprofv3 --kernel-trace ...                                 # ③ GPU 内核真实时长
+```
+实测 ①84 / ②85 / ③50 µs ⇒ **host 是瓶颈,GPU 40% 时间在等**。②≈① 就是 host-bound 的签名。
+
+根因是 FlyDSL 每次 launch 重解 JIT 签名(`inspect.Signature.bind`、globals-drift 检查、逐参数 cache-key),
+cProfile 里 `jit_function.py:_resolve_and_make_cache_key` 居首。**修法:`flyc.compile(fn, *args)` 拿到
+`CompiledFunction`,它只刷 data_ptr 不重解签名(全位置参数,含 stream),按标量签名缓存复用 → host 93→7 µs。**
+⚠ 标量会被当 constexpr 烤进 artifact,**cache key 必须含每一个标量参数**,否则换 shape 会静默用错内核。
