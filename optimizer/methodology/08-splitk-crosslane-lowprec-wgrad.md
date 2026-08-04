@@ -94,6 +94,66 @@ band-cyclic 反而是 **skew 崩溃的主因**,不是解:
 - split-K 仅对 few-tile 大-K 场景补一 WG/tile 撑不满 CU 的欠订阅;不与 L2 swizzle 冲突(后者是纯 WG→tile 双射,bit-identical,只调 L2 residency)。
 - skinny-GEMM 一并注意:hard-wire `tile_m=16` + 单 M-warp、把每个 wave 铺满 N;N-tile A-reuse 摊掉 A load,但 loop-carried 寄存器随 N-tile-repeat 倍增可压垮 occupancy → 配 `waves_per_eu` 旋钮。
 
+## ★★ 运行时自适应单-window split-K:variable-K wgrad 的 skew **尾部**(2026-08-03 campaign,tw grouped wgrad gm 0.9224→1.078)
+
+**内核** = `gemm_fp8_grouped_kernel.py` 的 `_compile_grouped_tn_wgrad_4wave`(+ 窄归约核
+`kernel_grouped_tn_wgrad_reduce`),tw fp8 grouped wgrad。**计分** = `r = t_fwd/t_wgrad`(wgrad 追平
+自身**冻结** fwd 的 FLOP-rate),6 配置(gate_up N=5760 / down N=2880 × balanced/moderate/heavy)。
+campaign 20260803_111756(GPU3,base bc5e4fdf):gm **0.92277 → 1.07679**、min → **1.0184**、SNR 54.78dB
+——wgrad 几何**反超**自身 fwd 7.8%,连最差配置也 +1.8%。
+
+### 与上一节 split-K 的**门控完全相反**,别混用
+- 上一节(§Split-K)的门 = **tiles < ncu/2**(设备**欠订阅**,靠加 grid 填满 CU),对 dense/few-tile 大-K。
+- 本节 = 设备**已满**(TOTAL m-block 576/1104 ≫ ncu),但 **token skew** 下一个 hot 组的 K-loop
+  (=M_g)远长于其它组 ⇒ 调度**尾部**所有别的 CU 都 drain 完了,只剩这一个 window 的串行 K-loop 在跑,
+  **尾部空窗**暴露。band-cyclic(本卡 §variable-K)均衡的是调度**主体**,救不了这条尾巴。
+- ⇒ 两者触发条件相反(欠订阅 vs 已满+skew 尾)、补的东西不同(整体 grid vs 尾部空窗)、S 候选集不同
+  (2/3/4/6/8/12/16 vs 见下)。**"split-K 只对 few-tile" 的旧结论不适用于 wgrad skew 尾**——
+  本 campaign 里 TOTAL 远超 ncu/2,split-K 仍是头号杠杆(r3 +7.57%)。
+
+### 机制:片上选**一个** window 切 M/收缩维,窄归约只折该 window
+- **只切一个 window**:把片上策略选中的那**一个** window 的收缩(token/M)维切成 S∈{1,2,4,8} 片,每片
+  是一趟 partial-K GEMM,写进**持久 scratch** `[S, OUT_M, OUT_N]`(`_wgrad_split_ws`);再由**窄归约核**
+  `kernel_grouped_tn_wgrad_reduce` **只折这一个 window 的 S 片**回主输出(不是整张输出做 reduce ⇒
+  scratch 是 per-window 不是 ×S 整输出,footprint 极小)。
+- **策略在 device 上算,零 host planner / 零 D2H**:`_wgrad_split_policy` 用 wave-uniform SALU 从
+  `group_offs` 直接判"切哪个 window、切几片",大致三条规则:
+  - **Rule A(尾部轮)**:最后一个 partial 轮里最长的那个 window 切片回填尾部空窗 —— **主要收益来源**。
+  - **Rule B1(整 hot 组,TPG≤NCU)**:hottest 组的 tile 数装得下设备时,切它整条收缩维。
+  - **Rule B2(溢出 tile,TPG>NCU)**:只切装不下的那部分溢出 tile。
+- **grid 过发射 + 活截断**:grid = `TOTAL + N_MAX*(S_MAX-1)`(按最坏切法预留),多余 split lane 用
+  早退 `s_endpgm` 现场截断(退出判定打**原始 bid**,见 methodology/05 §过发射 grid remap)。
+- **division-free 偏移(r7)**:片偏移算术**免整数除**——S 限定在候选集,配预算好的 reciprocal-multiply
+  (`_wgrad_split_rcp_cfg` / `_wgrad_split_div`),片起点用 mul-shift 而非 div。
+
+### r-by-r 归因(kept commits)
+| 轮 | commit | Δ | 内容 |
+|---|---|---|---|
+| r3 | e1e1a81e | **+7.57%** | split-K 管线(片上 policy + scratch + 窄归约)—— 主结构 |
+| r4 | dec91cdb | **+6.46%** | 补回 split 管线引入的 **host dispatch** 成本:wgrad 入口 flyc.compile mode-split(`_GROUPED_WGRAD_AT_CACHE`=[raw closure, compiled])。**同 pitfalls/02 §host / methodology/03 的 flyc.compile,别当新招**;新事实 = **加了运行时自适应派发层就会把 per-launch JIT 重解析成本吃回来,加完必须重测 host** |
+| r5 | 3c8fdd5d | +1.30% | A-pool interleave(split 片编进派发 A-pool 与主体**并跑**,不是严格排在主体之后)+ B1 crowd-gate(设备不拥挤才触发 B1,否则片只是排队 + 白背归约) |
+| r7 | cab387e3 | +0.60% | S=3 支持(见下)+ division-free 偏移 |
+| r9 | — | +0.18% | 按-band XCD 亲和门(见 methodology/05 §wgrad 按-band 亲和门) |
+
+r9 逐配置:gate_up wgrad bal/mod/hvy **3022/2999/2970 TF**、down **2844/2741/2667 TF**。
+
+### S=3 判据:rule-A 可用、rule-B 禁用 —— 是 **makespan/回填几何**,不是 footprint
+- **S=3 在 rule-A(单个 partial-round 尾)上合法**:3 片干净回填尾部空窗。
+- **S=3 在 rule-B(跨轮)上禁用**:非-2 幂的切法跨多个派发轮时,回填与轮边界**错位** ⇒ makespan 反劣。
+- ⇒ 原因是**回填几何/makespan**,不是 footprint(scratch 是 per-window,不随 S 线性涨)。
+  故 rule-B 用 S∈{1,2,4,8},rule-A 额外允许 S=3。
+
+### ★★ 正确性契约:reciprocal 候选集**必须**覆盖 policy 能选到的每一个 S,否则**静默丢半条收缩维**
+- 片偏移用**预算好的 reciprocal-multiply 表**(`_wgrad_split_rcp_cfg`)。若该表**没枚举** policy 实际能
+  选到的某个 S,查表**静默**落到错误/零配置 ⇒ 片起点算出**重叠或截断**的区间 ⇒ 输出**静默丢掉一部分
+  收缩维**,而**不报错**。
+- ★ **bench 门 + det 门都抓不到**:小-M bench 里 policy 只会选 S=1 或被覆盖的 S,根本不进高-S 分支;
+  det 只验 run-to-run 一致,**一个"一致地被截断"的输出照样 det=True**(与 pitfalls/05 §"确定性门 ≠
+  正确性门" 同型,但这里的触发是**大 M 逼 policy 进高-S 分支**,不是 unbalance)。
+- ✅ 唯一抓得到的门 = **大-M SNR-vs-ref 验收**:`_verify_wg_sa.py`(M≈16384,强制 policy 进高-S 支)
+  对参考算 SNR。⇒ **通用规则:凡"运行时选除数 + 预算 reciprocal 表"的核,(a) 编译期断言表覆盖全
+  可达候选集;(b) 正确性门必须专门造出能逼进高-S/高分支的 shape —— 小-M bench 与 det 门对它都是瞎的。**
+
 ## 跨 lane 原语与 MFMA/attention 数值:wave64 XOR shuffle、DPP butterfly、online-softmax log2
 
 ### wave64 cross-lane reduce（所有 gfx9xx 固定 64 线程）

@@ -61,6 +61,126 @@
 - 消 14% 冲突唯一路 = 操作数改 `a_plain`(预转置走 `ds_read_b128`,无 transpose 固定域冲突),但需 upstream 量化产转置副本、跨文件大改。
 - `a_plain` 在 kernel 内**零吞吐收益**(gfx950 transpose-read 零 per-op 惩罚),唯一价值是免 pad + 免冲突的 enabler。
 
+#### ⚠️ 上表 14% 已过期:`wswz` wave bank-swizzle 打开后实测 **0%**(2026-07-31)
+`kernel_grouped_tn_wgrad_4wave` 现在 `G2SLoader`/`S2RLoaderTr` 都带 `wswz=True`
+(`compute_global_swizzle_nn(..., wswz=True)`),rocprofv3 `--pmc LDSBankConflict
+MfmaUtil MeanOccupancyPerCU` 实测 tw = **LDSBankConflict 0.0 / MeanOccupancyPerCU 3.6(4 波满)**,
+mx 对照 **0.0 / 7.1(8 波满)**。⇒ **别再把 `_CS=1024` 的 bank 冲突当 wgrad 的待优化项**,
+也别为消它去做 `a_plain`/padding —— 冲突已被 swizzle 清零,`a_plain` 只剩"免 pad"这一个理由。
+- ★ **MfmaUtil 跨 wave 数不可直接比**:同一轮实测 tw(4 波,1 wave/SIMD)32.2% vs
+  mx(8 波,2 waves/SIMD)63.8%,而两者 wall 只差 4%、`SQ_INSTS_MFMA` 相等。
+  63.8/2 = 31.9 ≈ 32.2 ⇒ 该计数器按 **wave** 累加,occ=2 的 kernel 读数天然 ×2。
+  比较不同 wave 数的 kernel 时先除以 waves/SIMD,否则会误判成"mx 的 MFMA 利用率是 tw 的两倍"。
+
+#### ❌ 别再试:直接把 `ds_read_b64_tr_b8` 换成 `ds_read_b128` 当作"半指令数"探针
+想验证"DS 指令条数是不是瓶颈"时,把 emit 里的 4×`ds_read_b64_tr_b8` 改成 2×`ds_read_b128`
+**读同一组地址** —— 实测 wgrad **慢 80%**(geomean(mx/tw) 0.971 → 0.566,六配置全崩)。
+这不是"指令数无关"的证据,是**探针本身失效**:transpose-read 的 per-lane 基址是按转置单元
+布的,b128 在同一批基址上按 lane 顺序取 16B 会撞满 bank。`a_plain` 之所以合法,是因为它
+同时换了 LDS 布局(配 `a_row_stride` 的 A0/A1 全局偏移),**指令与寻址必须一起换**。
+
+#### ★★ tw fp8 wgrad whole-loop 的 emit 调度是**刀锋级局部最优**(2026-07-31 实测)
+
+`kernel_grouped_tn_wgrad_4wave` 的相位内指令排布(mfma 对角块 + 用后立即 refill +
+g2s 均匀撒进非 refill 槽)每一个方向的扰动都是**净负**,四次独立实测:
+
+| 扰动 | wgrad 组 geomean | 机制 |
+|---|---|---|
+| 基线(refill 紧跟末次使用;g2s 每 3 个 free 槽一发) | **0.9696** | — |
+| refill 延后 2 条 mfma(避 mfma-src 写后读冒险) | 0.9604 (**−0.9pp**) | ds_read 越早发越好,冒险不是瓶颈 |
+| g2s 全部前置(`fgap=1`) | 0.822~0.860 (**−15%**) | 一串 buffer_load…lds 把 mfma 流整段堵死 |
+| g2s 按**指令数**均匀(而非 mfma 槽均匀) | 0.904~0.939 (**−8%**) | 槽均匀 = 跟 mfma 节拍对齐,才是对的口径 |
+| m0 写与它的 buffer_load 拆开一个放置槽 | 0.9629 (**−0.7pp**) | 拆开反而更差,别管 m0 冒险 |
+
+⇒ **别再调这个 emit 的排布**。下一个 wgrad 增益必须改**做的功**(tile 形状/象限),
+不是改调度。同理 methodology/02 记的 vmcnt 膝点、ELGK 膝点也都已到位。
+
+#### ★ tw wgrad 单 tile 成本模型(三点实测拟合,down balanced/144 tile/32 phase)
+
+强制**所有** tile 走同一变体,直接量出每种变体的整核时间:
+
+| 变体 | MFMA/phase | 池数(ds frag) | 整核 ms | 每 tile 相对成本 |
+|---|---|---|---|---|
+| (2,2) 全 tile | 64 | 4 (16) | 0.943 | 1.00 |
+| (2,1) 半 N | 32 | 4 (16) | 0.773 | 0.82 |
+| (1,2) 半 M | 32 | 3 (12) | 0.661 | 0.70 |
+
+线性拟合:**固定 16% / 每池 feed 47% / MFMA 36%**(边际 22 cycle/MFMA)。
+- 推论 1:边界半 tile 花 0.70~0.82 的时间做 0.5 的功 ⇒ `down` 全核有 **4.6%** 的边界浪费,
+  `gate_up` 约 2.5%。这是 wgrad 目前最大的**已量化**开口。
+- 推论 2:frag/MFMA 比 = `(ah+bh)/(4·ah·bh)`,(2,2)=0.25 最优,(1,2)=0.375,(1,4)=0.3125。
+  128 行的条带要恢复 0.25 **只能**做 128×512(5 池)。
+- ⚠ **`all-forced` 探针量的是全局 regime,不是可加的单 tile 成本**:据此预测"半 N tile 少读
+  一个池省 0.9%",实做只兑现 ~0.2%(见 pitfalls/05)。
+
+#### ★ tw wgrad 当前(2026-08-01)PMC 分解:缺口 = 2.5% 周期 + 1.5% 时钟
+
+`rocprofv3 --pmc GRBM_GUI_ACTIVE SQ_INSTS_MFMA SQ_INSTS_LDS SQ_INSTS_VALU`,wgrad down balanced,末 20 次 dispatch:
+
+| | SQ_INSTS_MFMA | SQ_INSTS_LDS | SQ_INSTS_VALU | GRBM_GUI_ACTIVE | wall |
+|---|---|---|---|---|---|
+| tw(4 波) | 34,668,544 | 38,117,376 | 60,316,288 | 13,240,302 | 0.906 ms |
+| mx(8 波) | 34,668,544 | 27,131,904 | 53,316,608 | 12,916,310 | 0.871 ms |
+| tw/mx | **1.000** | 1.405 | 1.131 | **1.0251** | **1.0402** |
+
+周期只差 2.5%、wall 差 4.0% ⇒ **剩下的 1.5% 是时钟**(tw 每周期能量更高,与 +40% LDS 指令一致)。
+LDS 指令差的机制已定量到条:tw 每 wave 每 K-block 64 条 `ds_read_b64_tr_b8`(8B/条,128×128 wave tile),
+mx 24 条 `ds_read_b128`/`b64`(16B/条,128×64 wave tile),×波数 = 256 vs 192 = 1.333,
+实测 1.405(余量是 prologue/tail)。**这是上游 layout(tw 拿到 token-major 操作数)决定的,不是本核可调项。**
+
+#### ❌ 别去"提前"wgrad 的 256 条累加器清零(`v_accvgpr_write_b32`)
+
+`21_final_isa.s` 里 `v_accvgpr_write_b32` 共 576 条 = 四个边界变体的活累加器数之和
+(256+128+128+64),即每 wave-tile 256 条纯清零 VALU。看起来像 occ=1 下无法掩盖的串行开销,
+但 ISA 实读:它们已被 LLVM **逐条交织进 prologue 的 9 组 `buffer_load_dwordx4` 之间**
+(行 548-620 一条 accvgpr_write 一条 buffer_load),在 `wait_barrier` 之前就发完了 ⇒ 已经藏在
+g2s 发射窗口里。把 `acc0` 的构造在 Python 侧往前挪是**无操作**。
+
+#### ❌ `_diag_cells` 的第五次扰动:(bm,bn)=(2,2) 同样净负
+
+上表四个方向之外再补一个:`bm,bn = 2,4`(基线)→ `2,2`,wgrad 组 geomean 0.98486 → 0.98272(−0.2pp)。
+`_WL_ELGK` 12→13 则是 wgrad 组 +0.07pp / gm −0.14%(都在 0.2pp 噪声带内,且 13 没有做过 1500-rep
+det 压力)⇒ 12 不动。**这个 emit 现在有五个独立方向的负结果,别再来。**
+
+#### ★★ tw wgrad 的 wall 拆解:~89% 计算 + ~11% 输出写(2026-08-01 subtractive 实测)
+
+把 epilogue 整个删掉(`do_store=False`,保留 whole-loop)后直接量:
+
+| 配置 | 带 store | 无 store | 差 | 输出字节 | 推算带宽 |
+|---|---|---|---|---|---|
+| wgrad down balanced | 0.909ms | **0.812ms** | 97us (10.7%) | 555MB | 5.7 TB/s |
+| wgrad gate_up balanced | 1.714ms | **1.549ms** | 165us (9.6%) | 1085MB | 6.6 TB/s |
+
+两个形状都落在 ~6 TB/s(接近 HBM 写峰值)⇒ **这 11% 是带宽地板,不是发射/VALU**,
+也解释了为什么 r5 的"正确轴宽存(256 store_short → 64 dwordx2)"只值 +0.2%。
+mx 写同样字节数,**这部分两臂均摊,不是差距来源**:把剩余 ~4% 的 wall 缺口换算到
+计算段(只占 89%)就是 ~4.5%,与 PMC 的 LDS 1.405x / VALU 1.131x 一致。
+⇒ **别再为 wgrad epilogue 建 permlane/CShuffle 宽存**;要动就动计算段。
+
+#### ★ wgrad prologue 的 rendezvous:拆分有微收益,且拆完已到减法上界
+
+`_wholeloop_tile_3buf` 原本在 asm 前发 `s_waitcnt vmcnt(8)+s_barrier`,把 buf0+buf1 primes 全等完。
+拆成"只等 buf0(vmcnt(24))→ asm 内 ntmp 条 prologue ds_read → `s_waitcnt vmcnt(8) lgkmcnt(0)` → s_barrier",
+让 64 条 ds_read 的发射窗口盖住 buf1 的到达:**gm 0.99616 → 0.9973(三次读数均在基线之上)**。
+★ 同轮的减法上界:把两个等待全放到 `vmcnt(63)`(数值错但计时有效)= wgrad_gm 0.99363
+vs 拆分后 0.99553 ⇒ **prologue 侧已无剩余**,不要再为"隐藏 tile 开头的 HBM 延迟"去做
+跨-tile 软流水(每 WG 2 tile、下一 tile prologue 提前发)—— 它能拿的那部分已经是 0。
+同理 whole-loop 结尾那条 `s_waitcnt vmcnt(0)`(排空没人再读的 g2s)推迟到 epilogue 之后
+也实测 wgrad_gm 0.99553 → 0.99322(净负/持平),别再做。
+
+#### ❌ 别再把 tw wgrad 当 L2/HBM 带宽 bound(PMC 实测)
+
+`rocprofv3 --pmc TCC_HIT_sum TCC_MISS_sum TCC_EA0_RDREQ_sum`,wgrad down balanced,末 15 次 dispatch:
+
+| | TCC 请求(HIT+MISS) | L2 命中率 | TCC_EA0_RDREQ | wall |
+|---|---|---|---|---|
+| tw | 89.8M | **66.9%** | 25.5M | 0.918 ms |
+| mx | 96.1M | 54.7% | 39.2M | 0.882 ms |
+
+**mx 走了更多 L2 请求、更多 EA 读、更低命中率,却更快** ⇒ tw 不缺带宽,别再为"减 global 流量"
+做设计。剩下的差距在 LDS 侧**指令条数**(tw 256 条/CU-phase vs mx 192 条,mx 的操作数 K-连续
+可用 `ds_read_b128`),那是上游 layout 差异,不是本核可调项。
+
 ### 算术强度:4-wave 长 K 为何领先 8-wave
 
 - 强度定义 = 每 K-step 的 MAC / (A行 + B列 operand-elem)。
@@ -96,9 +216,27 @@
 | `FP4_WLVMCN` | 10 | +10T | — |
 | `FP4_SCV_ILV` | 1 | +20T (min) | scale load 交织进 mfma 流 |
 
+### ★ 移植到 tw fp8(哪些 knob 跨精度成立,哪些不成立)
+
+2026-07 把上表逐条搬到 **tw fp8 TN var-K wgrad 4-wave whole-loop** 上实测:
+
+| knob | mxfp4 上 | tw fp8 上 | 结论 |
+|---|---|---|---|
+| `INPLACE_ELGK`(barrier 处留 N 条 ds_read 在飞) | +27T @9 | **+0.8% gm @12** | ✅ 跨精度成立,是该轮主要收益 |
+| `WLBARNOP`(barrier 后插 1 个 `s_nop`) | +21T | **0.00%**(0.98016 vs 0.98027) | ❌ 不跨精度,别再花轮次 |
+| vmcnt 侧再放宽 | — | **0.00%** | ❌ 已在膝点,见 methodology/02 |
+
+- ⇒ **`ELGK` 类(lgkm 侧 partial drain)是这族 kernel 通用杠杆;`WLBARNOP` 类(纯发射
+  时序微调)是 mxfp4 专属**。移植 emit knob 表时先做 lgkm 侧,别按表头顺序全试一遍。
+- 同族的 **8-wave NN(dgrad)** 上等价杠杆不在 whole-loop asm 里,而在 `S2RLoaderTr` 的
+  `vmcnt_hint`:稳态主环里那几条 `vmcnt(2)` 与每迭代的 rendezvous drain **完全重复**,
+  删掉主环那份(prelude/epilog 保留)= dgrad 组 **+2.2%**、gm +0.67%。
+
 ### race-correctness 边界(稳定 emit)
 
-- `ELGK`:最优 9,`≥15` racy。
+- `ELGK`:最优 9,`≥15` racy。⚠️ **`15` 是 gfx950 `lgkmcnt` 4-bit 字段的编码上限,不是调参
+  边界**(写 16 汇编器报错);racy 阈值 per-kernel,tw fp8 wgrad 上 12 最快、15 仍 det0。
+  详见 methodology/02「mxfp4 4-wave 稳定 emit 边界」。
 - `WLVMCN`:最优 10,`≥20` racy。
 - barrier 是 race-critical:减 barrier(`LEANBAR`)必触发 operand race。
 - cross-wave race 根因 = **LDS barrier 不足**,不是 vmcnt 乱序:g2s `buffer_load→LDS` 是 wave 协作完成,barrier 确保所有 wave 的 g2s 全部落地后,跨 wave 的 ds_read 才安全。

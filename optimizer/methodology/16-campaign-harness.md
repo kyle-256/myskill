@@ -155,6 +155,23 @@ resume 只读 `state.json` 的进度,**参数取自 launcher 脚本** —— 所
 9. `manager_status.md` 与 `state.json` 不一致时信后者(§4)。
 10. **`--repeat` 取 MAX,系统性偏高**(实测约 +0.2%,机器抖动大时更多)。验收要自己另跑中位数,见 §7。
 11. crusoe 后端的文件队列**单目录严格串行**:`.job` 迟迟不变 `.done` 先看 `ls -lat $Q/*.done`,可能只是排在队友的长 bench 后面,不是 agent 死了(`connection/crusoe/01` §4.-2b)。
+12. ★★★**一轮 CRASH 之后,工作区可能被回滚到最近一次 *commit*,把没提交的"KEPT_WIP"轮全部丢掉**。
+    踩证(2026-08-01):r10 在收尾的 `rocm-smi` 上 TimeoutExpired 崩了;harness 回滚工作区,而
+    r8/r9 的改动因为增益小(+0.23% / +0.30%)只被记为 `KEPT_WIP`、**从未 commit**(git log 最后一条
+    是 r7),于是这两轮的成果一起消失。下一轮 agent 拿到的 memory.md 仍然把 r8/r9 写成"已保留",
+    baseline 却低了 0.15%,读数落在噪声带里、看不出来。
+    ⇒ **每轮开工第一件事:拿 memory.md 里上一轮 `scheme:` 描述的标志物 grep 目标文件**
+    (本例:r8 的 `_dbar`、r9 的 `cands = [(256, 2, 8, 0)...]`),确认前几轮的改动真的在树里,
+    再去测 baseline。缺了就先从 `rounds/round-NN/crash_worktree.patch` / `diff.txt` 里
+    把那几个 hunk 抠回来 —— 那是**零风险、已验证**的收益,比当轮任何新想法都划算。
+    (本轮就是这么找回 dgrad 组 0.9822→0.9847 与 min_speedup +0.6pp 的。)
+13. **`bench.sh` / `remote.sh` 没有重试,跳板机 banner 超时会直接打死一轮**。症状:
+    `Connection timed out during banner exchange` + `rsync ... exit status 255`,但同一时刻
+    **裸 `ssh` 是通的** —— 是 `ConnectTimeout=20` 在负载下不够,不是机器挂了。
+    解法:复制一份 ssh wrapper 把 `ConnectTimeout` 抬到 90 并加 `ServerAliveInterval=30`,
+    再套一层对 rsync/docker-exec 各自重试的 driver(本场记在 campaign 目录的 `rr.py`)。
+    ⚠ wrapper 必须放在**可执行**的路径下(campaign 目录挂载可能是 `nobody:nogroup` 且不可 chmod,
+    rsync 会报 `Failed to exec ...: Permission denied (13)`)—— 放 `/tmp/` 下 chmod +x。
 
 ---
 

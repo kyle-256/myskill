@@ -119,6 +119,29 @@
 - **per-call scale 转换 Python 循环是 host 瓶颈**：`gemm_mxfp8_flydsl_kernel` 的 per-call scale 转换（broadcast → WL lane-contig 经 `preshuffle_scale_lane_contig` 的 Python 循环）= **8000µs/call**，是端到端 host 开销瓶颈（kernel-only perf 已达标）。解法：向量化 / 缓存。(src: project_mxfp8_wholeloop_port.md)
   - （术语：**WL** = whole-loop mxfp8 移植路径；**lane-contig** = 把 scale 重排成 lane-contiguous 布局供该核直读。）
 
+## ★★ kernel-only bench 必须**锁死 e2e regime**：G、K-pad、M_g 分布都要对齐真实派发(2026-08-03 tw grouped wgrad campaign 头号教训)
+
+kernel-only 测量哪怕**口径干净**(raw op、rocprofv3、interleaved),只要**操作点(regime)**跟 e2e 训练不一致,
+就是在优化一个训练里**根本不出现**的 shape。本 campaign(gpt-oss-20b MoE grouped wgrad)踩实的三条:
+
+- **组数 G**:EP8 部署 ⇒ 每卡 **G=4 个本地 expert**,不是整模型 E=32。用 G=32 扫出来的
+  L2 swizzle / XCD / band-cyclic 最优参数**不迁移到 G=4**(band 数、组内 tile 数、skew 结构全变)。
+  bench 的 `_alloc` 必须按部署的 G 生成 group 直方图。
+- **K-pad**:fwd 的 K=2880 `%128=64` 非对齐,e2e 里 fwd 走 **K-pad 到 2944**(见 [[project_kpad_e2e_trace_validated]]);
+  拿 K=2880 未 pad 去 bench,量的是一个 trace 里**不存在**的 leading-dim 对齐画像
+  (K%128 拆行 penalty,见 [[project_tw_fwd_gateup_kalign]])。**wgrad 的 free 维 2880 补到 2944 slice 回
+  = 白捡 +3%,已烘进 baseline**(见 [[project_wgrad_reach_fwd_campaign]]);别再把 2880/2944 混着比。
+- **M_g 分布**:真实 MoE routing 是 skew 的 ⇒ bench 必须覆盖 **balanced/moderate/heavy** 三档
+  (heavy 是 min_ratio 所在,也是 skew 杠杆的验收点),单跑 balanced 会把 skew 尾部的坑全测漏。
+
+- **比值口径的 yardstick 必须同窗测**:score = `r = t_fwd/t_wgrad`(wgrad 追平**冻结** fwd)时,fwd 这个
+  分母**每个 config 都要在同一 interleaved 窗口里重测**——fp8 DVFS ~37% 漂移会同时动分子分母,
+  隔次/隔 session 测的 fwd 当分母 = 把它的时钟漂移记进 wgrad 的账。**冻结的是 fwd 的代码,不是它的计时。**
+
+⇒ **通用规则:定 kernel-only harness 前,先从 e2e trace 抄回真实 regime(G、每个操作数走不走 pad、
+M_g 直方图),再锁死;口径干净 ≠ 操作点对**。这条比本卡其它测量纪律更靠上游——操作点错了,
+后面 interleaved/多轮/SNR 门做得再干净也是在优化错的 shape。
+
 ## 虚高 TFLOPS 假象：SNR<0 跳过计算 TF 虚高、超 peak 数字、do_bench 不可靠
 
 **核心铁律：高 TF 数字必须先过 SNR/det gate 才算数。** 任何超 peak 或异常高的 TFLOPS 在过 gate 前一律当 bogus。

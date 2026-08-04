@@ -20,6 +20,7 @@
 - 注释**一律英文**,禁中/日文。
 - **单块 ≤5 行**(>5 行连续注释 / docstring 即打回,含 public API docstring),1-2 句讲清。
 - 注 **WHY 不注 WHAT**;推导 / 实测数字(dB · TFLOPS · MxNxK)/ 日期 / 多方案权衡 → 进 commit message · memory · `tuning_results/`,**绝不进源码**。
+- **★整行注释密度 ≤4%**(硬上限):`grep -cE '^\s*#' <file>` / 总行数 ≤ 4%。新写/整体重写的文件按**全文件**算;只改共享文件时按 **t新增行**算(`git diff <base> HEAD -- <file>` 里 `^+\s*#` 行数 / `^+` 行数 ≤4%)。**超 4% 即打回**——即使是大 kernel 的富 why-note 也不例外,要么浓缩成 1 行,要么移进 commit message / memory。
 - **★重构删代码后必须同步改引用它的注释/docstring**。融合/删 kernel 类 commit 最易留 stale 注释(如 pad+meta 融进主 kern 后 docstring 仍写"fused pad prologue")。review 必 **grep 被删结构名**(`rg 'pad.{0,3}prologue|<删掉的函数名>'`)确认 0 stale。
 
 **4. 无调试信息(rg 0 命中才放行)**
@@ -39,7 +40,8 @@
 
 ### 注释与命名
 - 注释**一律英文**,禁中/日文。
-- 注释**尽量精简**:**严禁单块注释/docstring 超过 5 行**。要点浓缩成 1-2 句;推导过程/实测数字/多方案权衡进 commit message / memory / `tuning_results/`,不进源码(见 pitfalls/10「注释里的 benchmark 数字」)。code review 硬门禁一条:`>5 行`连续注释即打回。
+- 注释**尽量精简**:**严禁单块注释/docstring 超过 3 行**。要点浓缩成 1-2 句;推导过程/实测数字/多方案权衡进 commit message / memory / `tuning_results/`,不进源码(见 pitfalls/10「注释里的 benchmark 数字」)。code review 硬门禁一条:`>3 行`连续注释即打回。
+- **整行注释密度 ≤4%**(硬门禁,与上面 checklist#3 同):`grep -cE '^\s*#' <file>` / 总行数 ≤4%。超 4% 打回,富 why-note 也不例外。
 - 函数命名跟 turbo 现有风格,别自造缩写:
   - `_grouped_<noun>`,如 `_grouped_block_mn`。
   - `_wgrad_<verb_or_noun>_<variant>`,如 `_wgrad_wholeloop_asm_3buf`。

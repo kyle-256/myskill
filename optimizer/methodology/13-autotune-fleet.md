@@ -14,6 +14,22 @@
 ### correctness reference + 切换门槛
 - candidate 第一个 `cands[0]` = correctness reference;后面只有 ≥1.5% 更快才切换。
 
+### ★ hysteresis 的副作用:候选表要"沿轴排梯子",cands[0] 的座位本身是一个可调参数
+1.5% 迟滞意味着**赢不到 1.5% 的候选永远落不了地**,于是:
+- **cands[0] 就是决策**(见 pitfalls/06);想换赢家,改座位比加候选有效。
+- **更进一步(2026-07-31 实测)**:当同一条轴上没有"到处最优"的点时,把 cands[0] 坐在
+  **轴的一端而不是中间**,能让迟滞链条一步步走到另一端。tw grouped NN dgrad 的
+  `num_xcd` 轴实测:xcd2 只在 skew 方 square-K 最优、xcd4 在 deep-K 最优、xcd8 在
+  balanced square-K 最优、xcd1/xcd3 全面落后。候选表 `[(xcd4,gm8),(xcd8,gm4),(gm2)]`
+  (中间起步)gm=0.98628;改成沿轴的梯子 `[(xcd2,gm8),(xcd4,gm8),(xcd8,gm4)]`
+  → gm **0.98770/0.98738**(dgrad 组 +0.35pp)。从 xcd4 起步时两个邻居都够不到 1.5%,
+  梯子就断在原地。
+- ⚠️ 但**别越过端点**:同一轮把 dgrad 基座推到 xcd1、把 NT 短-K 基座推到 xcd2,
+  gm 掉到 0.98564(dgrad 组 −0.25pp、fwd 组 −0.42pp)。梯子只能铺到实测的最优端。
+- **先数一遍每个 shape 分支实际有几个候选**:同一个 dispatch 函数按 `N vs K` 分叉时,
+  很容易出现某一分支只装了 3 个(浪费一个名额)。gpt-oss fwd `down`(N==K==2944)就是
+  这种"空位"分支,补一个 `(xcd4,gm4)` 座位实测 fwd 组 +0.30pp(两次读数一致)。
+
 ### never-regress(追平或更快,永不回退)
 - **twin 交错取 global-min**(通用模式,细节因轴而异):候选 config 作为多路 twin **同进程交错计时**取全局 min(交错验证 twin 正确性等价且稳定才敢用,避免噪声误选)。
   - **变体轴(COOP/TACCW)**:四路 twin `{df,T,C,CT}`,`margin` 由 0.99 演进到 **0.995**,`VREPS=16`(2026-07-01)。

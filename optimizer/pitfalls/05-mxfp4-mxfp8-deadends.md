@@ -333,6 +333,12 @@
   (0.00%),wgrad 六配置几何 1.1370 vs 1.1393,`gate_up heavy` 1.320 vs 三次 base 的 1.342/1.347/1.353。
   ⇒ **wgrad 的边界 tile 只有半/四分之一的 MFMA,本来就提前收工、不在关键路径上**;NT 是一 tile 一 WG、
   半-N tile 占 down 的 1/12 且 feed-bound,才吃得到。**判据:先问被优化的 tile 在不在 makespan 上。**
+  ★ **修正(2026-08-03,mxfp4 grouped 实测)**:「wgrad 判负」不能按算子写死。把半-N 体搬到
+  **mxfp4** wgrad 核是**小幅正收益**(六配置 5/6 上升,gm 两次复测各 +0.2~0.3%,down 三项
+  0.617/0.603/0.599ms → 0.590/0.592/0.597ms)。区别在**被删池的发射位次与消费距离**:mxfp4 的
+  wgrad 与 NT 共用同一份 whole-loop 体、BR 是**最后发射**的 g2s 组(删了不动前面的 drain);
+  mxfp8 wgrad 判负的池是**距离-1 且最先发射**的 A1。⇒ 判据改成按「被删池的距离 + 发射位次」分,
+  不是按算子(wgrad vs NT)分。
 - ★ **续刀(2026-07-29 实测)：上面「vmcnt 序列必须逐条相同」是保守起手,不是终点**。半区的 g2s 也能删,
   但**只在 NT 核成立**：NT 半-N 变体删掉 b1 半区的 g2s + drain `2*NA+NB`(6)→`2*NA`(4),`fwd/dgrad down
   balanced` 0.985/0.988 → **1.005/1.006**、gm +0.6%、**min 0.985→1.003（14/14 过验收线）**;同一手术在
@@ -553,5 +559,235 @@ rocprofv3 派生指标(crsuse2-m2m-328,200 iter balanced,NT kernel):
 - **碰撞守卫**:两版定义同名 flydsl 闭包,若 JIT 缓存串了 old 会跑 new 的 kernel → byte-identical **且** ratio~1.0。判据:`mism==0 且 ratio≠1.0` = 真 byte-exact 调度胜;`mism==0 且 ratio~1.0` = 疑碰撞(或 autotune 选同 config,如 Mixtral E8)。
 - 探针:`_probe_ver_nt.py`(Shape A/B)+`_probe_ver_models.py`(任意 E,K,N)+`_prof_nt_shapeA.py`(PMC 单核启动器)。高-E(E≥256)`num_cu=-1` autotune 合成探针 M_c=G×16384 会 OOM → `pick_numcu(E)=256` 走 persistent 跳过 autotune(见 [[project_grouped_fp8_autotune_oom_highE]])。
 
+
+## ❌ tw fp8 TN wgrad:动"变体的 fragment 足迹"必炸 regalloc(2026-07-31 复现两次)
+
+`_wholeloop_asm_3buf` 一个 kernel 里同时存在 4 个变体 ((2,2)/(1,2)/(2,1)/(1,1)),
+每个变体用 `=&{v[...]}` 钉死 `ntmp` 个 8-VGPR 片段。**只要新增一种 ntmp 取值,整核 spill 爆炸**:
+
+| 改动 | ntmp 组合 | `vgpr_spill_count` | `private_segment_fixed_size` | 结果 |
+|---|---|---|---|---|
+| 基线 | {16,12,12,12} | **0** | 0 | gm 0.9864 |
+| b_halves=1 整池删除(含 ds_read) | {16,12,12,**8**} | **122** | 464 B | gm 0.9604(**−2.6%**,全 tile 变慢) |
+| 只删该池 g2s(足迹不变) | {16,12,12,12} | 9 | 40 B | gm 0.9849,wgrad 组持平 |
+
+- **规则**:边界变体只能删 **MFMA + 累加器 + g2s**,**ds_read 必须保留**(它决定足迹)。
+  与 r2 的"只删 MFMA"结论一致,这里补上机制:是 `ntmp` 的取值集合,不是删了什么。
+- ⇒ 想做 **128×512(5 池, ntmp=20)** 的边界变体,**不要塞进同一个 kernel** —— 那是第 5 种足迹。
+  正确做法:**独立 `@flyc.kernel` + 第二次 dispatch** 只跑 M 边界条带,主核变体集合原样不动。
+
+#### ⚠️ 勘误加强(2026-08-01 实测):不是「ntmp 取值集合」,是「任何变体的池数变化」
+上表把根因写成"新增一种 ntmp 取值"。按这个规则做了一次**保证 ntmp 集合不变**的手术:
+只给 `(2,1)`(半 N 且 a 满)变体删掉死 b1 池 —— `tiles=[nta,nta,ntb]` ⇒ ntmp=12,
+与既有 `(1,2)` 变体**完全同值**,集合仍是 {16,12,12,12}。实测:
+
+| | `vgpr_spill_count` | `private_seg` | gm | wgrad gate_up | wgrad down |
+|---|---|---|---|---|---|
+| 基线 | **0** | 0 | 0.9847 | 0.965 | 0.955 |
+| (2,1) 删死池(ntmp 集合不变) | **16** | 68 B | **0.9573** | **0.854(−14.6%)** | 0.937(−6.3%) |
+
+`gate_up` 的死池 tile 只占 12/276,却掉 14.6% ⇒ **损失是全局的**(spill 打在每个 tile 上),
+不是边界变体自己变慢。半 M/N 对拍 SNR 55.1~56.7dB、det=True、ndiff=0,纯性能判负。
+- ⇒ **规则改写**:`_wholeloop_asm_3buf` 的四个变体共享一次寄存器分配,**只要任一变体的
+  `n_pools` / ds_read 序列变了,整核 spill 就会动**,ntmp 数值是否撞车无关。边界变体能
+  安全删的只有 **MFMA + 累加器**(r2 结论),g2s 可删但只值 ~0.2%(r10)。
+- ★ **修正(2026-08-03,mxfp4 grouped 实测)**:这条卡里承重的是「**ds_read 必须保留**」那半句
+  (足迹 = `ntmp` 取值集合)。「g2s 只值 ~0.2%」是 **tw wgrad 专属,不可外推**:mxfp4 grouped 的
+  半-N 体同时删了 MFMA **和**一整组 BR g2s,`vgpr_spill_count` 仍是 **0**(vgpr 428→432、
+  sgpr 58→59),而 g2s 那一半值 **好几个百分点**。判据是「变体之间 ds_read 序列有没有变」,
+  不是「删了 MFMA 还是删了 g2s」。
+- ⇒ 同时把这条钉死:**tw wgrad 的 N 边界"死池"不是开口**。三种删法各自实测 —— 只删
+  ds_read(r2)≈0、只删 g2s(r10)≈0.2%、两个连池一起删(本轮)−2.8% gm。别再回来。
+- 附带:删掉死池的 global load(占该 tile 1/4 的 LDS-fill 流量)实测只值 ~0.2%,
+  远低于按"全 tile 强制"探针线性外推的 0.9% —— 见 methodology/06 的成本模型告警。
+
+## ✅ 已交付杠杆(2026-08-01 实测):边界体「少做功」若逼出更差的同步表,就别少做功
+
+`_compile_grouped_nn` 的半 N 边界体有两种形态(N=2944 ⇒ 最后一个 N-block 只有 128 列有效,
+占 1/12 的 tile):
+* `nn_halfn_noload=True`(旧默认,`nq==0`):连 b1 的 g2s + s2r 一起删 ⇒ 每迭代只发 3 组 g2s,
+  同样的 in-flight 允许量对它就不够(见下一条,`_nd=4/2` 两个值都 racy),只能退回
+  **每 K-iter 一次 `vmcnt(0)` 全排空**。
+* `nn_halfn_noload=False`(新默认,`nq==1`):**保留** b1 的 g2s/s2r,只删 c01/c11 的 MFMA 与 store。
+  g2s 发射序列与满体逐条相同 ⇒ 直接继承满体的 graded 逐消费者 drain(`_nd=2*(NSA+NSB)`)。
+
+实测(scored bench,其余不变):dgrad 组 geomean **0.98897 → 0.99399(+0.5pp)**,gm 0.99372 → 0.99600,
+`dgrad down balanced` 0.992→0.998、`gate_up heavy` 0.999→1.000。det:`_ck_nn_det 500` × 4 个宽 shape
+= 2000 run,mismatch 0,SNR 55.1~56.3dB。
+- ⇒ **规则**:边界体删工作量之前先问「删完之后它还能不能用主体的 drain 计数」。删掉一整组 g2s
+  会同时削弱 vmcnt 的保护力,被迫全排空时,省下的 HBM 流量远不够赔。
+- 同族反例已在树里:tw wgrad 的 `b_halves=1` 保留死池的 g2s/ds_read(删了炸 regalloc),
+  也是「少做功不一定赢」的另一种成因。
+
+### ★ 修正(2026-08-03,mxfp4 grouped 实测):删一组 g2s **不必**退回全排空
+
+上面「删掉一整组 g2s ⇒ in-flight 允许量不够 ⇒ 只能每 K-iter `vmcnt(0)` 全排空」在
+`mxfp4_grouped_kernel` 的 NT/wgrad whole-loop 上**不成立**。正确做法是把 phase barrier 的
+partial `vmcnt` **按被删 load 组的条数等量收紧**:满体 `vmcnt(_WLV)`,半-N 体
+`vmcnt(_WLV - nsb)`(nsb = 被删的 BR g2s 条数),`lgkmcnt` 与 ds_read/barrier 序列逐条不动。
+这样 graded drain 完整保住,g2s 的删除立刻兑现 **gm +3.8% / min +4.7%**,det=True。
+- ⇒ 规则应写成「**删一组 g2s 必须同时把 vmcnt 减去该组条数**」,而不是「删 g2s 就得全排空」。
+  只有在减完之后 vmcnt 仍无法表达「下一个消费者需要的那条已落地」时才退回全排空。
+
+## ❌ tw fp8 wgrad:XCD gather 在**组内**做也是死路(2026-08-01 实测)
+
+想拿 `num_xcd>1` 的 L2 聚簇又不吃 skew 的亏:把 `xcd_remap_pid` 从全局 tile 序改到
+**组内 local 序**(`local = idx % TILES_PER_GROUP` 之后再 remap),这样每组 tile 仍在同一个
+launch 窗口里(group-major LPT 完整保留),但每个 XCD 拿到 (m,n) 网格上连续的一条 band。
+
+| | gm | wgrad down balanced | wgrad gate_up heavy |
+|---|---|---|---|
+| 基线(xcd=1,round-robin 摊开) | **0.99372** | **0.962** | **0.995** |
+| 组内 xcd_group=8 | 0.98762(**−0.6%**) | **0.941(−2.1pp)** | 0.965(−3.0pp) |
+
+⇒ **XCD 连续分块对本核在两种形态下都是负的**,不是"全局版被 skew 毁了"那么简单:
+round-robin 把 8 个 XCD 同时压在**同一条 band** 上,共享的 MALL 命中率更高;连续分块让 8 个 XCD
+各自流一条不同的 band,MALL 工作集×8。与 PMC「tw wgrad 不缺带宽(L2 命中 66.9%)」一致 ——
+它缺的是**延迟**,而并发触碰同一份数据正是最好的延迟对策。别再往 XCD 重排上花轮次。
+
+## ❌ tw fp8 wgrad:`group_m=2` 已不再是 balanced 上的赢家(2026-08-01 复测,推翻旧记录)
+
+本卡与 campaign r4 记过「gm2 在 balanced/moderate/heavy 三种分布上都更快,只在 autotune 的
+`_canon_skew_offs` 上慢 3.9%,所以被 worst-of-two 判据挡掉」。今天把 `_WGRAD_4WAVE_CANDS`
+强制成 `((2,4,1),)` 直接量:
+
+| | gm | wgrad down balanced | wgrad down heavy |
+|---|---|---|---|
+| gm4(现候选表 cand[0]) | **0.99600** | **0.966** | **0.981** |
+| gm2 强制 | 0.99203 | 0.950(**−1.6pp**) | 0.966(−1.5pp) |
+
+⇒ 经过 r2~r7 的边界象限跳过 / K-block 地板 / drain 膝点几轮改造后,**gm2 在 scored 分布上也输了**。
+autotune 拒绝 gm2 现在是**凭实力**,不是被 skew 守卫误伤 —— 别再为了"救 gm2"去动 race 的负载集。
+
+## ❌ tw NN dgrad 的 half-N-noload 体(nq==0)不能用 graded drain
+
+r8 把 graded 逐消费者 vmcnt 用在满体上 +0.7pp,但 `nq==0`(丢 b1 载入的边界体)
+**每迭代那一次 `wait_barrier(0)` 是承重的**:它每迭代只发 3 组 g2s(满体 6 组),
+同样的"after-count 减一个 issue group"推导给出 4,实测 `_ck_nn_det 400`:
+
+| `_nd` | N=2944/K=2944 | N=2944/K=5760 | mg=512 |
+|---|---|---|---|
+| 4 | 0 | **2** | **12** |
+| 2 | 0 | **24** | 0 |
+
+两个值都 racy(且非单调)。**别再放宽它**;g2s 组数少 ⇒ 同样的 vmcnt 计数给的保护更弱。
+
+
+## ❌ tw fp8:主环 standalone `s_waitcnt vmcnt(N)` —— NN 上能删,NT 上不能
+
+r3 在 **NN dgrad** 主环删掉每 K-iter 那条独立 `s_waitcnt vmcnt(3)`(`nt_vmcnt=-1`),理由是
+per-iter rendezvous 已覆盖全部 LDS 读、缓冲是距离-2,实测 dgrad 组不劣且机制干净,已保留。
+2026-08-01 把同一个单值改动搬到 **NT fwd**(`_autotune_np_dispatch` 的 `mk()`,`trans_b` 分支):
+
+| | fwd 组 geomean | gm |
+|---|---|---|
+| `nt_vmcnt=3`(基线) | **1.0119** | 0.98813 |
+| `nt_vmcnt=-1` | 1.0099(**−0.2pp**) | 0.98631 |
+
+⇒ NT 主环那条 drain 是**承重的**,NN 的判定不跨核。两个核的 rendezvous 结构不同
+(r8 已记:NT 是均匀距离-2、NN 有一个距离-1 的 A1 池),所以"哪条 drain 冗余"必须逐核实测。
+同族的 r8 也已证反向不成立:graded 逐消费者 drain 在 NN 上 +0.7pp、搬到 NT 上 −0.3pp。
+
+
 ---
 来源: 08-att-root-cause.md, 04-ceiling-analysis.md, project_mxfp4_k28672_ceiling.md, project_mxfp4_epilogue_store.md, flydsl-fp8-gemm-results/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, mxfp8-grouped-gg-devloop/SKILL.md, 08-deadends.md, 05-dead-ends.md, 12-llama-aiter-baseline.md, mxfp8-8wave-devloop/SKILL.md, project_mxfp8_wholeloop_port.md, project_mxfp8_grouped_wgrad_wl.md, project_gptoss_nt_fwd_dgrad_opt(2026-07-28 PMC/gfx950-waitcnt 实测)
+
+
+## ❌ tw wgrad C store 的非临时/绕 L2 提示:全面大幅净负(2026-08-01 实测)
+
+`StoreCPerTensor(store_aux=)` 在 `kernel_grouped_tn_wgrad_4wave` 上扫 aux in {0,1,2,3,16,17},
+两个形状 x 三个分布(均 ndiff=0,纯性能判负):
+
+| aux | 语义 | down bal | gate_up bal | 结论 |
+|---|---|---|---|---|
+| 0 | 默认 | 1.000 | 1.000 | — |
+| 1 | sc0 | 1.002 | 0.999 | 中性 |
+| 2 / 3 | nt / sc0+nt | **1.090** | **1.085** | 净负 ~9-11% |
+| 16 / 17 | sc1(系统作用域) | **1.179** | **1.177** | 净负 ~18-21% |
+
+根因(比本卡旧条的"partial-line 事务暴增"更具体):MFMA 16x16 累加器的 lane 布局使
+每条 `buffer_store_short` 产生 **4 段 32B 的半行写**,靠同一 wave 相邻 4 个 `tj` 的存在 **L2 写合并**
+成整行,才能把 555MB 以 ~6 TB/s 发出去。任何 nt/sc1 提示削弱该合并 ⇒ 半行写直达 HBM。
+⇒ **凡是"每 lane < 128B/16-lane 连续"的 store,L2 写合并是承重的,不得加非临时提示**;
+这也坐实了 goal 里"NN dgrad 的 cstore_aux=1 配标量 store 预期同样负",不必再测。
+
+## ❌ 探针反例:把所有 WG 的 store 指向同一块输出以"消除内存流量"
+
+想把"epilogue 的 10% 到底是字节还是发射"分开,于是去掉 `base_row/base_col` 的 tile 偏移,
+让 4608 个 WG 写同一个 256x256 区域 ⇒ wgrad down balanced **0.909 → 1.093ms(慢 20%)**。
+量到的是**写竞争/同行串行化**,不是"无流量基准"。这类分解必须保持地址分散,
+只能改值(存常量)或改宽度,别改地址。
+
+#### ❌ 2026-08-01：整条"压低 SQ_INSTS_LDS / DS-per-MFMA"路线在 tw grouped fp8 上判负（三次独立实测）
+
+goal 一直把 tw 相对 mx 的 `SQ_INSTS_LDS` 超额（dgrad 1.324×、wgrad 1.405×）当成主开口，
+本轮用三个互相独立的实验证明**它根本不在关键路径上**：
+
+1. **DS/MFMA 0.75 的结构已经在树里，而且更慢。** ratio = `32/n + 64/m`（per-wave tile m×n，
+   B 侧 8B/lane tr 读）。要到 0.75 必须 `m·n=16384` ⇒ **256 AGPR/wave ⇒ 1 wave/SIMD**。
+   8-wave WG 需要 2 waves/SIMD（≤256 reg），所以 **0.75 与 occupancy 直接互斥**，
+   `BLOCK_M=512` 的 8-wave 形态还额外撞 LDS（A 4 半区×2 stage=128KB + B 64KB=192KB > 160KB）。
+   唯一可行载体 = 已存在的 4-wave `_compile_grouped_nn_4wave`（128×128 wave tile，DS/MFMA 0.75）：
+   实测在四个计分点全输 **3.0 / 5.5 / 5.5 / 6.6 %**（最好的 xcd4/gm8）。
+   ⇒ **别再为"更方的 wave tile"立项**；DS 少 25% 换不回 occ 从 2→1 的损失。
+2. **直接删 25% 的 ds_read = 0.0%。** NN dgrad 半-N 边界体（1/12 tile）的 b1 transpose 读只喂
+   被跳过的 c01/c11，是死读；删掉后 dgrad 四点 geomean **1186.5 → 1187.5 us（噪声内）**。
+3. **再把那批 g2s 的地址改指向 b0（省掉 25% 的越界 HBM 读流量）= 0.0%**（1186.6 us）。
+   ⇒ 这族核既不是 LDS-指令 bound 也不是带宽 bound。与 methodology/05 的
+   「消 conflict ≠ 变快（红鲱鱼判据）」同一模式，只是换成了指令**条数**。
+
+#### ★★ tw NN dgrad 的 8 barrier/K-iter 是**双向**局部最优（2026-08-01 实测）
+
+主环每 K-iter 4 phase × 2 barrier。两侧都量过：
+- **全删 8 个 barrier**（只留 vmcnt drain，时序探针）→ dgrad geomean **1186 → 1273 us（−7.3%）**。
+- **每 phase 在 s2r 读与 g2s 写之间再加 1 个 barrier**（+3 个，wave-uniform、无 race）→ **1234 us（−4.0%）**。
+⇒ barrier 在 occ=2 waves/SIMD 下是**波相位对齐装置**（同 SIMD 两波错开 MFMA/LDS），不是开销。
+r3 的 `sched_schedbar`（−1.4%）只是这条曲线上的一个点。**别再动 dgrad 的 barrier 数量。**
+对照：wgrad（4-wave、occ=1、4 波在 4 个不同 SIMD 上）删掉每-phase barrier 只值 **0.27%**，
+加一个 phase 中点 barrier 反而 −0.22% ⇒ **"多同步"不跨占用率迁移**。
+
+#### ★ tw NN dgrad 的 per-tile prologue rendezvous：减法上界只有 0.21%
+
+把 `_w1/_w2` 放宽到 `vmcnt(63)`（数值错，仅计时）→ 1186.5 → **1183.9 us**。
+⇒ 非持久化 dgrad 每 tile 一次的 prologue 全局往返已被掩盖，**不值得为它建跨 tile 预取**
+（wgrad 侧 r13 已得同结论）。
+
+#### ★★ mxfp4 grouped 的 preshuffle 核是 VALU-issue bound：per-thread O(G) 扫描要换 lane-resident 表（2026-08-03 实测）
+
+`mxfp4_grouped_kernel` 的 scale preshuffle（`kern_0`，A/B 两条 slab 合在一个 grid 里）每个线程只搬
+**8 dword**，却曾经跑 **759 VALU/wave**：它为了把 A-slab 的 64 行块映射回源行，在**每个线程**里跑一遍
+`G=32` 的串行组扫描（每组一次 group-offset load + 一组 select）。ATT 记账：整核 15.9M VALU insts，
+其中扫描占 ~92%。
+换成 GEMM prologue 早就在用的 **lane-resident 表**（lane g 拥有组 g，一次 wave 内 inclusive scan +
+两次 O(1) 查表；`wi` 由 `gid/nd/16` 结构性 wave-uniform，所以每个 wave 只有 `2*wi`、`2*wi+1` 两个查询）：
+**VALU 759 → ~206/wave，kern_0 35.34 → 16.32 µs（−54%），全 18 配置 gm +1.1% / min +2.0%，SNR/det 不变。**
+判据(可移植)：**preshuffle/量化这类"每线程搬几个 dword"的核，先用 `SQ_INSTS_VALU/wave ÷ 有用 dword 数`
+看比值**；>10 VALU/dword 基本就是索引/扫描逻辑吃掉了核，别去优化搬运路径（宽存、LDS staging 都白搭，
+后者在本核还出过 nan）。同一份 `_lane_tbl_*` helper 在 GEMM prologue 与 preshuffle 两处复用。
+
+#### ❌ 别再试：mxfp4 grouped whole-loop 里"拉长 ds_read→MFMA 依赖距离"（含寄存器级 operand 双缓冲）
+
+三条独立证据，方向一致：
+1. **物理上装不下。** 4-wave whole-loop 用 VGPR 432（arch 176 + AGPR 256），unified 512 池只剩 **80**；
+   一组 operand fragment（A 8 行 + B 8 列 × n_sub，b128）= **128 VGPR** ⇒ 寄存器级双缓冲必然 spill，
+   而 spill≠0 会让手写 partial `vmcnt(N)` 语义失效（pitfalls/04）⇒ 直接连带 race。
+2. **本来就没有气泡可减。** ATT 逐指令：ds_read stall **0.05–0.12 cycle/条**（整 phase 4.9 cycle
+   ≈ in-loop 开销的 0.4%）、in-loop `s_waitcnt` 4.0 cycle；紧跟内存指令的 MFMA stall 0.28。
+3. **零寄存器成本的等价探针也判负。** 改 `emit_inplace` 的 4×8 cell 发射序（等价于改每个 fragment
+   的 last-use→refill 距离，不多花一个寄存器）：column-major **±0.15%（平局）**、diagonal
+   **+0.7~1.2%（更慢）**、cyclic **+0.0~0.3%**。⇒ 现有 blocked-diagonal 序已在最优附近。
+**下一个具体杠杆不在 operand feed 上**：ATT 把 in-loop 开销指向 g2s 的**服务速率**背压
+（round-4 已判负重排），F 侧则指向 epilogue 的 VALU 链条数（`cvt_pk` 配对）与 preshuffle。
+
+#### ❌ 别再试：mxfp4 grouped NT prologue 的 partial-drain（`wait_barrier(N>0)`）
+
+prologue 发 32 条 `buffer_load ... lds`（2 buffer × (A 8 + BL 4 + BR 4)）后 `vmcnt(0)` 全排空。
+把发射序改成 **buffer-major**（buf0 全部 → buf1 的 A → buf1 的 B），再把屏障放宽到只留 buf1 的
+B 半区在飞（`vmcnt(8)`，其首个消费者在第一个 phase 第二个 4×8 block，≥1024 cycle 之后，结构上安全）：
+**实测 −0.18% / +0.01%，即噪声内的平局**（`vmcnt(4)` 同）。
+机制：这段的成本是**issue backpressure 而不是 tail latency** —— ATT 量到 36 条 g2s 的 issue stall
+lat/hit **119 cycle**，32 条发完本身就 ~3.8k cycle，等最后一条落地几乎不额外花钱 ⇒ 放宽屏障没有可省的量。
+要动只能**不发**（把 buf1 的 g2s 推到第一个 phase 之后），那等于把流水深度砍回 1，与 clean
+double-buffer 已判负（0.65–0.82x）撞车。★ round-1 记的 `wait_barrier(16)`「方向不一致
+（−1.9%/+1.6%）」也由此结清：那个变体在**旧的 A-major 发射序**下 `vmcnt(16)` 会让 BL0/BR0 还没落地
+就被 asm prologue 的 `emit_ds(0,0)` 读走 —— 它是个 **racy 臂**，那两个数字不可用。

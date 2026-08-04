@@ -50,6 +50,9 @@
 | scale 流 tile-major/cache-line 共置重排 | ❌实测DEAD | subtractive-pin 证伪「scale-thrash」:四条地址流合计 ≤4% 超额 miss,scale 本就驻留;定价 ~0.002% wall | pitfalls/05 |
 | 在功耗墙(≥99% TBP)核上继续削 DRAM 字节 | ❌实测DEAD | 387 MB 超额全消掉只值 ≤0.18% wall(DRAM 占能量 0.8~1.6%);★**下一刀=LDS→VGPR 读放大**(55% 能效,缺口 10~30× 于 DRAM 杠杆) | pitfalls/05 · methodology/12 |
 | atomic 融合 reduce(dense split-K) | ❌实测DEAD | 同地址 HBM atomic 争用串行;split+reduce 是答案 | pitfalls/05 |
+| 优化 scale preshuffle 核的**搬运**路径(宽存/LDS staging) | ⚠️先量 VALU/dword | 它常是 **VALU-issue bound**:per-thread O(G) 组扫描 759 VALU/wave 搬 8 dword;换 lane-resident 表 −54% 核时间(gm +1.1%) | pitfalls/05 |
+| mxfp4 grouped whole-loop 寄存器级 operand 双缓冲 / 拉长 ds_read→MFMA 距离 | ❌实测DEAD | 只剩 80 VGPR 装不下 128;ATT ds_read stall 0.05-0.12 cy/条;零成本的 cell 重排等价探针 ±0.15~+1.2% | pitfalls/05 |
+| mxfp4 grouped NT prologue 放宽 `wait_barrier(N>0)` partial drain | ❌实测DEAD | 该段是 issue backpressure(119 cy/条)不是 tail latency,放宽屏障 ±0.2% 平局 | pitfalls/05 |
 
 ## D. attention(fwd + bwd)—— 优化顺序 playbook 见 methodology/15;实测 win/dead 见 pitfalls/12(dsv4)+13(hd64 dense)
 > 优化前先读 **methodology/15-attention-optimize**(定 bound→fwd:消/藏 store·_FMAX0·dual-wave / bwd:减 MFMA·融串行核→藏 MFMA 延迟→exp2·occ·确定性)。
@@ -136,6 +139,7 @@
 | `BLOCK_M=128`(grouped/dense config sweep) | ❌实测DEAD | grid 写死 /256 → 少启动块假象,真实 1.55× 慢 | pitfalls/05,06 |
 | per-shape `num_xcd` / 旧 `m_total<=2048` gate | ❌实测DEAD | overfitting 噪声 / 误判高-G MoE 走 masked | pitfalls/06 |
 | grouped/MoE 核用 `num_xcd>1` 连续块 remap(照抄 dense) | ❌实测DEAD·skew | 连续 tile 整段绑一个 XCD ⇒ hot expert 压到单 XCD;wgrad band-cyclic+xcd=8 是 skew 崩溃主因(修=group-major+xcd=1,+26%/min 0.474→1.005)、NT xcd=8 同源 down-heavy −3% | methodology/08 · methodology/05 |
+| ★✅ **grouped 核的 XCD 分区改 band-cyclic**(XCD x 拿第 x, x+8, … 个 `span` 个 M-block 的 run) | ✅mxfp4 grouped **+1.6% gm / +4.8% min** | 「连续块」与「逐 tile 轮转」是同一条轴(轮转粒度)的两个极端:连续 ⇒ 小-expert 尾巴全压一个静态 XCD;逐 tile ⇒ band 内 A/B 复用被打散。甜点 = **run 与组边界对齐**(span = 均匀分布下每组 M-block 数),skew 罚金 7%→0~1.8%。⚠**同核的 wgrad 相反**:它的 skew 在 contraction 长度上,只有 `xcd=1` 均衡 | methodology/05 |
 | `set_*_backend(BackendType.FLYDSL)` | ❌DEAD | FLYDSL 未注册进 BackendType | pitfalls/06 |
 
 ## F. 正确性 / 数据构造(先读,否则静默错)
@@ -163,6 +167,7 @@
 | 按 CPU/GPU 占用 0% 判 campaign 卡死 | ❌方法错 | agent 大部分时间等 API;轮内唯一活信号是 kernel 文件 mtime(`deep_raw.jsonl` 只在收轮时落盘) | methodology/16 §4 |
 | 小形状"内核慢"下结论前先量 host enqueue | ⚠必做 | wall 84 / host 85 / GPU 50 µs;判据=扫 S 时**工作量差 64× 而时间不变**;修法=缓存 `flyc.compile` artifact,host 93→7 µs | pitfalls/02 · pitfalls/13 |
 | 用**代换探针**给一条指令定单价 | ❌方法错 | 差额会被重叠吃掉:exp 代换读出"全速率",PMC 直接分解是 half-rate(8.14 拍),差 1.6× | connection/common/05 · pitfalls/13 |
+| 在 e2e 训练里**加 python print** 验证某 kernel 有没有真跑 | ❌方法错 | 派发路径可能不是你以为的那条(MoE 走 ragged,不经 PrimusTurboGroupedLinear/公共 grouped_gemm_fp8)→ print 在死路全为 0,误判"没触发"。**开 torch profiler 看 trace kernel 名才是 ground truth**(pad-quant kernel = K-pad 铁证) | methodology/17 · [[project_kpad_e2e_trace_validated]] |
 
 ## H. 环境 / 同步 / 构建(违反=破坏别人环境)
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |

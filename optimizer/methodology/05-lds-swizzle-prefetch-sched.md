@@ -81,6 +81,100 @@ attention bwd 的 tr16 转置读(`ds_read_tr16_b64` 喂 GEMM2 A-operand)有顽�
 | **XCD WG-id remap** | 保持 `chunk_size` 个连续 id 在同 XCD:`chunk_idx*(num_xcds*chunk_size) + xcd*chunk_size + pos`→相邻 tile 共暖 L2 | — | **dense** GEMM/attention 有均匀空间局部性时是实打实的 win;**grouped/MoE 核在 skew 下相反(见下 ⚠️)** |
 
 ⚠️ **`num_xcd>1` 的连续块 remap 在 grouped/MoE 核上是 skew-fragile 的**(2026-07-30 NT 核实测,与 wgrad 同源见 methodology/08):连续 tile 整段绑到同一 XCD ⇒ 把 hot expert 压到一个 XCD。`dgrad/fwd *_down heavy` 在 xcd=8 下掉 **2.8~3.0%**(balanced 中性),全局强制 xcd=8 净 −1.6%(miss −20.4% 但 cyc +5.3%)。**没 ship 的唯一原因是本核顶在 1400 W 功耗墙 ⇒ tile 顺序不改 energy、wall 惰性**;但 NT 候选表里遗留的 `(256,4,8,0)` 对 bench 的 skew 配置是**潜在毒**(竞速当前 3/3 选 base 未触发)。⇒ **`nt_num_xcd=8` 作基线只对 dense 局部性成立;grouped 核最优是 group-major 序 + `xcd=1`(HW round-robin 均分每组 tile),不是照抄 dense 的连续块聚簇**。
+★ **反例 / 修正(2026-08-03,mxfp4 grouped 实测)**:「grouped 核最优是 `xcd=1`」**不普适**。同一批
+gpt-oss skew 配置上逐配置实测 `xcd=8` 明显优于 `xcd=1`(R2:两个 min 配置 −7.0%/−7.8%;本轮
+`fwd/dgrad down balanced` `xcd=1` 反而 +2.3~3.2%),全 18 配置 `xcd=2` gm 1.4366 vs `xcd=8` 1.4486。
+**skew 与局部性是一对 trade-off,方向随核而变**:`xcd` 越小越均衡(heavy 组 −4~5%)、越大局部性越好
+(`fwd gate_up` 从 1.373 崩到 1.223)。⇒ 该轴必须**当场逐配置扫**,别照搬任何一侧的结论;而且
+**快筛配置集必须同时覆盖 (窄N,短K) 与 (宽N,短K)** —— 本轮只筛了 `dgrad gate_up`(长 K)就漏掉了
+`fwd gate_up` 的 12% 崩塌。
+
+### ★★ 过发射 grid 上做 XCD remap:`total_pids` 必须是**活 tile 数**,不是 grid 上界(2026-08-03 mxfp4 grouped 实测 +1.4% gm)
+
+grouped/MoE 核的 grid 是**上界**(每组 round-up 的最坏情况,`(ceildiv(total_M,BM)+G)*n_blocks`),
+真实 tile 数 `total_tiles` 只有片上 O(G) scan 之后才知道。此时 remap 的 `total_pids` 传谁,是
+**一个 6% 量级的负载均衡 bug**:
+
+* ❌ `pid = xcd_remap_pid(block_idx, grid_upper, 8)` 然后 `if pid >= total_tiles: s_endpgm`
+  —— remap 是 `[0, grid_upper)` 上的双射,死 pid 区间 `[total_tiles, grid_upper)` 整段落在
+  **最后一个 XCD 的尾部**(它拥有 remap 值域的最高段)。gpt-oss 形状实测:544 个 m-block 里 32 个是
+  死的(5.9%)⇒ XCD0-6 各干 816 tile,**XCD7 只干 432**。XCD 分区是**静态**的(HW: XCD = bid % 8),
+  别的 XCD 帮不了它 ⇒ wall 由 816/768 = **+6.25%** 决定。
+* ✅ 退出测试打在**原始 bid** 上,remap 只在活 tile 上做:
+  `if block_idx >= total_tiles: s_endpgm` → `pid = xcd_remap_pid(block_idx, total_tiles, 8)`。
+  这样 remap 是 `[0, total_tiles)` 上的干净双射,过发射的 WG 按 `bid % 8` 被 HW **均摊到 8 个 XCD**。
+  实测 gm 1.4292 → 1.4486(两次 1.4467/1.4506),SNR/det 不变,per-tile L2 足迹与遍历序完全没动。
+* **别把 remap 的 total_pids 设成 grid 上界再靠 remap 后的 pid 做退出** —— 那两件事顺序反了。
+  `mxfp8_grouped_kernel` / `gemm_fp8_grouped_kernel` 本来就是对的(`xcd_remap_pid(t, total_tiles, …)`),
+  照抄它们。⚠️ 反过来也别把 remap 的 total_pids 改成 total_tiles 却仍用 remap 后的 pid 做退出:
+  `bid >= total_tiles` 时映射会**撞进活区间**(pid 碰撞 ⇒ 有 tile 算两遍、有 tile 没人算)。
+* **诊断签名**(不用改代码就能判):同形状不同 skew 下 `SQ_INSTS_MFMA`、`TCC_REQ/HIT` 逐位相同,
+  而 `GRBM_GUI_ACTIVE` 差 13%,同时 `SQ_BUSY_CU_CYCLES` 只差 0.7% ⇒ **CU 空转 = 静态分区的负载不均**,
+  不是访存、不是 latency(`TCC_EA0_RDREQ_LEVEL/RDREQ` 只差 1.9%)。这三对计数器是判 XCD 分区
+  不均的最短路径。
+
+### ★★ grouped 核的 XCD 分区要 **band-cyclic**,不是「连续块」也不是「逐 tile 轮转」(2026-08-03 mxfp4 grouped 实测 +1.6% gm / +4.8% min)
+
+`xcd_remap_pid` 给每个 XCD **一整段连续 pid**;`xcd=1`(identity)让 HW 按 `bid % 8` **逐 tile** 轮转。
+这两端都不是最优 —— 它们是同一条轴(**XCD 轮转粒度**)的两个极端:
+
+```python
+# band-cyclic: XCD x 拿第 x, x+8, x+16, ... 个「run」,每个 run = band 个连续 tile
+span = num_xcd * band
+xcd, loc = pid % num_xcd, pid // num_xcd
+rnd = loc // band
+mapped = (rnd * num_xcd + xcd) * band + (loc - rnd * band)
+pid = select(pid < (total_pids // span) * span, mapped, pid)   # 尾部退 identity 保双射
+```
+双射证明:`bid ↔ (xcd, rnd, q)` 与 `mapped ↔ (rnd*8+xcd, q)` 都是唯一分解;尾部区间 `[full, total)` 不与
+`[0, full)` 相交。**退出判定仍打原始 `bid`**(见上一条卡)。
+
+**为什么两端都不对**:grouped 核的**每 tile 成本不均匀**——只有 1 个 M-block 的小 expert 拿不到任何 B 复用。
+连续分区把整条小-expert 尾巴压在一个 XCD 上(静态 `bid % 8` 事后无法再平衡,那个 XCD 决定 makespan);
+逐 tile 轮转则把一个 band 内的 A/B 复用打散到 8 个 XCD。band-cyclic 两头都保:run 内复用留在本 XCD 的
+L2 slice,而每个 XCD 又在整个 token range 上取样。
+
+**run 长度实测(gpt-oss G=32 / M=131072 / BM=256 ⇒ 每组 16 个 M-block;span 单位 = M-block)**:
+
+| span | balanced | moderate | heavy |
+|---|---|---|---|
+| 2(=一个 gm=2 band) | **+9~11%** | — | −6.3% |
+| 8 | +1.4~1.7% | — | −5.8~6.9% |
+| **16(=一组的 M-block 数)** | **+0.0~0.8%** | **−1.8~2.7%** | **−4.5~6.1%** |
+| 24 | +0.2~2.9% | — | −4.5~5.2% |
+| 32 | +0.1~0.4% | — | −3.1~4.4% |
+
+⇒ ① **run 必须装得下同一组的好几个 band**(span=2 只有 1 个 band ⇒ balanced 崩 10%);
+② **run 越长均衡越差**(span=32 只有 2 run/XCD,heavy 只剩 −3~4%);
+③ **甜点 = run 与组边界对齐**(span=16 时 balanced 每组恰好一个 run ⇒ 零回归;span=14 在 balanced 上
+`gate_up` +1.2~1.6%,正是 run 跨组把两个 expert 的 B 同时拉进一个 XCD)。
+⇒ 落地形态:**span = 均匀分布下每组的 M-block 数**,并按「run/XCD ≥ 4」核对。
+实测把 heavy-vs-balanced 的 skew 罚金从 6.7~7.4% 压到 0~1.8%(fwd `gate_up` 上 heavy 反超 balanced)。
+`SQ_INSTS_MFMA` / L2 足迹逐位不变 ⇒ 逐字节确定性天然保住(两次 bench det=True)。
+
+### ⚠️ 同一个核的两条路径可能要**相反**的 XCD 策略:先问 skew 载体是 tile 数还是 contraction 长度
+
+mxfp4 grouped 的 NT(fwd/dgrad)吃 band-cyclic,**wgrad 却必须留在 `xcd=1`**。历史上把 wgrad 一起换成
+`(gm=2,xcd=8,gn=0)` 实测崩到 **0.382~0.549x**,当时没归因;机制其实很干脆:
+* wgrad 的 tile 数**每组恒等**(`TILES_PER_GROUP` 编译期常量),但**每 tile 的 contraction = 该组的 M_g**,
+  heavy 分布下 M_g 相差 **80×**。连续分区 ⇒ XCD x 拿 group `4x..4x+3` ⇒ XCD0 拿到最大的四组
+  = 全部工作量的 **86%** ⇒ wall ≈ `8 × 0.86 = 6.9×`(实测 4.3×,同一量级)。
+* 而 band-cyclic 也救不了它:group g 的 TPG 个 tile 被按 run 发牌,XCD 之间的差就是 **1 个 run**
+  = `R / (TPG/8)` 的组内份额;`TPG=276` 时 R=8 已经是 23% 的组内不均,乘上 group 0 的 62% 成本份额
+  = 14% 总不均。**只有 R=1(=identity/HW 轮转)才恰好均衡** ⇒ wgrad 的 `xcd=1` 是最优,它的 L2 复用
+  只能从 `group_n` band 里拿。
+⇒ **判据**:先量「skew 落在 tile 数上还是落在每 tile 成本上」。落在 tile 数 ⇒ band-cyclic 有解;
+落在 per-tile contraction 上且组内 tile 数不够多 ⇒ 任何粗于 1 tile 的分区都会按比例引入不均。
+
+#### ★ 精化:「wgrad xcd=1」可**按-band 放宽**,门控在 device 上判(2026-08-03 tw grouped wgrad campaign,+0.18%)
+- 上文与 pitfalls/05 §"XCD gather 在组内做也是死路"(**无条件**给所有 band 上 xcd=8 → −0.6%)说的是
+  **一刀切**;它们**没被推翻**。可放宽的是**粒度**:`_wgrad_band_is_xcd_aff` 在 device 上逐 band 判
+  「这条 band 的分布够均衡吗」,**只对判定均衡的 band** 做 XCD 聚簇,hot/skew band 仍留 HW round-robin。
+- ⇒ 净 **+0.18%(det-safe)** —— 小,但方向明确:blanket-xcd=8 负、blanket-xcd=1 是安全默认、
+  **runtime 逐-band 门控**能在不碰 hot band 的前提下把均衡 band 的 L2 复用捡回来。
+- **判据**:XCD 亲和不是核级 on/off,是 **band 级**决策;能不能开取决于**该 band 运行时的分布**,
+  必须片上判(别引入 host D2H)。与 [[project_wgrad_reach_fwd_campaign]] 的单-window split-K 同源
+  (都靠 `group_offs` 的 wave-uniform SALU policy,见 methodology/08 §运行时自适应单-window split-K)。
 
 ### ★ attention bwd 上的 XCD remap(2026-07-27 meta hd64 实测,单项最大杠杆)
 - **形式**:`xcd = block_id % 8`(片上实测确认此式,别猜),让每个 XCD 拿一整块 `(batch, kv_head)`,
@@ -108,6 +202,11 @@ attention bwd 的 tr16 转置读(`ds_read_tr16_b64` 喂 GEMM2 A-operand)有顽�
   实测 min 配置 gm 2/4/8/16 = 1.010 / 1.036 / **1.045** / 1.031,单峰。
   ⚠ **别简化成"A band 必须 ≤ 4 MB"**:按那条规则 K=5760 该选 gm=2,而 gm=2 实测最差(1.010)—— B 流量项压过驻留项。
   ⇒ 做法:autotune 的 cfg_key **必须含 K**,再用 `gm*BLOCK_M*K > 4 MiB` 这个物理阈值给 cand[0] 分档,候选数不变。
+  ⚠ **这条按 K 分档只在 NT(mxfp8 grouped NT)上成立,别外推**:2026-07-31 在 **tw grouped NN dgrad**
+  上照此把 cand[0] 的 gm 在 K<4096 时从 8 收窄到 4(xcd 不变=4),`dgrad down`(K=2944)
+  **掉 1.2pp(0.990 → 0.978)**,K≥4096 的 `gate_up` 不受影响 ⇒ 已回滚。
+  根因方向:NN 的 B[K,N] 是**沿收缩维 strided**,band 里复用的是 B 的 N-stripe 而不是 A 的 slab,
+  A 足迹越 4MB 线的那套算术不适用。**gm 的最优值必须按 kernel(NT/NN)分别实测,不能跨布局搬。**
 - **2D autotune gating**:候选 gated `n_blocks>=32 and M//256>=16`(小 M 的 m-block 太少、banding 不划算,走 1D 防回归);winK 块(K≥28672)也 sweep `group_n ∈ {n_blocks/8, n_blocks/4}`。
 - **persistent kernel** 要 remap 的是 **PERSISTENT work-id,不是 `blockIdx.x`**。
 

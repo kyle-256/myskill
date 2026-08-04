@@ -82,6 +82,37 @@
 ### mxfp4 4-wave 稳定 emit 边界
 - `ELGK ≥ 15` racy(最优 9);`WLVMCN ≥ 20` racy(最优 10)。
 - barrier 是 race-critical:减 barrier(`LEANBAR`)必触发 operand race。
+- ⚠️ **更正:`15` 不是调参边界,是 ISA 编码上限** —— gfx950 `lgkmcnt` 是 **4 bit 字段**,
+  写 `s_waitcnt lgkmcnt(16)` **汇编器直接报错** `too large value for lgkmcnt`(失败签名
+  是一大片 MLIR/lld 噪声 + `target emulation unknown`,真因在很上面,**grep `error:`** 别读 tail)。
+  所以那条应读成"9 最优,15 是存在的最大值"。**racy 阈值是 per-kernel 的**:2026-07 tw fp8 TN
+  var-K wgrad whole-loop 上 **12 最快**,15 仍在 1500 reps 逐字节一致。
+
+### ★★ partial `vmcnt(N)` 必须留"一整个发射组"的余量,恰好卡边界 = race(2026-07 实测)
+
+- **规则**:一条 g2s 写、到读它的那条 `ds_read` 之间,若中间发射了 `S` 条 load,则该读之前的
+  drain 必须取 `N ≤ S − (一个发射组)`。**取 `N = S`(按发射顺序"刚好够")会 race** ——
+  gfx950 vmcnt 乱序退役,`in-flight ≤ S` 完全可以是"要的那条还在飞 + S−1 条新的"。
+- **踩证(tw fp8 NN dgrad,8-wave)**:去掉 transpose-read 自带的 `vmcnt(2)` 后,只剩每
+  K-iter 一条 rendezvous drain。按发射顺序算 distance-1 的 A1 池恰好是 `S=2*NSA+NSB=6`:
+  取 `N=6`(margin 0)→ 宽 shape 300 reps **2 次不一致**;取 `N=4`(margin 0,卡的是 epilog
+  里另一条 `S=4` 的读)→ 仍 **2 次不一致**;取 `N=NSA+NSB=4` 并把 epilog 的读留着自带
+  drain → **500 reps × 4 shape = 2000 run 全部逐字节一致**。
+- **别用单调性外推安全性**:同一 kernel 上 `N=8` 只错 3 次、`N=6` 错 13 次、`N=-1`(无 drain)
+  错 7 次 —— **非单调**,因为它是代码布局/时序驱动的概率事件,不是阈值。**只能逐个实测**。
+- **算 margin 前先把 prelude / epilog 单独算一遍**:稳态主环的 `S` 通常有一整个迭代,
+  prelude 第二批 load 往往比稳态迭代**少一个发射组**、epilog 的读离它的 g2s 只有半个迭代,
+  这两处才是 margin 最小的地方,也是本次两次 race 的真正落点。
+
+### ★ LLVM 不给 intrinsic LDS 读插 vmcnt —— LDS-DMA 可见性全靠手写 drain
+
+- `buffer_load ... lds`(g2s)写 LDS 走 vmcnt,`ds_read` 读 LDS 走 lgkmcnt;**两者之间
+  没有任何自动同步**。实测 gfx950 上把 NN dgrad 主环所有手写 `vmcnt` 去掉后,`21_final_isa.s`
+  里**一条 `s_waitcnt vmcnt` 都不剩**(包括 A 侧走 intrinsic `ds_read_b128` 的那条路径)。
+- ⇒ **别指望"A 侧是 intrinsic,编译器会保守处理"**。手写的那几条 `vmcnt` 是**整个 kernel
+  唯一的 LDS-DMA 可见性装置**,删一条就等于把 A、B 两侧的保护一起删掉。
+- 反过来:`s_barrier` 之前 gfx950 **不会**自动插 `vmcnt(0)`(FeatureBackOffBarrier),
+  所以 barrier 只同步执行位置、不 drain —— 这正是这套 kernel 能做深流水的前提。
 
 ### ISA diff 精确定位 racing gap
 - `PT_RACE_VM=0`(safe) vs `=1`(racing) 的 `21_final_isa.s` 只差 **2 行**(两相位 barrier 的前置 drain):
@@ -93,10 +124,44 @@
 ### 安全回收 racing 优势 = 加缓冲深度换 partial-drain
 - 1 池 3buf(只给 B1 第 3 缓冲):安全延迟 1/4 写 → 回收 racing 优势约 **51%**。
 - 2 池 3buf(B0+B1 都第 3 缓冲):安全延迟 1/2 写 → m2048 打平/超 racing、全线比 1 池 **+2~4%**、m4096 距 racing **0.6%**。
+- **2 池 3buf 已经吃满 racing 优势(tw fp8 wgrad 实测,2026-07)**:在它之上再放宽到
+  完全 racing 的 `vmcnt(16)` 买到 **0.00%**(0.98033 vs 0.98027);反向收紧到 `vmcnt(0)`
+  全 drain 则 **−7.5%**(每个 wgrad 配置 −6.8~11.5%)。⇒ 这条流水正好停在膝点,
+  "再加缓冲深度 / 再多 defer 写"在该 kernel 上是**已耗尽的杠杆**,剩下的停顿在 lgkm 侧。
 
 ### prefetch:AGPR 累加腾 VGPR → 手工提早 ds_read
 - AGPR 累加腾出的 VGPR 余量(如 **128→110**)可用于把 operand ds_read 主动提早进 MFMA 窗口做重叠。
 - 编译器因 volatile+barrier 强序做不到;手工把一个 operand 的 ds_read **下移一个 barrier**(在可见性安全范围内)可恢复并反转残差。
+
+## ★ 分级 drain(graded per-consumer vmcnt):把单个 rendezvous 拆到各消费者前
+
+单个 "覆盖下一整轮 LDS 读" 的 `s_waitcnt vmcnt(N)` 必然被**最紧的那个 pool** 钉死:
+N 只能取 `min_pool(该 pool 填充之后发出的 load 数) - 一个 issue group`。
+**拆开放**——每个 phase 收尾 barrier 各带一条 vmcnt,只覆盖紧随其后的那次 LDS 读——
+每条就只需回溯到"上一轮发出的填充",N 直接翻倍。零新增指令(vmcnt 挂在已有 barrier 上)、
+零 LDS、byte-exact。2026-07-31 tw NN grouped dgrad 实测:单条 `vmcnt(NSA+NSB)=4`
+→ 三条 `vmcnt(2*(NSA+NSB))=8`,dgrad 组 geomean **0.9810 → 0.9878(+0.7pp)**,四个配置全涨,
+总 gm 0.98505 → 0.98710。
+
+### ★★ 适用前提:先数每个 pool 的 distance,只有"存在唯一一个 distance-1 pool"才赢
+- 2-buffer ping-pong 的 pool,只要在**读之后**回填,拿到的就是 k+2(distance-2);
+  若回填的是**另一个** slot,则只能是 k+1(distance-1)。一轮里最后被读的那个 operand
+  常常被迫走后者(它的 slot 要到下一轮开头才空出来)= 唯一的 distance-1 pool = 全局 drain 的下界。
+- **全 pool 已 distance-2 时,分级/挪动 drain 是中性甚至负的**(同轮三处实测):
+  ① NN dgrad 给 A1 加**第 3 块 LDS buffer** 变 distance-2、并撤掉它那条 drain →
+     dgrad 0.98800 vs 0.98824,**中性**(白花 16KB LDS + 三槽轮转)。
+  ② NT fwd(`nt_dist2=True`,四个 pool 本就 uniform distance-2、每轮一条 drain)照搬分级 →
+     fwd geomean 1.0116/1.0127 → **1.0094(−0.3pp)**,`fwd down balanced` 1.036 → 1.024。**判负**。
+  ⇒ 结论:**杠杆不是"drain 条数"或"in-flight 上限",是"单条 drain 被 distance-1 pool 钉死"这个结构缺陷**。
+  没有那个缺陷就别动 drain 排布。
+
+### ⚠ prelude/首轮 rendezvous 不适用循环内推出来的 margin
+同一份 margin 规则(binding - 一个 issue group)在主循环里 1600 rep 干净,搬到**进循环前的
+那条 rendezvous** 上 → **wide shape 每 rep 都不一致(400/400)**,其中一个 shape SNR 掉到 34.3dB,
+而计分 bench 自带的 `N=1024/K=256` det 门**照样全绿**。原因未根因(疑似上一个 tile 的
+`buffer_store` 仍占 vmcnt 槽,使 issue-order 计数在 tile 缝失效)。
+⇒ **prelude 的 drain 保持紧;要放松必须单独 400+ rep wide-shape 验证,不能靠推导。**
+（同源提醒见 pitfalls/04 §"det gate on narrow shapes passes while wide shapes diverge"。）
 
 ## 长 K(K28672)HW 级间歇非确定:判 race 必须用短 K 做干净 det0
 
@@ -133,3 +198,13 @@
 
 ---
 来源: remote-sync/SKILL.md, flydsl-fp8-gemm-tuning/SKILL.md, flydsl-fp8-gemm-results/SKILL.md, 02-nt-fwd-kernel.md, verify-accuracy/SKILL.md, agpr_rawasm_progress.md, agpr_phase5_mono.md, tool-rocprof/SKILL.md, gfx950-vmcnt-race-debug/SKILL.md, 02-race-diagnosis.md, 03-emit-knobs.md, 10-grouped-wgrad-4wave-3buf.md, flydsl-sync/SKILL.md, flydsl-kernel-authoring/SKILL.md, project_mxfp4_epilogue_store.md
+
+## ★ graded 逐消费者 drain 的两条边界(tw NN dgrad,2026-08-01 复测)
+
+1. **计数不是越大越好**:把三处 `_dbar()` 的 `_nd` 从 `2*(NSA+NSB)`=8 放到 `3*(NSA+NSB)`=12,
+   dgrad 组 geomean 0.98897 → 0.98748。8 是**性能最优**,不只是"安全上限之下的一个值" ——
+   放宽 vmcnt 之后 g2s 跑得更远,反而把 LDS 写回压到消费者头上。
+2. **能不能用 graded,取决于该体每迭代发几组 g2s**:满体 4 组 ⇒ 8 安全且最快;丢掉 b1 载入的
+   半 N 体只发 3 组,同样推导给出的 4/2 两个值都 racy(见 pitfalls/05)。正确解不是"给它另找一个
+   计数",而是**别让那个体少发 g2s**:保留 b1 的 g2s、只删它的 MFMA/store,该体就直接继承满体的
+   graded 表,dgrad 组 +0.5pp。

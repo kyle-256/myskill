@@ -50,6 +50,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | **attention(dsv4)** 优化 | pitfalls/12(必读)→ 00-decision-index §D |
 | **autotune/dispatch/MoE 变长** | pitfalls/06 → methodology/13 |
 | 要**跑/盯/救一场 campaign**(起不来、卡住、要 resume、数对不上) | **methodology/16(整卡读)** |
+| 想在**真实 e2e 训练**里验证某 kernel 有没有真跑(别加 print) | **methodology/17**(开 profiler 看 trace)|
 
 ---
 
@@ -97,6 +98,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [12-mxfp8-grouped](methodology/12-mxfp8-grouped.md) — grouped var-K wgrad/quant 融合/公平对标/e2e 计时与节点结果
 - [13-autotune-fleet](methodology/13-autotune-fleet.md) — Autotune 五原则/生产四轴 never-regress/N-GPU N-agent 调度
 - [16-campaign-harness](methodology/16-campaign-harness.md) — **跑自动优化 campaign 必读**:起(launcher 模板/环境红线)、bench 契约(★必须 mirror 部署配置)、盯盘(★轮内唯一活信号=kernel 文件 mtime)、停/续(工作区必须干净)、★坑清单(pgrep 自杀·孤儿 agent 改文件·effort=max 反而超时零产出·换机必重测 base/best·收官 squash 挑错 base+commit 游离·并发 pool 重叠致分数腰斩)、验收(不打扰在跑 campaign 的隔离复测法)
+- [17-e2e-kernel-trace-validation](methodology/17-e2e-kernel-trace-validation.md) — **e2e 训练里验证某 kernel 有没有真跑 = 开 torch profiler 看 trace,别加 print**(print 探针可能在死路);Primus mock 冒烟 + profiler 步骤、trace 落地目录(被 patch 改写)、gzip+json 解析(glob `rank[0]` 字符类坑)、kernel 名→后端对照表、K-pad 铁证(pad-quant kernel 只可能来自 syncv3);MoE 走 ragged 派发不经 PrimusTurboGroupedLinear/公共 grouped_gemm_fp8
 - [99-misc](methodology/99-misc.md) — 其它零散事实
 
 ---
