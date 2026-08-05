@@ -66,10 +66,12 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [common/04-build-git-triton](connection/common/04-build-git-triton.md) — 按需 build/清 flydsl cache、git push、triton 版本
 - [common/05-reference-misc](connection/common/05-reference-misc.md) — 权限/硬件表/MFMA 延迟/LDS 规格/ISA dump 等参考
 
-### connection/gpt_oss/ — 本机环境连接卡（容器 / host 盘 / venv 细节，env-specific；换机器时替换本子目录）
-- [gpt_oss/01-container-image-nodes](connection/gpt_oss/01-container-image-nodes.md) — 容器 flag/saved tar/生产节点现状 + 本机边界(哪个容器/盘是你的、相邻环境严禁碰)
-- [gpt_oss/02-run-and-venv](connection/gpt_oss/02-run-and-venv.md) — docker exec 跑法 + mxfp4/tensorwise venv 隔离
-- [gpt_oss/03-sync-and-remote](connection/gpt_oss/03-sync-and-remote.md) — NFS/rsync 规程/FlyDSL 远端为主
+### connection/gpt_oss2/ — 本机环境连接卡（容器 / host 盘 / venv 细节，env-specific；换机器时替换本子目录）
+> 本分支(`gpt-oss2-docker`)的本机环境 = 容器 `mlperf_gptoss2` / 盘 `code3` / venv `/opt/venv`+`/opt/venv-mxfp4`。
+> 名字只差一个 "2" 的 `mlperf_gptoss` + `code2` 是**另一个项目**的地盘，严禁触碰；其连接卡见 `optimizer` 分支的 `connection/gpt_oss/`。
+- [gpt_oss2/01-container-image-nodes](connection/gpt_oss2/01-container-image-nodes.md) — 容器 flag/saved tar/节点沿革 + 本机边界(哪个容器/盘是你的、相邻环境严禁碰) + **换节点时根盘容量硬约束**
+- [gpt_oss2/02-run-and-venv](connection/gpt_oss2/02-run-and-venv.md) — docker exec 跑法 + mxfp8/mxfp4 两 venv 隔离(finder MAPPING 两个污染坑、build_ext 铁律)
+- [gpt_oss2/03-sync-and-remote](connection/gpt_oss2/03-sync-and-remote.md) — rsync 规程(本地 canonical)/git 两边一致/push 坑/CRLF 行尾陷阱
 
 ### connection/crusoe/ — Crusoe 集群(spur 调度器)连接卡（2026-07-20 搭建）
 - [crusoe/01-access-spur-container](connection/crusoe/01-access-spur-container.md) — 登录(csh坑/host key轮询/node-ssh)+login红线(Guardian杀内存)+spur账号关联+**容器=节点dockerd+docker run**(spur --container-image是死路)+docker-exec引号helper+两venv build(clone pip-shebang污染/flydsl 0.2.2 egg坑/git safe.dir)+存储(/shared_nfs/kyle)+已验证dq 1100TF

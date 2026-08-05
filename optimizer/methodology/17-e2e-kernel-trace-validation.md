@@ -29,8 +29,8 @@ kernel 名字。别在 python 侧加 print 探针**——派发路径可能跟�
    export PRIMUS_PROFILE_STEP_END=4    # schedule: wait=start-1, warmup=1, active=end-start
    ```
    backend 用 FLYDSL:`export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=FLYDSL`;PYTHONPATH 前置
-   `syncv3/Primus-Turbo` 让 K-pad turbo 胜出 editable(见 connection/gpt_oss/04)。
-2. **跑**(见 connection/gpt_oss/02、03):
+   `syncv3/Primus-Turbo` 让 K-pad turbo 胜出 editable(PYTHONPATH/venv 串环境的坑见 connection/<env>/02)。
+2. **跑**(见 connection/<env>/02、03):
    ```sh
    ./.ssh-chi.sh root@chi2798 "docker exec mlperf_gptoss bash -lc '
      rm -rf /root/.flydsl/cache
@@ -88,4 +88,4 @@ nt 96×1270.9µs、nn 96×1155.4µs、tn-wgrad 96×1424.9µs、pad-quant 288×26
   用完回退。
 
 ---
-来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss);见 [[project_kpad_e2e_trace_validated]]、connection/gpt_oss/02·03·04、pitfalls/07(glob/tracer 坑)
+来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss);见 [[project_kpad_e2e_trace_validated]]、connection/<env>/02·03、pitfalls/07(glob/tracer 坑)

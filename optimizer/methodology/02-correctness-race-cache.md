@@ -177,10 +177,23 @@ N 只能取 `min_pool(该 pool 填充之后发出的 load 数) - 一个 issue gr
 
 ### disk cache 何时自动失效、何时必须手动清
 - FlyDSL JIT disk cache 在 `~/.flydsl/cache`,`FLYDSL_RUNTIME_ENABLE_CACHE` 默认 true。
-- **kernel 源码或闭包值变化 → 自动失效**;in-memory cache 始终生效。
+- **kernel 源码或标量闭包值变化 → 自动失效**;in-memory cache 始终生效。
 - 只有以下两种情况需要 `FLYDSL_RUNTIME_ENABLE_CACHE=0` 或 `rm -rf ~/.flydsl/cache`:
   1. 改了 C++ passes;
   2. 改了**非闭包** helper 函数(改动不进 hash,disk cache 不失效)。
+
+### ★ cache key 的确切构成:只有**标量**闭包值进 key,类型对象被静默丢弃
+
+上一条的「闭包值变化 → 自动失效」**只对标量成立**,这是个会造成静默错数的陷阱。缓存路径 `~/.flydsl/cache/{func_name}_{manager_key}/{sha256(inner)[:16]}.pkl` 两级:
+
+- **外层 `manager_key`** = `_jit_function_cache_key`(`compiler/jit_function.py`):flydsl 版本 + `@jit` 函数源码 + 依赖源码 + `_collect_closure_scalar_vals`。**最后一项只收 `(int, float, bool, str, None, tuple)`**,其余尝试当 callable 递归、否则**静默丢弃**。⇒ **仅以类型对象形式进闭包的编译期参数(如 `_out_ty = fx.Float16 / fx.BFloat16`)不进 key**,两个变体共用一个目录。
+- **内层** = 各实参的 `__cache_signature__`(`compiler/jit_argument.py`),张量含 dtype,通常能兜住。
+
+**致害组合**:代码里出现「按 A 配置编译的内核、却拿 B 配置的实参去 `flyc.compile`」。此时外层合并、内层记的是 B 的签名,缓存里就留下**「B 签名 → A 内核」**,而且**跨进程持久**。
+
+- **实战踩证(2026-07-30, mxfp4 dense)**:autotune 的计时候选按 `out_fp16=False`(bf16 store)编译,却拿调用者真实的 **fp16 实参**去 compile → fp16 输出里装着 bf16 比特,SNR ~1dB;而 bf16 永远正常。表现为**时好时坏**——取决于 autotune 那 0.5% 门槛这次选中哪个变体、以及缓存历史。
+- **排查手法**:①`rm -rf ~/.flydsl/cache` 后按**调用顺序** A/B(先 bf16 vs 先 fp16 结果不同即中招);②数缓存目录——同一变体两种 dtype 只出 **1 个目录** = key 合并了。
+- **写内核时的规矩**:任何编译期变体参数都要以**标量**形式出现在内核闭包里(`out_fp16` 这个 bool,而不是只有 `fx.Float16` 这个类型);`_out_ty = fx.Float16 if out_fp16 else fx.BFloat16` 写在**内核函数体内**,别写在外层 builder 作用域。
 
 ### 单进程多 env-variant 对比:必须 cache_clear
 - `_compile_dense_tn` 是 `@functools.lru_cache(128)`。
