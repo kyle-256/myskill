@@ -98,11 +98,39 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
   - ≈0% = 满 64B cache line、无空间浪费;**高 32B%** 才指向 scatter/misaligned,值得重构。
 - **over-fetch** = 实取字节 vs `--ideal-gb` → 有无冗余取数。
 
+### ★ wave-cycle 预算：把「卡在 barrier/waitcnt」与「想发但管道忙」分开（gfx950 实测配方）
+- 三个 counter 恰好把 `SQ_WAVE_CYCLES` 分成 **100%**（全部 quad-cycle，×4 换算成周期）：
+  `SQ_ACTIVE_INST_ANY`（正在发射）+ `SQ_WAIT_INST_ANY`（想发但发不出）+ `SQ_WAIT_ANY`（waitcnt/barrier）。
+- **只看 `SQ_WAIT_ANY` 会误判**：MFMA-bound 循环里 `SQ_WAIT_INST_ANY` 高是**健康态**（自己的 MFMA 还占着管道，
+  sibling 也发不进去），真正的空转来源是 `SQ_WAIT_ANY`。实测一个 8-wave/2-waves-per-SIMD 的 mxfp8 GEMM 主环：
+  24.2% / 45.2% / **30.6%**，而管道空转（20% of 主环）≈ 两个 sibling wave 的 `SQ_WAIT_ANY` 交叠（~70%）
+  ⇒ 结论是「barrier convoy 偏斜」，而不是 LDS/VMEM 延迟，于是 barrier 数与相位结构成为唯一相关的轴。
+- 判据：把 `SQ_WAIT_ANY / SQ_WAVE_CYCLES` 与 `MFMA_BUSY /（SIMD 数 × 时长 × 实测时钟）` 一起读；
+  两者之差就是「可归因于 rendezvous」的空转。改动后若 `WAIT_ANY` 占比上升而 MFMA busy 不变，必然更慢
+  （实测 30.6%→34.2% 对应 −2%）。
+- `SQ_LDS_IDX_ACTIVE = 4 × SQ_ACTIVE_INST_LDS`（逐位）。**按 CU-cycle 归一才是 LDS 数据利用率**
+  （gfx950 LDS 256 B/clk；某 8-wave GEMM 每 K-iter 每 CU 192 KB ⇒ 26.6%，3.8× 富余）；
+  按 MFMA busy 归一得到的「10×」是量纲不明的说法，容易被读成结论。
+- ⚠️ rocprofv3 counter CSV 的 `VGPR_Count` 是 **granule 计数**（同一 kernel ISA reg-note 246 → CSV 报 124），
+  **不能当 spill/寄存器门禁**；门禁只认 ISA reg-note（见 pitfalls/09）。
+- ⚠️ 本容器版本的 counter CSV 直接落在 `<dir>/<out>_counter_collection.csv`，**没有 `pass_1/` 子目录**。
+- ⚠️ 在 `ssh ... docker exec bash -lc '...'` 里写 `pkill -f rocprofv3` 会**杀掉自己**（模式匹配到自身命令行），
+  表现为 exit 143 且无输出；查残留进程用 `ps -ef | grep`。
+
 ### LDS 带宽 bound vs 延迟暴露(必区分)
 - 量 `SQ_LDS_IDX_ACTIVE`(LDS 端口忙周期)**:** `SQ_VALU_MFMA_BUSY_CYCLES` 比值。
 - 实测 8w wholeloop = **1:9.46**(端口只在 MFMA 忙的 ~10% 活动,≥5× 余量)→ **不是端口带宽 bound**。
 - `SQ_WAIT_INST_LDS ≈ SQ_LDS_IDX_ACTIVE` 且占 `SQ_WAIT_ANY` 的 **59%** → 是 **ds_read 延迟暴露**而非带宽打满。
 - 长 K 冒烟枪:`SQ_WAIT_INST_LDS/GUI`(LDS-wait 归一化,越低越好)、`MfmaUtil`(MFMA busy%)、`SQ_INSTS_LDS`(=算术强度)、`SQ_INSTS_VMEM`、bank_conflict、`GRBM_GUI_ACTIVE`(cyc/dispatch,时钟无关效率)。
+- ★**2026-08-04 锐化(gpt-oss fused attn bwd 实测,代价是一整轮)**:`SQ_WAIT_INST_LDS`
+  **不能单独当"LDS 是 bound"的证据**,哪怕它高到 **81% 的 CU-cycle 预算**、且 `SQ_LDS_IDX_ACTIVE/CU-cycle`
+  高到 **1.20**。该内核在这两个读数下,把**三类 LDS 读各删一半**(lse 广播 `ds_read_b128` 384→320、
+  GEMM1 A-frag 384→256、GEMM2 `ds_read_b64_tr_b16` 1536→1280)实测 **全是 0.0%**(交错 A/B 3/7、3/7、2/7)。
+  原因:它计的是**依赖等待**(wave 等 LDS 返回的周期),同驻 wave 一掩盖就不构成资源上限;
+  而 `IDX_ACTIVE/cycle` 的分母(每 CU 每 cycle 的 LDS 数据通路宽度)在 CDNA4 上比直觉大一倍。
+  ⇒ **判 LDS 是否 bound 的唯一可靠手段 = 减法探针(删掉一半读)+ ISA 计数交叉验证**,
+  counter 只用来提出假设。**代价警示**:整个 campaign 的第一 bound 结论和由它派生的两个方案
+  (换宽 MFMA 减 reads/MFMA、head 间共享 fragment)都建立在这个误读上,白排了两轮。
 
 ### 不可信的计数(权威判据在别处)
 - CSV `Accum_VGPR_Count` **恒报 0**。
@@ -227,6 +255,30 @@ pJ/FLOP:mx 0.5581~0.5607 vs tw 0.5749~0.5759 ⇒ **功耗高 ≠ 效率低**,mx 
   ① 按 MfmaUtil 比值 0.956 预测「追平参考只有 +4.6% 余量」,消掉 per-tile O(G) 扫描后实测 **+5.3~19.1%**(因为
   同时消掉了 tile 开头的串行依赖链与 spill);② 按 traffic 上界 2.1% × 50~60% 兑现率预测 +1.0~1.3%,半-N 边界
   tile 删 B 侧 g2s 实测 **+2.0%**(删的是 DMA,而该 tile 恰是 feed-bound)。⇒ **上界是双向不准的,别用它判负。**
+- ★ **孤立单核微基准也是一把不可信的尺子——它连符号都能翻**(2026-08-04 融合 flash-bwd r09 实证):
+  把 dQ split-K 规约核单独拿出来扫 work-group 形状,`1024×8` 以 **557.2 µs** 拿下第一、`512×2` **563.6 µs** 第二;
+  放回完整 backward 后 `1024×8` 反而**输 0.4% 的整体分**(874.9/876.0 vs 878.0~880.7),第二名才是真赢家。
+  机制:孤立跑时该核独占整机且工作集冷热状态与真实调用不同,in-situ 它紧跟 4 ms 的主核、承接主核的 ramp-down。
+  ⇒ **微基准只用来"筛掉明显差的档",最终选档必须用 end-to-end 打分尺再确认一次**;同一族的
+  「探针/roofline/op-count 只给上界」铁律对孤立微基准同样成立。
+
+### K-sweep 拟合 `t_tile = F + n_phase × P`:把「稳态慢」和「固定开销大」一次分开
+
+攻一个 GEMM 之前先回答「稳态 K-loop 到底慢不慢」——否则很容易花几轮去调一个已经满速的主循环。
+做法:固定 M/N,**扫 6 个以上的 K 点**,对每个 tile 的时间线性拟合 `t_tile = F + n_phase × P`,
+`P` = 每 K-phase 的稳态成本,`F` = 与 K 无关的 per-tile 固定开销(prologue + epilogue + drain)。
+把 `P` 和「dense 同精度单体峰值换算出的 per-phase 成本」对比,就知道差距在稳态还是在 F。
+
+mxfp4 grouped 实证:**P=1.565 µs/phase vs dense mxfp4 5405 TF 换算的 1.59 µs —— 只差 1.6%**,
+即稳态 K-loop 已经跑在 dense 速度上,**grouped 相对 dense 的全部效率损失都在 F=7.81 µs/tile 里**。
+反向核对:令 F=0 反推 5326 TF,对 dense 5405 闭合 1.5%,三方自洽。这一条直接把优化面从「主循环」
+整体挪到了「prologue/epilogue」。
+
+★ **拟合有两个会毁掉整个坐标系的系统误差,都踩过**:
+1. **时钟按标称算**。用 2.4 GHz(boost 标称)算出 in-loop util 52.8%,用 `GRBM_GUI_ACTIVE/dur/8`
+   实测的 **2.09 GHz** 重算是 **62.6%** —— 一整轮的方向建立在错的 util 上。见 connection/common/05。
+2. **`P` 里混进了随 K 增长的邻居 kernel**。第一次拟合把 scale preshuffle 一起计进去了(它的耗时也随 K 涨),
+   于是 P 被高估、F 被低估。**修法:用 `rocprofv3 --kernel-trace` 只取目标 kernel 那一行,不要用 wall。**
 
 ## ATT trace 做 stall 根因:MFMA operand bubble 记在 MFMA 头上而非 waitcnt
 

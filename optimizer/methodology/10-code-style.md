@@ -18,7 +18,9 @@
 
 **3. 注释:短 · 只英文 · 不留过程 · 不 stale**
 - 注释**一律英文**,禁中/日文。
-- **单块 ≤5 行**(>5 行连续注释 / docstring 即打回,含 public API docstring),1-2 句讲清。
+- **单块 ≤3 行**(>3 行连续注释 / docstring 即打回,**docstring 与 `#` 注释同权**,含 public API docstring),1-2 句讲清。⚠**计数器必须把 docstring 也数进去**:只 grep `^\s*#` 的门禁会漏掉多行 docstring(踩证 2026-08-09,8 行 docstring 蒙混过关),见 pitfalls/10。
+- **文件头 copyright / license 块豁免**:不计入 block 连续行、不计入密度分子/分母(它是强制样板,既不是 WHY 也不该被浓缩)。
+- **共享文件只管自己动过的**:改既有文件时,block/doc/no-nums 与密度一样**只作用于我们新增/改过的注释与 docstring**(与 base 的 added-line 相交者);上游原有、我们没碰的 docstring 不去动它(碰了徒增 diff 噪声、也不是本次职责)。
 - 注 **WHY 不注 WHAT**;推导 / 实测数字(dB · TFLOPS · MxNxK)/ 日期 / 多方案权衡 → 进 commit message · memory · `tuning_results/`,**绝不进源码**。
 - **★整行注释密度 ≤4%**(硬上限):`grep -cE '^\s*#' <file>` / 总行数 ≤ 4%。新写/整体重写的文件按**全文件**算;只改共享文件时按 **t新增行**算(`git diff <base> HEAD -- <file>` 里 `^+\s*#` 行数 / `^+` 行数 ≤4%)。**超 4% 即打回**——即使是大 kernel 的富 why-note 也不例外,要么浓缩成 1 行,要么移进 commit message / memory。
 - **★重构删代码后必须同步改引用它的注释/docstring**。融合/删 kernel 类 commit 最易留 stale 注释(如 pad+meta 融进主 kern 后 docstring 仍写"fused pad prologue")。review 必 **grep 被删结构名**(`rg 'pad.{0,3}prologue|<删掉的函数名>'`)确认 0 stale。
@@ -26,7 +28,9 @@
 **4. 无调试信息(rg 0 命中才放行)**
 - 放行前 `rg -i 'debug|tmp|临时|verified|实验|print\(|# TODO'` 必须 **0 命中**。
 - 无 `# debug` / `# tmp` / 注释掉的旧代码 / 裸 TODO(无 issue 号)/ 调参备忘 / benchmark 数字。
-- 临时探针脚本(`_*.py` / `opt_*.py`)**绝不 git add**,只留本地。
+- 临时探针脚本(`_*.py` / `opt_*.py`)**绝不 git add**,只留本地。⚠**但 campaign harness 的每轮 commit 会自动
+  `git add` agent 落在 repo 根的 `_an_*`/`_*.py`,卷进每个 KEPT commit**(踩证:gptoss_e32 三个 win commit 夹带
+  936 行探针)——这条规矩 harness 不守,收官必须主动剥,`git diff --stat <base>..HEAD` 要只剩目标核(见 methodology/16 §6.17)。
 
 **5. 命名 & 魔术数**
 - 跟 turbo 命名(`_grouped_<noun>` / `_wgrad_<verb>_<variant>`),别自造缩写。
@@ -40,8 +44,8 @@
 
 ### 注释与命名
 - 注释**一律英文**,禁中/日文。
-- 注释**尽量精简**:**严禁单块注释/docstring 超过 3 行**。要点浓缩成 1-2 句;推导过程/实测数字/多方案权衡进 commit message / memory / `tuning_results/`,不进源码(见 pitfalls/10「注释里的 benchmark 数字」)。code review 硬门禁一条:`>3 行`连续注释即打回。
-- **整行注释密度 ≤4%**(硬门禁,与上面 checklist#3 同):`grep -cE '^\s*#' <file>` / 总行数 ≤4%。超 4% 打回,富 why-note 也不例外。
+- 注释**尽量精简**:**严禁单块注释/docstring 超过 3 行**(docstring 与 `#` 注释同权,含多行 `"""..."""`)。要点浓缩成 1-2 句;推导过程/实测数字/多方案权衡进 commit message / memory / `tuning_results/`,不进源码(见 pitfalls/10「注释里的 benchmark 数字」)。code review 硬门禁一条:`>3 行`连续注释/docstring 即打回。
+- **整行注释密度 ≤4%**(硬门禁,与上面 checklist#3 同):`grep -cE '^\s*#' <file>` / 总行数 ≤4%(密度沿用 `#` 行定义)。超 4% 打回,富 why-note 也不例外。**block 连续行计数必须把 docstring 也算进去**(只数 `#` 的门禁漏多行 docstring);**文件头 copyright/license 块从密度与 block 计数中一并剔除**;docstring 另受「每块 ≤3 行 + WHY-not-WHAT + 禁实测数字」约束。
 - 函数命名跟 turbo 现有风格,别自造缩写:
   - `_grouped_<noun>`,如 `_grouped_block_mn`。
   - `_wgrad_<verb_or_noun>_<variant>`,如 `_wgrad_wholeloop_asm_3buf`。

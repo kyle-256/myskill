@@ -10,8 +10,15 @@
 - cache key 用**纯静态维度**：`(op, N, K, G, M_total, out_fp16, cbsz, blgp)`。WHY：这些是唯一决定最优 kernel 的量,不含运行期 buffer 身份。
 
 **per-shape 过拟合(overfit)**
-- ❌ 别再试：dgrad NN 按 c_n 做 per-shape `num_xcd`。实测 **−0.5%** 负杠杆,没有干净物理阈值——属于纯 overfitting。
+- ❌ 别再试：dgrad NN 按 c_n **用启发式直接算** per-shape `num_xcd`。实测 **−0.5%** 负杠杆——
+  当时没有干净物理阈值,属于纯 overfitting。
 - 原则：**没有清晰物理阈值的 per-shape 调参一定 overfit**,别做。
+- ✅ **但把 `num_xcd`/band 作为候选丢进 per-shape autotune 去 race 是赢的**(2026-08-09 dense fp8 NN,
+  同 session A/B 计入 **+1.66%**,是那一场十轮里最大的一笔)。**两条不矛盾**:
+  差别在**你是"算"还是"量"**,以及**这次有物理阈值**——
+  M-band 复用 B 的 N-stripe(`K × BLOCK_N`),stripe 一旦超过单 XCD 的 L2 slice(gfx950 ≈ 4 MiB),
+  把 tile 聚到一个 XCD 就颠簸,硬件 round-robin 反而更好。
+  窄-N 与宽-N 要**相反**的 band,两族差距远大于竞速噪声 ⇒ 两族都放进候选表让它自己选。
 
 **wgrad gate 用 per-group m_total/G**
 - wgrad gate 必须用 **per-group contraction = m_total/G**,不是裸 m_total。
@@ -20,6 +27,17 @@
 **Constexpr vs Int32**
 - `Constexpr[int]` 值被**烘进 IR**——不同值产生不同编译内核(触发 re-compile)。真正动态的值必须用 `Int32`,否则每个取值都重编。
 - autotune 里 Config kwargs 注入成 `@jit` 调用的 Constexpr 参数;只有 `key=[...]` 里列的 arg 值变化时才 re-tune。
+
+**★`except Exception: continue` 会把编译期 bug 伪装成"没有可用 config"**
+- autotune 候选循环普遍写成 `try: ... except Exception: continue`。**编译错误、NameError、签名不匹配
+  统统被降级成"这个候选不行"**,和真的 config 不兼容长得一模一样,最后只剩一句
+  `autotune found no working cfg for (M,N,K)`。
+- 2026-08-09 实例:NT 循环是 `for bm, gm, xcd, ag in _NT_CANDIDATES`,却被改成
+  `cands.append([launch, (bm, gm, gn, xcd, ag), c])` ⇒ `gn` 未定义 ⇒ 每个候选静默丢弃,
+  **整条 dense fp8 前向断掉**,而只跑 NN/TN 的 bench 十轮全绿。
+- 纪律:**改过候选表或编译参数,必须单独跑一次把异常打印出来的探针**(把 `except` 换成
+  `traceback.print_exc()`);收官时再对**每条 layout** 各调一次真入口。
+  另配 AST 检查 use-before-assign(`Load 的 Name − Store − 全局`)。
 
 **dispatcher 写法**
 - `can_handle` 对不支持的输入必须 **return False,绝不 raise**。WHY:dispatcher 靠返回值做 fallback,raise 会打断 fallback 链。
@@ -46,6 +64,13 @@
 
 - **fwd/dgrad 用非持久 (non-persistent)**：每 WG 做完一个 tile 后直接 `s_endpgm`，不进 `scf.for` 循环。持久内核会吃 `scf.for` 调度惩罚 **~11%**，非持久省掉这部分。WHY：fwd/dgrad tile 数与 CU 匹配良好，无需持久复用。
 - **wgrad 小-M 用持久，优于 masked**：per-group contraction ≤ **1536** 时，持久内核胜过 masked 分支——省掉 over-run chunk 的废循环（masked 会跑满整个 chunk 再 mask 掉尾部，浪费循环）。
+- ⚠ **别把"wgrad 小-M 持久优"读成"截 grid 到 NCU 优"**：fp8-tensorwise TN var-K wgrad 上截 grid 实测是平的（生产路径 −0.03%/−0.24%），见 pitfalls/05 §persistent grid 的条件收窄。
+
+## ❌ `num_xcd>1`（xcd_remap_pid 分区）：均衡负载 +7%，倾斜负载 −22~−43%
+
+- gpt-oss wgrad var-K deploy（G=32/M=4096）实测，同 band 同边界体单变量：gate_up `num_xcd=2` 在**均衡**负载 **+6.94%**（ratio 0.8922→0.9542）、`num_xcd=8` +3.72%；同两臂在 **skew** 负载上是 **−22.07% / −42.84%**。
+- 根因：remap 打散了 group-major 的 LPT 顺序，热组的 tile 被摊到全 launch，尾巴拉长。⇒ **候选表把 xcd>1 全部排除是对的**，race 若只打分均衡负载会被这条骗到（`_score` 必须取 balanced/skew 的**最差**）。
+- ✅ 开口：同样的 L2 局部性有**不动派发顺序**的拿法 = 组内 XCD-affine 走位（`xcd_aff`）。它要求 `N_BLOCKS_N` 可分解；**N_BLOCKS_N 为质数时（gpt-oss gate_up 5760/256→23）几何退化成一列宽，等于没有**，这就是 gate_up 拿不到那 7% 的原因。
 - ❌ **别再试**：把 big-K 的 drain-removal lever 迁移到 big-N。**不迁移**：big-N 的短 K 摊不开 drain 成本，lever 在 big-N 上无收益。
 
 - **vmcnt_hint 要调到 det=0 的上限**（determinism/正确性边界；与 methodology/13 deep-wl 的 `(vmcnt,lgkmcnt)` 是不同轴：这里是正确性 det=0 上限，非性能 margin）：
@@ -108,6 +133,16 @@
   修法（2026-07-29 实测）：`_robust_ab_ratio(base, cand, args)` 在**同一测量窗口内逐 rep 交替**计时 base 与
   候选、取比值中位数，再要求**每个竞速点**都 <0.985。实测噪声带 ≤0.5%（最差 0.9%），1.5% 裕度有 1.7~3×
   安全系数；清 cache 连跑 4 次 gm 极差 **0.62% → 0.12%（5×）**，`down heavy` 双峰消失（1.001~1.007）。
+- ★ **第五个处置方向:干掉竞速,直接写死**。2026-08 mxfp4 grouped 实测:那场 race 的候选表里本来就有
+  正确答案 `(2,8,0)`,只是因为在合成 balanced 点上打分而选不中它;关掉 race 逐配置实测,`(2,8,0)` 在两个
+  最差配置上 **−7.0% / −7.8%**(每个数测两次,重复性 <0.15%)。**改成写死后 gm 1.3529→1.3762、min
+  1.1843→1.2271**。当候选表小、且离线能一次量清每个 shape 家族该选谁时,写死比修 race 便宜得多,
+  还顺带省掉每 shape 一次的首调用竞速开销。
+- ★★ **别让两条派发路径共用同一个默认常量**。同一实证:NT 与 wgrad 共用一个 `_*_DEFAULT_CFG`,于是
+  race 为 NT 选的值直接套到 wgrad 上。**两者统一成 NT 的最优 `(2,8,0)` 会让 wgrad 崩到 0.38–0.55×**
+  ——拆成两份常量各自写死才对。机制核对过**不是 L2 命中率**(`TCC_HIT` 差 0.006%、`TCC_REQ` 逐位相同、
+  `SQ_INSTS_MFMA` 相同),是 **WG→tile 顺序造成的负载不均**:同一个 swizzle 对 M-major 的 NT 和
+  对 per-group 变 K 的 wgrad 意味着完全不同的 tile 到达序。
 
 ### benchmark 增益 > 结构能产 → 先查，别接受
 

@@ -3,14 +3,25 @@
 > 类别: 方法论 · 主题标签: register-pressure, agpr-accum, raw-asm, whole-loop-asm, lds-feed-bound, bank-conflict, 算术强度, mxfp4, emit-knob, race-correctness, VGPR-scale
 
 ## 寄存器压力:asm-inplace MFMA 把 accum 挪进 AGPR 消 spill、raw-asm 绕 LLVM 拒 AGPR
+> ⚠ 标题里的「LLVM 拒 AGPR」是**旧工具链**的情况。ROCm 7.2 上 scaled MFMA 的 tied-operand
+> `"=a,v,v,0,v,v"` 已可用,见下面 §「先试 tied-operand」——**动手前先花 60 秒编译一个探针**。
 
 ### 核心手法:把累加器从 VGPR 挪进 AGPR
 - **asm-inplace MFMA(`asm_mma=2` mode2)**:D 别名 C in AGPR,`agpr_alloc=128`,把 accum 挪进 AGPR,消掉 accvgpr 拷贝 + spill(**18→0**),big-K **+2.3%** 且 **det0**。  (flydsl-fp8-gemm-tuning)
 - **whole-loop bare-asm**:整个 K-loop 写成一个内联汇编 hw-loop,消 per-mfma asm 边界 + per-iter 循环开销;是 mxfp4 4-wave 从 **3583(intrinsic)→ 5401** 的关键 lever(**+16%**)。accs 用 `['=a']` 且 MFMA dst=acc_in(`$q,$a,$b,$q`)实现 AGPR 原地累加,天然消除 accvgpr-shuffle。  (11-upstream-agpr-pin-moot)
 
-### gfx950 scaled/fp4 MFMA:LLVM 拒 `=a` → raw-asm 写死物理寄存器
-- **问题**:gfx950 scaled MFMA(`mfma_scale`)LLVM 不肯给 AGPR 分累加器 —— `=a` 约束被拒,AccumVGPR 恒 0。  (agpr_rawasm_progress)
-- **绕过**:inline `volatile` asm 文本写死物理 `a[N:N+3]` 做 dst/src,**不用 `=a` 约束**,累加器只放进 clobber `~{aN}`。
+### gfx950 scaled/fp4 MFMA 的 AGPR 累加器:先试 tied-operand `"=a,v,v,0,v,v"`,不行再 raw-asm
+
+★★★ **2026-08 勘误(这条过时记录直接挡住了一整场 campaign 的四轮)**:**ROCm 7.2 上
+`_asm_mma_scale_do` 用 `constraints="=a,v,v,0,v,v"` 的 tied-operand 写法直接编译通过** ——
+ISA 里是 `v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[..], v[..], a[0:3]`、`.agpr_count 256`、
+spill 0、SNR 逐位不变。在 mx8tw 的 NT 核上它把 **arch VGPR 246 → 184、空闲 arch 寄存器 10 → 72**,
+正好是此前四轮跨 tile/persistent 改动一直差的那 23–25 个。
+⇒ **动手前先花 60 秒编译一个探针,别按下面的旧记录直接放弃 AGPR。**
+下面的 raw-asm 路线是更早工具链才需要的兜底:
+
+- **(旧工具链)问题**:gfx950 scaled MFMA(`mfma_scale`)LLVM 不肯给 AGPR 分累加器 —— `=a` 约束被拒,AccumVGPR 恒 0。  (agpr_rawasm_progress)
+- **(旧工具链)绕过**:inline `volatile` asm 文本写死物理 `a[N:N+3]` 做 dst/src,**不用 `=a` 约束**,累加器只放进 clobber `~{aN}`。
   - init:`v_accvgpr_write_b32 aN, 0`
   - readout:`v_accvgpr_read_b32 $k, aN`
 - **收益**:32 个 v4f32 累加器从 **256 VGPR 移进 128 AGPR**(`num_vgpr` 256→128);det0 证明跨迭代物理驻留稳定。  (agpr_rawasm_progress)
@@ -39,8 +50,16 @@
 
 ### 4-wave whole-loop 结构(wgrad)
 
+> ★★ **这个核就是 gpt-oss mx8tw campaign 的标尺**(`kernel_grouped_tn_wgrad_4wave_0`,3000–3188 TF/s,
+> 本机最快的 grouped GEMM)。**2026-08 逐条 ISA 复核为真**:grid 258048 = 1008 WG × 4 wave、
+> LDS 163840、256 条 `v_accvgpr_read_b32`、`ds_read_b64_tr_b8`、`buffer_store_short`、`s_setprio` 0 条。
+> **教训:要追某个核之前先读这张卡** —— mx8tw 那场十五轮都在猜标尺长什么样,而它一直写在这里。
+
 - occ=1(512 VGPR = 256 操作数 + 256 AGPR 累加器,accum_offset=256),256×256 tile,2×2-wave,两操作数都 transpose-read,whole-loop 裸 asm 主循环,AGPR 累加,CShuffle store。
 - 根因瓶颈 = LDS 转置读 feed 带宽(TN 固有税),**非** 占用率/延迟/bank。即使 racing 也只有 fp8 峰值约 44%。
+  - ★ 2026-08 给了这条一个新的量化形式:**NT 布局不付这笔税,所以 NT 的稳态每 K-iter 比这个核快
+    11–14%**(1.164 vs 1.31–1.35 µs,稳态 MFMA busy 87% vs 81%)。⇒ 追它的时候别去改稳态,
+    差距在别处(tile 长度与同步密度,见 methodology/12 §标尺)。
 - 主循环 = 两个 ping-pong 相位,相位间一道 `s_waitcnt;s_barrier`。一个 wave 的 transpose-read 要 gather 所有 wave 写的 chunk(`W*chunk_stride`)→ barrier+drain 是跨 wave LDS 一致性硬需求,per-wave 局部 drain 不安全。
 
 ### byte-exact LDS 账(2 池 3buf 塞 160KB)
@@ -108,6 +127,12 @@ g2s 均匀撒进非 refill 槽)每一个方向的扰动都是**净负**,四次�
 线性拟合:**固定 16% / 每池 feed 47% / MFMA 36%**(边际 22 cycle/MFMA)。
 - 推论 1:边界半 tile 花 0.70~0.82 的时间做 0.5 的功 ⇒ `down` 全核有 **4.6%** 的边界浪费,
   `gate_up` 约 2.5%。这是 wgrad 目前最大的**已量化**开口。
+  - ⚠ **口径修正(2026-08-10, gptoss wgrad campaign)**:上面 4.6%/2.5% 是 **wall 占比**。若 score 是
+    small-M/large-M 的**比值**(两个 regime 的 tiles/group 完全相同),这笔浪费大部分相消,regime-aware
+    折算后只值 ratio **+0.96%(dn) / +0.57%(gu)**。选杠杆时先把 wall 占比换算到 score 口径再排序。
+  - ★ **边界体(`half_bnd`)与 band 深度(`group_m`)必须成对调**,单调任一个都拿不到收益:down deploy
+    实测 深 band 单独 +1.00%、精简边界体单独 +0.62%、**两者一起 +3.00%**(均衡)/+1.94%(倾斜)。
+    机理:band 里的廉价 tile 是跟同 band 的 h−1 个满 tile 一起走的,不是单独提前释放 CU。
 - 推论 2:frag/MFMA 比 = `(ah+bh)/(4·ah·bh)`,(2,2)=0.25 最优,(1,2)=0.375,(1,4)=0.3125。
   128 行的条带要恢复 0.25 **只能**做 128×512(5 池)。
 - ⚠ **`all-forced` 探针量的是全局 regime,不是可加的单 tile 成本**:据此预测"半 N tile 少读

@@ -58,7 +58,7 @@
 
 ## ❌ 已判负杠杆(measured,别再试;"负"= 当前实测负 + 需何条件才可能翻)
 **fwd**:
-- **s_setprio**:全 DEAD(fwd 是 VALU+read bound,优先 MFMA 反饿死 VALU)。
+- **s_setprio**:在**本 kernel**全 DEAD(fwd 是 VALU+read bound,优先 MFMA 反饿死 VALU)。⚠**这条不可跨 kernel 搬运**:同一对 `s_setprio(1/0)` 包 MFMA-dense 的 GEMM2 时,在 MFMA-pipe-serialized 的融合 hd64 flash bwd 上**拿掉它 −2.8%(9/9)** ⇒ 正负由 regime 决定(有无共驻仲裁对象 / 该 region 兄弟 wave 有没有 MFMA run / body 是否 MFMA-serialized),判据见 pitfalls/09 §调度提示。
 - **cross-tile 软件流水(XPIPE)**:全 shape 死(cr4 LDS-port 饱和填 MFMA 无用;few-tile cr0 prologue 成本 > 重叠)。
 - **DMA / buffer_load_to_lds**(所有形态:非流水/per-tile/4-buffer/深预取/banded):register-prefetch+store 对 scattered-gather 最优,DMA 的 s_waitcnt 粗同步暴露 HBM 延迟。**buffer_load_to_lds 已真实现**(非代理):原语全对/单 buffer 587<840,流水被 flydsl 编译器 bug 挡死(同 iter tr16 从 >2 个 LDS base 读就坏),见 [[project_dsv4_fwd_dma_experiment]]。→ 翻它需改 flydsl 编译器(用户禁)。
 - **register-transpose PV(fwd RTR)**:实测 **−77%**(97.7TF/SNR PASS)。转置每 tile 重做不摊薄(bwd rtr 赢是转置摊在 rank-tile;fwd PV 每 tile V 不同)。

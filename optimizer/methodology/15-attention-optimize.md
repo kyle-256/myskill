@@ -100,3 +100,7 @@ hd64 fwd 收官时踩到:GQA sharer merge 在 full-causal 上 +1.8%,在同形状
 ⇒ **regime 之间的杠杆是耦合的**:A 在 regime R 下判负,可能只是 R 缺了 B。正确做法是先把公共杠杆对齐,再测 A。
 ⇒ 附带教训:一个门控条件如果**注释里给不出理由**(这里 `window_left < 0`),多半是当初圈定在被优化的形状上的
 **scope 残留**,不是物理约束 —— 值得当成开口去试。softmax 的平移不变性与掩码无关,SWA 完全可以吃固定 max。
+⇒ ★**同一 `window_left<0` scope 残留在 bwd 上再次坐实**(2026-08-09):fused bwd 的 `MASK_SKIP = FUSE_DQ and
+window_left < 0` 把 causal band-trim 只留给 full-causal,SWA 下每 kv-band 把全 causal q-loop 算完再全掩=纯浪费,
+使我们的 SWA wall dividend 只有 7.3×(GB300 9.54×)。加 window-aware q-loop 上界(裹 `const_expr(window_left>=0)`
+保 full 字节不变)把 SWA 216→298 eff-TF、dividend 拉到 10.1×(反超 GB300)。见 pitfalls/13 §2026-08-09 GB300 对标。

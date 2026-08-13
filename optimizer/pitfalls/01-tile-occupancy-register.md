@@ -28,12 +28,31 @@
 - **反例配置 BN128**（用来反驳「occ=1 大 tile 必赢」的对照实验；把 tile 缩到 32 accs=128 AGPR + 2-buffer + LDS≤80K，即降算术强度换 occ=2；`HAS_BR=False` 是关闭某内部分支的 flag）→ occ=2 反而藏 ds_read 延迟更好。
   - PMC 证据：LdsUtil 8%（non-bw-bound），大 SQ_WAIT_INST_LDS 被 1-wave/SIMD 暴露。
 - **结论**：occ=1 大 tile 不是无脑赢，是 tile 强度 vs 延迟隐藏的权衡。
+- ★★★ **但「1 wave/SIMD 没有 sibling wave 遮延迟所以不行」这个推论是错的，它劝退过一条正确的路**
+  （2026-08 mx8tw campaign 实证）：这台机器上**最快的核**（per-tensor grouped wgrad
+  `kernel_grouped_tn_wgrad_4wave_0`，3000–3188 TF/s）**就是** 4-wave / 1 wave-per-SIMD /
+  1 WG-per-CU / LDS 163840 / 256 AGPR 累加器。
+  - **1 wave/SIMD 的延迟隐藏由「同一个 wave 内的软件流水」提供**（operand 预取 + whole-loop 排布 +
+    最小 barrier 骨架），不是由 sibling wave 提供。**判据是「同步指令/MFMA」与「barrier/K-iter」，
+    不是 wave 数本身。**
+  - **把 8-wave 的相位骨架原样搬到 4 wave 上一定 −30~40%**（两次独立实测：−31% 与 −41%）。
+    那两次都保留了 6.39 条 `s_barrier`/K-iter 与 `s_setprio`，而标尺在同样的 4-wave 几何下只用
+    ~2.3 条/K-iter、0 条 setprio。**几何换了、同步装置一件没换 = 白试。**
+  - ⇒ 试 4-wave 时把「barrier/K-iter ≤ 3 且 setprio == 0」当作 compile-only 门；**门不过就不是这条路，
+    别把读数当成「4-wave 又判负一次」记进死路。**
 
 ## 死路：maxnreg 强制 accum_vgpr=0、AGPR 搬移救不了 VGPR 溢出
 
 - ❌ 别再试：用 `maxnreg` 强制 `accum_vgpr=0` 来给预取/arch-VGPR 腾寄存器。历史环境（flag 曾生效时）实测 **~4.5× GPU kernel 回退**（⚠️旧环境数）：占用率翻倍，但 MFMA 累加器被逼经 `v_accvgpr_read` 溢出到 arch_vgpr（arch-VGPR spills）。MFMA-heavy kernel 绝不能用 `maxnreg`。**AccVGPR 压力只能付在 occupancy 上，无法规避。** ⚠️ 本容器 external codegen 不可用 → `maxnreg` 已完全无效（ISA 逐字节相同，见 methodology/03），此路在本容器连「生效」都做不到。
 
 - **死坑：把 accs 搬 AGPR 救不了溢出**。CDNA occ=2 下 `ArchVGPR + AccVGPR` 共享 256 组合预算（`accum_offset 256`）。把累加器搬到 AGPR **不减少总量**，救不了 VGPR 溢出。
+  - ★ **这条只在 2 waves/SIMD 成立,别当成「AGPR 永远不给容量」**:降到 1 wave/SIMD 后 V cap=512 /
+    A cap=256 是**两个独立堆**(见本卡 §「4-wave (occ=1) 的 VGPR headroom 只有 88」),此时把 256 个
+    累加器搬进 AGPR 是真的腾出 arch 空间 —— mx8tw 的 NT 核实测 arch VGPR **246 → 184**(空闲 10 → 72)。
+    ⇒ **判「搬 AGPR 有没有用」先看 waves/SIMD,不是看 kernel。** 写法见 methodology/06 §tied-operand。
+  - ⚠ 两条 AGPR 路线不是一回事:**`amdgpu-agpr-alloc` 属性路线对 scaled-MFMA 无效**(LLVM 会把 AGPR 当
+    spill slot,实测 1155 条 `accvgpr_read` + 43 VGPR 落 scratch、6.2× 慢);**tied-operand
+    `"=a,v,v,0,v,v"` 路线可用**。别用前者的失败去否定后者。
   - fp4 MFMA 有 5 个操作数 `(a, b, sa, sb, c)`；`sa`/`sb`（a、b 各自的 scale 操作数）必须留 VGPR，`acc` 可移 AGPR，但 **V 不下降** → `V + A = 384 > cap`。
   - ❌ 别再试：8-wave BN512 BK128 实测 spill 到 Scratch，1132 → 374 TF（**13× 慢**，每个 MFMA 都读写 scratch = 打 HBM）。
 

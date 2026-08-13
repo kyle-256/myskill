@@ -51,6 +51,8 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | **autotune/dispatch/MoE 变长** | pitfalls/06 → methodology/13 |
 | 要**跑/盯/救一场 campaign**(起不来、卡住、要 resume、数对不上) | **methodology/16(整卡读)** |
 | 想在**真实 e2e 训练**里验证某 kernel 有没有真跑(别加 print) | **methodology/17**(开 profiler 看 trace)|
+| 要把 **grouped gemm trace 时长换成达成 TFLOP/s** / 算出的数字比 campaign 低一个数量级 | **methodology/17** §FLOPS 换算(★别把每层指派再除 L)|
+| Primus e2e 报 `quantize_fp8_tensorwise expected at most 3 argument(s)` | pitfalls/08 §stale-quant-so(重编 .so)|
 
 ---
 

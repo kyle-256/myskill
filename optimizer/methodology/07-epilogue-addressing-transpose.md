@@ -36,6 +36,14 @@
 | Direct Store(默认) | 每线程 MFMA 累加器直写 global | 无额外 LDS;某些 tile 非合并写 | 小 tile_n |
 | CShuffle | 累加器 row-major 写入 LDS `[tile_m,tile_n]` tile → barrier → 重映射 threads 到 `(MLane,NLane)`(256 线程=8×32)再读,使一行内 lane 持连续列 → 合并成 128-B 事务(`buffer_store_dwordx2`) | 额外 LDS + 2 barrier | `tile_n≥128` |
 | permlane16_swap | 寄存器跨 lane 重排完成转置(无 LDS、无 barrier),免费 VALU;转置后 `buffer_store_dwordx4`(16 store/tile,发射量 1/16) | 仅 VALU | store-bound 胖形状最优 |
+| **quad_perm DPP 配对列**(最轻的一档) | 只把**相邻两个 n-fragment** 折进一个 dword:`v_cvt_pk_bf16_f32` 打包 + **一条 `quad_perm:[1,0,3,2]` DPP** 与邻 lane 交换 ⇒ 偶 lane 拿低片、奇 lane 拿高片,每 lane 持**相邻两列** | 每对 1 cvt + 1 DPP + 1 perm;无 LDS 无 barrier | 只想把 **32 B 请求并成 64 B、store 数减半**,又不值得上整套转置时 |
+
+**为什么单靠 2 B 标量 store 只有 32 B**:16×16 MFMA 一行的一个 n-fragment 摊在 16 个 lane 上,
+每 lane 2 B ⇒ 32 B/请求;fragment **对**覆盖 32 个相邻列,正好是两倍。
+配对后一发 64 B。约束:**N 必须是偶数**(这一对是当作一个单元写出去的),
+输出 **bf16**(靠的是 `v_cvt_pk_bf16_f32`),边界 clamp 要挪到**这一对的最后一列**上。
+2026-08-09 dense fp8 NN 实测计入 **+0.85%**(同 session A/B),
+是那一场唯一命中「访存侧(LDS/req per MFMA)」主轴的改动。
 
 ### CShuffle 细节
 - `e_vec = 4 if tile_n%128==0 else 2`。
@@ -45,10 +53,32 @@
 ### permlane16_swap 实战(mxfp4)
 - 正确的 permlane16_swap 转置 + dwordx4 是 store-bound 胖形状最优 epilogue:8192²×4096 从 fly/ait `1.039 → 0.998`。
 - ⚠️ **转对轴才有效**：`pitfalls/25` 记录过"转错轴"的 permlane 判负(不降 store 事务数)。区别只在转的是不是 MFMA 输出的正确轴——对轴=最优,错轴=白做。
+- ⚠️ **"最优 epilogue" 只在 store-bound 胖形状成立,别默认迁移**。同一手法(TACCW 宽存)搬到 **mxfp4 grouped NT**(G=32、N=2944/5760)实测 **+0.7~1.3% 更慢**(fwd down +1.34 / fwd gate_up +0.70 / dgrad gate_up +1.07)。不是矛盾而是不迁移:上面那条来自 dense 8192²×4096(行跨度 16 KB、N%256==0),而 grouped 这边行跨度只有 5888 B。**判据:先量 store 在 epilogue 里的占比,再决定要不要动存策略。**
+  这句判据非常正确并且救过整轮(照着"上面那条最优 epilogue"直接做宽存会稳定亏 3.5~4.1%),但**它下面原先引用的
+  ATT 归因数字("store 只占 per-tile 固定开销的 8%、42% 在 VALU 链")在 2026-08 的 mxfp4 grouped NT 上被直接消融
+  证伪,已删除**:删掉整段 C-store epilogue = **−4.87 µs/tile = 61% of F**(F=7.943 µs,K-sweep 六点同 run 拟合),
+  另一独立尺子 = 删 C-store 让 `kern_1` 从 579.2 → 476.5 µs(**−17.7%**);而删掉 254 `v_accvgpr_read` + 254
+  `v_cvt_pk_bf16_f32`(256 条 store 一条不留)只值 **−0.5%(噪声内)**。旧数字大概来自更早的核/调度策略。
+- ★ **epilogue 分解必须是三件套探针**:①**删整段**(量总量)②**同字节数只改段数**(量请求)③**保段数只删 VALU**(量发射)。
+  只有 ① 动分数 ⇒ 成本是字节/带宽。mxfp4 grouped NT 实测 ②=+0.8%、③=−0.5%、①=−20.3% ⇒ **字节限**。
+  ⚠ 任何改变**写入字节数或行集合**的"请求"探针都会假阳性:把 4 行塌成 1 行的"1 段"写法量到 −2.58 µs,
+  但它同时把写字节掉了 ~6×。做 ② 之前先核对 `M×N×2` 的覆盖面逐项不变。
 - inline-asm **不需要写死 `s_nop 1`**:该 hazard 只针对后续 VALU 读结果,而消费者是 `buffer_store`(VMEM 读 vgpr)不触发。
 - 降 nop 必须两步都做:
   - 去掉写死 s_nop + 两阶段(先全部 cvt+permlane 进独立 VGPR,再 burst 全部 store,把 permlane 与 store 拉开)→ ISA `s_nop 80→0`,bit-exact。
   - 单去 s_nop 只到 19 nop;单两阶段不去 s_nop 仍 64 nop;**两者都做才 0**。
+
+### ★ peel-last:把 C-store 插进最后一个 K-block 的 MFMA 阴影(occ=1 grouped wgrad 实测 +0.7~1.1%)
+- 场景:字节限 + occ=1 ⇒ store 的量既不在 VALU/宽度/顺序上(四项都实测 ≈0),而在"drain 无算力可藏"。
+  **tile 内唯一存在的可藏算力 = 最后一个 K-block 的 mfma**;把它从 whole-loop 手写 asm 里整块剥出来,
+  以 row-tile major 重发,并把每个 row-tile 的 store 插到**下一个** row-tile 的 mfma 之后(距离 1 最优,2/4 更差)。
+- **不需要把 store 搬进手写 asm**:让 asm 额外返回它末相已填好的 srcA/srcB 片段(`return_frags`),剥出的
+  block 直接复用寄存器,不重读 LDS。代价 vgpr +20、spill 0、store/cvt/accvgpr_read 条数不变。
+- ⚠ **asm mfma 对 backend hazard recognizer 不可见**:每组 store 前 `sched_barrier(0)` 固定发射距离,
+  最后一个 row-tile 后补 `s_nop 15`×2,否则 VALU 读到过期累加器(静默错,且只错最后收尾的 row-tile)。
+- 上限就是一个 K-block 的 mfma:deploy 每 tile 32 个 K-block,最后一个 ≈1.3 µs 而 drain ≈4.3-4.8 µs
+  ⇒ 只回收 store 成本的 ~10%。要吃剩下的必须有**跨 tile** 的 mfma,而统一 in-order vmcnt 封住了它
+  (见 pitfalls/05:store 藏进后续 fill/K-loop 整族)。
 
 ### B 矩阵 preshuffle(配套,减 load 侧 shuffle)
 - CPU 上把 `[N,K]` 预转置重排成 `[N/16, K/kpack, 4, 16, kpack_bytes]`。

@@ -32,6 +32,12 @@
 
 ### 下一刀 ROI
 - 生产 var-K wgrad 上 **occ=2**(LDS 128KB→≤80KB:**削流水缓冲 4→2 而非缩 tile**,让第二 wave 填 barrier/依赖气泡,唯一能真正抬 MfmaUtil 45→61% 的 lever)。不是 WL、不是 cross-group persistent(均已证伪)。风险:fwd/dgrad occ=2 曾证伪(bm=128 坏),wgrad 削缓冲是新尝试。dense NT 自己也只 61%@occ=1,现实目标是逼近 61% 吃掉 16pp。
+- ★★ **2026-08 勘误:上面这条「唯一 lever」已被实测推翻,方向甚至是反的。** 抬占用率的三条路
+  (tiled-pipeline 8-wave / whole-loop 8-wave / BLOCK_N=128)**全部 measure-closed**,根因是
+  **拆 tile 本身**(每波 MFMA 流长砍半 ⇒ ds_read→MFMA 气泡占比翻倍 + 抢同一个 LDS 读口),不是 barrier。
+  而这台机器上最快的 grouped 核(per-tensor wgrad 标尺,3000+ TF/s)是 **1 wave/SIMD + 256 AGPR**,
+  也就是**往下**走。⇒ **别再把 occ=2 当目标;判据换成「同步指令/MFMA」与「barrier/K-iter」**,
+  见下方 §「追一个具体 kernel 当标尺」③。
 
 ## grouped MXFP8 quant:融合 meta prologue / batched 权重 quant / HIP 输出契约
 
@@ -69,7 +75,11 @@
 ### fwd/dgrad occ=1 结构上限(PMC)
 - M2048 4096×7168:MX `kernel_grouped_mxfp8_nt` MfmaUtil 60.2%/Occ 21.8%/MemStall 0.1%/VGPR128 LDS128KB vs TW `kernel_grouped_nt_persistent` 65.2%/21.2%/0.1%/同。
 - MemStall≈0 非访存瓶颈;MfmaUtil 只 60-65% 是 **occ=1(LDS=128KB→1WG/CU)** 下 barrier/依赖 stall 没第二 wave 填;MX 60 vs TW 65 的 5pp 是喂 scale 给 scaled-MMA 的操作数开销(**scaled-MMA 本身税≈0**)。persistent 假设证伪(vs 非 persistent 无差别)。
-- 剩余 40% MMA 空闲要动只能上 **occ=2**(LDS 128KB→≤80KB:削流水缓冲 4→2 或缩 tile),TW 同卡 occ=1 是共有结构上限。
+- ~~剩余 40% MMA 空闲要动只能上 **occ=2**~~ —— 见上一节的 2026-08 勘误:occ=2 三条路全判负,方向是反的。
+  ⚠ 另外 **MfmaUtil 这个数本身要小心**:它按 wall 平均,含每 tile 的 prologue/epilogue。mx8tw 那场把
+  F(每 tile 固定成本)剥掉之后,**稳态 MFMA busy 是 87%**(标尺 81%)—— 60% 的读数几乎全部来自
+  tile 太短、固定成本被摊在 23 个 K-iter 上,不是稳态有 40% 空闲。**报 MFMA util 一定要说明是
+  wall 口径还是稳态口径。**
 
 ### ★ E8M0 scale pack 的硬上限 = 4 / occ 与 LDS 的实测常数(gfx950 实测)
 - **`pack ≤ 4` 是 ISA 硬上限,不是调参空间**:`scale_opsel(k,pack)=k%pack` 喂的是 `v_mfma_scale_f32_16x16x128_f8f6f4` 的 **op_sel 字段,只有 2 bit**(一个 dword 4 个字节)→ `pack=8` 在 ISA 层不可表达。❌ 别再试 `pack=8`。
@@ -107,6 +117,110 @@
 - ⇒ **在 ≥99% TBP 的 kernel 上,任何纯「省周期」的杠杆按 ~45% 兑现率估收益**(本轮 5.3%→2.2%,兑现 42%);要拿满额必须**同时省能量**(字节/L2 miss/指令发射),否则省下的周期一半被时钟吃掉。
   - ⚠️ **兑现率是 shape-dependent 不是常数**(2026-07-30 收官轮实证):45% 是在 `fwd down balanced` 上量的;换到 min 配置 `dgrad gate_up heavy`,mx cyc 2905 vs tw 3110(赢 7.1%)但 wall 1.6014 vs 1.6241(只赢 1.42%)⇒ **兑现率跌到 20%**(sclk 被压到 1814 vs 1915,−5.3%,两臂都钉 1400 W)。**排杠杆的折算系数要按 shape 取,skew/min 配置是全 bench 最不该花周期类杠杆的地方**。
 - pJ/FLOP 反而是 mx 更优(0.5601 vs tw 0.5758,好 2.7%):**功耗高 ≠ 效率低,只是把同样的活干得更快**;判 regime 时别把「功耗高」当成「浪费」。
+
+## ★★★ 追一个具体 kernel 当标尺:mx8tw campaign 的打法(2026-08,gm 0.881→0.972)
+
+任务形态 = 「让 mxfp8 grouped 的 fwd/dgrad/wgrad 在 18 个 e2e 配置上都打赢**同形状的
+per-tensor(tw)grouped wgrad**」。下面是这场 17 轮里**可复用的东西**;具体死路见 pitfalls/05。
+
+### ①★★★★ 第一轮就去拆标尺的 ISA,别只测自己
+**这场十五轮只测自己,第十六轮才第一次 dump 标尺的 ISA + dispatch 元数据,一测就换了整个打击面。**
+拆出来的对照表(同一次 rocprofv3 trace + `FLYDSL_DUMP_IR=1` 的 `21_final_isa.s`):
+
+| | mx NT(我们) | 标尺 tw wgrad |
+|---|---|---|
+| 每 WG 线程 / wave | 512 / 8 wave | 256 / **4 wave** |
+| **wave / SIMD** | **2** | **1** |
+| WG 数 / LDS | 6192 / 131072 B | **1008** / **163840 B**(满 160 KB) |
+| 累加器 | VGPR(`.agpr_count 0`) | **256 AGPR** |
+| 主环 LDS 读 | `ds_read_b128` | `ds_read_b64_tr_b8`(TN 转置读) |
+| **每 tile 的 K-iter** | **23** | **134** |
+| **每条 MFMA 配几条同步/调度指令** | **0.933** | **0.126**(7.4×) |
+
+⇒ 结论完全反直觉:**我们的稳态更快**(每 K-iter 1.164 µs vs 1.31–1.35,稳态 MFMA busy 87% vs 81%
+—— 因为 NT 不付标尺 TN 布局的转置读税),**全部缺口在 tile 太短**。
+**成本:一轮。收益:把十五轮「切 F 的零件」换成「换几何」。别再拖到第十六轮。**
+
+### ②★★★★ 用「tile 数 × 每 tile K-iter」把缺口算成一个数,再做反事实
+两边算同一批 FLOP 时,`T_tile = F + n_phase × P`(K-sweep 六点同 run 拟合,见 methodology/03):
+
+| | mx NT | 标尺 |
+|---|---|---|
+| tile 数 / 每 tile K-iter | 6192 / **23.0** | 1008 / **134.3** |
+| F / P | 5.43 µs / 1.164 µs | — / ≤1.351 µs |
+| **F 占 wall** | **15.7%** | **≤3.7%** |
+
+**反事实算术**:把 F 占比压到标尺水平 ⇒ wall 779 → 673 µs ⇒ **ratio 1.06,单独一条就够过线**。
+★ 这个算术**不依赖绝对时钟**(只用同 trace 的 wall 与 tile 数),所以在功耗墙上也成立 ——
+比「省了多少周期」那套折算(本卡 §DVFS 回吞 55%)可靠得多。
+★ **同一张 18 格表可以自证**:n=45 的三个格(0.984/1.032/1.013,2 个 PASS)vs n=23 的九格(全 ≤0.978),
+同代码同时钟,唯一差别就是每 tile 的 K-iter 数。**优先找这种「同表内的自然对照」,它比任何探针都干净。**
+
+### ③★★★ 新的对标维度:同步指令密度(每条 MFMA 配几条 waitcnt/barrier/setprio/nop)
+逐 opcode 直方图相除,**比值不依赖展开系数**,所以两个不同 kernel 可以直接比:
+
+| 每条 MFMA 配几条 | mx(8-wave) | 标尺(4-wave) | mx/标尺 |
+|---|---|---|---|
+| `ds_read` / `buffer_load`(g2s) | 0.750 / 0.268 | 1.455 / 0.446 | **0.52× / 0.60×** |
+| `s_waitcnt` / `s_barrier` / `s_setprio` / `s_nop` | 0.338 / 0.200 / 0.247 / 0.148 | 0.075 / 0.035 / **0** / 0.016 | 4.5× / 5.6× / ∞ / 9.4× |
+| **同步+调度小计** | **0.933** | **0.126** | **7.4×** |
+
+⇒ **访存指令我们全面更省,多出来的全是同步** —— 而 waitcnt/barrier/setprio 三类**全是
+2 waves-per-SIMD 的相位对齐装置**(8 个 wave 要 rendezvous、两个 sibling wave 要错开抢 LDS 读口)。
+1 wave/SIMD 时它们一件都不需要。**这条比「MFMA util」有用:它直接指向要改的东西。**
+
+### ④★★★ barrier 能不能删,判据是「这一段还有 g2s 在飞吗」
+笼统的「barrier 数 ≤ 参考」不可执行,逐段判可以:
+- **还有在飞的 g2s**(稳态)⇒ 承重的相位对齐装置,删一个 **−8.7%**(三次独立复现)。
+- **没有**(NT tile 尾部两个 K-step:距离 2 的预取让最后一次 g2s 在 `k=K_ITERS-3` 就发完,这两步只读)
+  ⇒ 纯税,删掉 12 个值 **min +1.06%**(本场第二大的一笔)。
+⚠ **这种失败过 SNR 和逐字节确定性门**,正确性门抓不到,只能靠 bench 区间。
+⚠ 同族的还有三条:**g2s 的发射点**也是相位装置(把一组 g2s 提前一个相位 = −1.3% gm);
+**epilogue 的位置**是承重的(store 提到最后一个 MFMA 相位之前 = −7%);
+但 **vmcnt 可以在同一相位内向后挪**(+0.4~0.5%)—— barrier 是相位装置(位置承重),
+vmcnt 是可见性装置(只要中间不发新 g2s 就能滑)。
+
+### ⑤★★★ 20–60 秒的 compile-only ISA 门,先于 70 秒的 bench
+`rm -rf /root/.flydsl/cache && FLYDSL_DUMP_IR=1 python <驱动>` 然后 grep
+`.vgpr_count / .agpr_count / *spill_count / group_segment_fixed_size`,再 `grep -c s_barrier`。
+**spill > 0 的候选不要送去跑 bench。** 本场至少五个候选(wide tile / 2-tile 循环 / A-fragment 跨迭代
+驻留 / persistent / 第二份重 body)全部靠这道门在一分钟内判掉,每个都省一轮。
+- **本核的悬崖是 246/256,余量只有 10 个 arch VGPR**(8-wave = 2 waves/SIMD)。任何「让某组值多活一段」
+  的改动都会 spill 并直接 −19…−26%:store 提前折叠 +24、tile 循环 +25、A fragment 跨迭代驻留 +44。
+- ⚠ **同一 kernel 内塞第二份重 body** 恒定 `256 / spill 23`,spill 落点是 **MFMA 流里的累加器**
+  fragment。单份 244/0、两份**同样**的 body 仍 244/0 ⇒ 是「第二份重 body 实例」本身,不是几何选错。
+  要落只能拆**第二个 kernel dispatch**。
+
+### ⑥★★ grouped 特有:E8M0 preshuffle 是 dispatch-bound,只吃「砍 WG 数」
+`kern_0` 占 wall 0.8–1.5%,标尺一分钱不付。它有效带宽只有 2.6–2.9 TB/s(HBM 8 TB/s 的 33–36%),
+**是派发/延迟 bound,不是 BW-bound**:
+- ✅ **砍 WG 数**的改动一路正收益:KT 16→32→48→64(WG 数 = `rows/64/AS × ceil(K128/KT)`)、
+  一个 WG 吃 AS 个 64 行 slab(A 侧 WG 2052→1026,**本场最大的一笔 +1.04%**)。
+- ❌ **「同 WG 更多线程」不吃**:BLK 256→512 是 **+24~28% 更慢**(LDS barrier 要同步的波从 4 变 8)。
+- ❌ 加宽访问也不吃:读宽 dword→dwordx4(指令数 ÷4、在飞字节 ×4)实测**净零**。
+- ★ **AS 与 KT 是同一个乘积约束的两个面**:LDS 预算卡的是 `AS × KT`,「KT 减半换 AS 加倍」拿到的是
+  同样的 WG 数。要再砍派发面得抬 8 WG/CU 的驻留上限,不是在这两个旋钮之间搬家。
+- ★ **真正的预算是每 WG 份额 `LDS_total / WG_per_CU` = 163840/8 = 20480 B,不是 160 KB 总量**。
+  按它写一个 `_preshuf_a_slabs(pitch)` 让配对**只在保得住 8 WG/CU 时发生**(K128=23 配对 16896 B、
+  K128=45 拒绝),比写死一个 AS 好 —— 写死 AS=2 会在 K128=45 上掉到 6 WG/CU。
+- ⚠ **KT 的峰值位置由 staged 行 pitch 决定**:dense pitch 下 KT=64 是 +51% 更慢,加了 `KT+1` 奇 pitch
+  之后 64 反而最好。**改 pitch 必须重扫 KT。**(pitch 自己只值 0.4% —— 它是使能项不是加速项。)
+- ⚠ **`share_of_main` 报的是毛成本不是可回收成本**:实测把 preshuffle 整个关掉,调用反而**慢 6 µs**
+  —— 它顺带把 GEMM 马上要读的 scale workspace 热进了 L2。
+
+### ⑦★★ 已实测「两边同档、没有对标差距」的三条轴(别再挂在计划里)
+- **DRAM 字节 / L1→L2 读请求 / 功耗**:`TCP_TCC_READ_REQ` 1.02×、HBM 合计 1.90 vs 1.84 GB、
+  1399.5 vs 1374 W。⇒ pitfalls/13 §「省 TCP→TCC 请求 = 买时钟」在这里没有可动面。
+  **前置判据:先测两边的 `TCP_TCC_READ_REQ`,比值 < 1.1 就说明请求路径已经打平。**
+- **LDS→VGPR 读放大**:闭式 `waves×(tile_m+tile_n)/512` 给 mx 3.0× / 标尺 2.0×,**但按字节实测标尺
+  自己是 2.91×** —— 它的 TN 布局必须用 8 B 的 `ds_read_b64_tr_b8`,两条才顶一条 `b128`,而且它每 WG
+  每 K-iter 发的 ds_read 是我们的 **1.94 倍**,照样更快。**闭式只在两边用同宽度读时可比。**
+- **等待的去向**:`SQ_WAIT_ANY/SQ_WAVE_CYCLES` mx 28.7% vs 标尺 4.05%,但 `SQ_WAIT_INST_LDS` 折算到
+  每个常驻 wave-slot 是 2.2% vs 2.6%(同档)⇒ **等待集中在 barrier,不在 LDS。**
+
+### ⑧ 测量口径:两条本场各踩三次以上的,已写进 pitfalls/02
+**gm 只能靠夹心判、min 反而稳**;**隔离/graph-replay 探针不能给 cache-state 或 launch-overhead 类
+改动排序(会符号翻转)**。判据与数字见 pitfalls/02 §噪声地板。
 
 ### benchmark shape 表(源 benchmark/ops/training/config.py)
 - 3 模型 ×2 GEMM(GateUP/Down),B=8(experts),M∈{2048,4096},trans_b=True。GateUP=(N=2*moe_int,K=hidden),Down=(N=hidden,K=moe_int)。

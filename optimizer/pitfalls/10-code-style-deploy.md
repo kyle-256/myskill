@@ -4,7 +4,13 @@
 
 ## 代码风格门：源码禁调试痕迹/benchmark 数字、探针脚本不 git add、ruff --fix 查 diff
 
-- **注释精简,严禁 >5 行连续注释/docstring**:要点 1-2 句;推导/实测数字/权衡进 commit/memory/`tuning_results/`。放行前 review 逐块查,`>5 行`即打回。
+- **注释精简,严禁 >3 行连续注释/docstring**:要点 1-2 句;推导/实测数字/权衡进 commit/memory/`tuning_results/`。放行前 review 逐块查,`>3 行`即打回。
+
+### ★ block/密度 计数器必须数 docstring,copyright 头豁免(2026-08-09 实测)
+自建 ship-gate 的 `[block<=3]` 与密度只 grep `^\s*#`,**docstring 是字符串字面量、根本不以 `#` 开头**——于是 8 行、5 行的多行 `"""..."""`(还塞了 `17.0`/`12.75`/`12x12`/`measured flat` 这类实测数字)全程 PASS,连过两轮 workflow review 都没抓到,最后被用户一眼看穿("你不会数数?")。教训:
+- **block 连续行计数要把 docstring 计入**(密度沿用 `#` 定义)——用 `ast.get_docstring(node, clean=False).count("\n")+1` 量每个 def/class/module 的 docstring 行数,>3 即 FAIL;禁数字正则也要扫 docstring 文本(`\d+\.\d+|\d+x\d+|dB|TFLOP|measured`)。
+- **文件头 copyright/license 块从行数与密度双双剔除**(强制样板,非 WHY,不该浓缩)。
+- docstring 改动对 codegen 中性(不进 AST 签名),可放心浓缩;但正因它不进 AST 签名,**行为守门器看不见它 → 必须单独有一条 docstring 计数门**,否则就是这次的洞。
 - **源码注释严禁调试/实验痕迹**：跑数结果(如 `58dB 正确`)、调参备忘、`# debug`/`# tmp`/`# 临时`、带日期的过程笔记——这些进 commit message / memory / PR，**不进源码**。放行前必须 `rg -i 'debug|tmp|临时|verified|实验|print\(|TODO'` 得 **0 命中**才放行。WHY：源码是长期资产，调试痕迹是过程噪声，会误导后续读者。
 - **探针脚本绝不 git add**：`_g_*.py` / `_d_*.py` / `opt_*.py` 这类临时探针脚本，永远留本地，不入库。
 - **tuning 中间态放 `tuning_results/`(项目内)，不写 memory**：每轮 winner / TFLOPS / cfg 属于易变数据，进 `tuning_results/`。memory 只放**不变的约定**——target 来源、`BK=128` 硬约束等。WHY：memory 是稳定索引，塞入易变调参结果会污染。

@@ -107,6 +107,8 @@
 - **WHY 关键**：曾据 torch `copy_` 的 ~5.0 TB/s 误判 quant "已贴墙 90% / 物理锁死"，**这是错的**。真上限是 ~6.3 TB/s，quant 还有空间，别据假天花板宣布物理无解。
 - **vw2 vs vw4（8B vs 16B 事务）几乎无差别**：上限 ~6.3 TB/s 与事务粒度无关，**❌ 别再靠加大事务粒度（16B）指望突破带宽上限**——不是杠杆。
 - 呼应 68（别轻易宣布物理无解）：宣布"贴墙/物理锁死"前，先用自定义宽向量 copy 测真上限，不要用带自身开销的 framework 原语（torch copy_）当基准。
+- **2026-08-04 融合 flash-bwd r09 复证，并追加一条更隐蔽的假天花板**：同一台 MI355X 上，torch `sum(dim=1)` 折叠 split-K 槽 = **4.48 TB/s**，同样字节的手写 FlyDSL 规约核 = **6.14 TB/s（+37%）**；torch 的 strided transpose+mul（lse 转置预缩放）= **1.1 TB/s**，换 LDS 分块使两侧都 128 B 连续后 = **2.86 TB/s（2.6×）**。⇒ 本卡"torch 原语低 25%"的结论在 reduction / transpose 上更严重（低 27~61%），不止 `copy_`。
+  - ⚠️ **假天花板的第二种形态：把"自己当前最快的核"当成机器上限。** 该 campaign 早前用自家 dqred 实测 6.03 TB/s，据此在本地 memory 里写下"6.03 是内存速率封顶、别想手写核超它"，于是把 dk/dv 折叠留给 torch 又跑了 4 轮；本轮三个手写尾核实测 **6.14 / 6.24 / 6.26 TB/s**，与本卡记的真上限 ~6.3 TB/s 吻合。⇒ **"我的核 = 上限"和"torch = 上限"是同一个错误**；只有独立的宽向量 1R:1W 微基准才是上限基准，且任何"已封顶"的记录都要标注它是用什么测的。
 
 ## prefetch 何时无用/有害：s_waitcnt 编译器控、memory-bound/compute-bound/1wave 溢出别加
 
@@ -132,6 +134,44 @@
 - **Pattern2** 连续 load 背靠背无 compute 交织 → VMEM 队列饱和。修法：在当前 tile MFMA 计算期间预取下一 tile 的 K load（double-buffer）。
 - **Pattern3** LDS prob 读紧接 PV MFMA → lgkmcnt stall。修法：先把所有 LDS 读 batch 发射，再统一做所有 MFMA，让 LDS 数据先就绪。
 - **Pattern4** scale load 和使用只隔 TLOOP 个 MFMA → 用太早 stall。修法：把 scale load 放到 **block 最开头、K load 之前**发射，最大化延迟掩盖距离。
+
+## 深派发下 L2 命中的守恒量是 **WG 存活时间**，不是 tile 的 MFMA 条数
+
+gpt-oss-20b E=32 wgrad（gfx950，OUT_M=2944，单卡 32 专家全驻，18/34.5 轮派发）实测锚点，
+所有数字同一轮 rocprofv3 单遍 5 counter（`GRBM_GUI_ACTIVE / SQ_VALU_MFMA_BUSY_CYCLES /
+SQ_INSTS_MFMA / TCC_HIT_sum / TCC_MISS_sum`）：
+
+| 臂 | wall | SQ_INSTS_MFMA | MFMA-busy | L2 命中 | DRAM 读 | 等效带宽 |
+|---|---|---|---|---|---|---|
+| down (2,6,1,1) 开短-N 余数体 | 14.19 ms | 6.370e8 | 82.98% | 68.0% | 61.7 GB | 4.40 TB/s |
+| down 同配置但**齐一 tile**（关余数体）| 14.27 ms | 6.795e8 | **88.35%** | **74.4%** | 50.9 GB | 3.57 TB/s |
+| gate_up (1,1,1,1)，本就齐一 | 27.36 ms | 1.3023e9 | **90.66%** | 60.6% | 133.3 GB | 4.87 TB/s |
+
+三条结论，按可迁移性排序：
+
+1. **L2 命中不是直接约束**。gate_up 命中最低（60.6%）却 MFMA-busy 最高（90.66%），且它在
+   4.87 TB/s 下照样跑满 —— 所以看到低命中先别去修 L2，先看 MFMA-busy 还剩多少。
+   两条 shape 都在 83~91% busy，即**整算子离发射天花板只剩 9~17%**。
+2. **余数体（短 M/短 N 体）的定价要打两折**。down 的短-N 体省 6.25% MFMA，实际只兑现
+   **+0.6~1.2%**：它同时把 L2 命中打掉 6.4pp、MFMA-busy 打掉 5.4pp。
+   经验折扣 ≈ **只有 20% 的余数 MFMA 收益能落到 wall 上**。
+3. ❌ **别把余数 tile「配对成等成本 tile」**。让短-M 体（`a_halves=1`）的一个 WG 连做两个
+   相邻 N-block，MFMA 精确 −3.89%、逐字节 bit-exact，但 wall **−20%**：
+   L2 命中 68.0%→**44.5%**、DRAM +70%（请求总量反而 −1.7%，全部是命中率崩的）。
+   机制：`a_halves=1` 的体是 **0.5× MFMA / 0.75× 字节 / 1.0× K 扫描**，两个串起来 = 1× MFMA
+   但 **~1.5× 存活时间**。每 XCD 只有 32 个 CU 共驻，WG 活得比一"代"长就会横跨两个 class run，
+   活跃 slab 从 12 翻到 ~24。**共驻窗口里要齐一的是存活时间，MFMA 条数齐一没有意义。**
+
+### ❌ 别再试：256×192 tile 消 wgrad 的 N padding（含把 LDS pool 由 96 列补到 128 列）
+2880/192=15、5760/192=30，看着是"零 N padding + tile 成本齐一"，但按上表的实测轮次分解
+（齐一臂 T_round = 0.700 ms MFMA + 0.092 ms stall）反解为**负**：
+- 与今天的短-N 体 **MFMA 完全相同**（两者 N padding 都已是 0），换来的只有齐一性；
+- WG 数 +25%（144→180 tile），算术强度 `BM×BN/(BM+BN)` 从 128 掉到 **109.7 B/cell**；
+- 真 96 列 pool（要 fork 一整套非 2 的幂地址代数）：22.5 轮 ×(0.526+0.081) = **13.64 ms，+0.9%**，
+  落在 `_an_wg_cfg` ±0.7% 的噪声里；
+- 补到 128 列 pool（B 每行又回到 256 B）：22.5 轮 ×(0.526+0.092) = **13.90 ms，−1.0%**。
+
+补 pool 宽度这一步本身就是负的：它把省下来的 B 字节又还回去，只剩 WG 数 +25% 的开销。
 
 ### ❌ 别再试：FP4_LDSR 手动提前发射 ds_read
 - 手动把 a1/b1 的 ds_read 提到 iter 顶隐藏延迟 → **反退 ~20%**（K2048：2509 vs 3126）。

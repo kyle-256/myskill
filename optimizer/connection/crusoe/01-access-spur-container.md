@@ -11,17 +11,6 @@
 > ```
 > 没有活 job 就按 §0 第 3 步重新 sbatch 一个。**只认自己的 job** —— `squeue -u xianzhao` 里别人的节点不要碰。
 
-> **🚨 2026-07-28 更正:跳板机挂了,chi 全线不可达 —— 下面这条回退路线暂时无效。**
-> `149.28.124.225` **本身** SSH 超时,而 `sync/.ssh-chi.sh` 是靠 ProxyCommand 经它中转的,
-> 所以 **chi2798 / chi2774 / chi2811 全部连不上**。症状是 `Connection timed out during banner exchange`,
-> 看着像节点故障、实为跳板故障 —— 我据此误判"chi2798 节点挂了",让一个 campaign 空等 3.5 小时。
-> ★**诊断顺序:先单独试 `ssh root@149.28.124.225`,再怀疑节点。**
-> ~~⚠️ 2026-07-23 回退提示:crusoe spur 常排队,急用 GPU 时优先回 chi2774~~(跳板恢复后才重新适用):
-> chi2774 经跳板 + `sync/.ssh-chi.sh`,容器 `mlperf_gptoss` 长期 Up,GPU4-7 干净,
-> meta-attn 分支 Primus-Turbo 在容器 `/workspace/code/Primus-Turbo`。
-> 详见 [[../../../../.claude/memory/project_crusoe_env]] + [[../../../../.claude/memory/project_chi2811_sync]]。
-> chi 侧文件传输走 base64→容器 `/root`(`docker cp /dev/stdin`/scp-to-NFS/`docker exec -i` 都挂)。
-
 ## 0. TL;DR（一条龙）
 Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur 的 --container-image(那条死路)，用节点自带的 dockerd**。流程：
 1. login: `ssh -i .ssh_laptop/id_ed25519 xianzhao@crs-m2m-cpu-spur-login.crusoe.amd.com`（csh！命令包 `bash -lc`）
@@ -33,8 +22,8 @@ Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur
    bash /shared_nfs/kyle/node_setup.sh
    sleep infinity
    ```
-4. `node_setup.sh` 里 **从保存的 tar 直接起**(flydsl 0.2.2/egg-fix/双 venv 全烤进镜像,免重装):`docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar`(25G,~3min)→ `docker run -d --name=gpt-oss-docker --network=host --ipc=host --device=/dev/kfd --device=/dev/dri --group-add video -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260720 sleep infinity`。进度看 sbatch 的 `-o` 输出文件。**兜底**(无 tar):`docker pull rocm/primus:v26.3` + §6 重装 flydsl。
-5. 干活:短命令用独立 `srun ... bash /shared_nfs/kyle/xx.sh`(见 §4.-1),容器内用 `docker exec gpt-oss-docker bash -lc '...'`。coding base = `/shared_nfs/kyle`(=容器内 `/workspace/code`)。⚠ 那里目前**只有 `meta-attn`,没有 `Primus-Turbo`** —— 要跑 turbo 得先把整个仓(**含 `.git`**)传过去。⚡ 一条龙脚本见 §4b。
+4. `node_setup.sh` 里 **从保存的 tar 直接起**(flydsl 0.2.2/egg-fix/4 套 venv(含 venv-syncv4)全烤进镜像,免重装):`docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260807.tar`(25G,~3min)→ `docker run -d --name=gpt-oss-docker --network=host --ipc=host --device=/dev/kfd --device=/dev/dri --group-add video -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260807 sleep infinity`。进度看 sbatch 的 `-o` 输出文件。**兜底**(无 tar):`docker pull rocm/primus:v26.3` + §6 重装 flydsl。
+5. 干活:短命令用独立 `srun ... bash /shared_nfs/kyle/xx.sh`(见 §4.-1),容器内用 `docker exec gpt-oss-docker bash -lc '...'`。coding base = `/shared_nfs/kyle`(=容器内 `/workspace/code`)。⚠ 新仓要跑 turbo 先把整个仓(**含 `.git`**)传过去(rsync 到 login `/shared_nfs/kyle/<name>/Primus-Turbo`,.so 排除后从现成仓补,见 [[../../../../.claude/memory/project_syncv4_env]] 的 syncv4 standup 流程)。⚡ 一条龙脚本见 §4b。
 
 ## 1. 登录 ✅
 - host `xianzhao@crs-m2m-cpu-spur-login.crusoe.amd.com`；key **`/workspace/code/.ssh_laptop/id_ed25519`**(pub=`xianzhao@amd.com`)。首次把该 pub 加进 login `~/.ssh/authorized_keys`(共享 NFS home，一次全集群生效)：`echo 'ssh-ed25519 AAAA... xianzhao@amd.com' >> ~/.ssh/authorized_keys`。
@@ -80,6 +69,19 @@ Crusoe = AMD 内部集群，调度器 `spur`(slurm 兼容)。**容器不用 spur
 ⚠ 别在这三条死路上反复试 —— 已经有两个 session 分别在 node-ssh 和 srun --overlap 上耗掉大量轮次,
 其中一个还得出了"srun --overlap 死路 → node-ssh 是唯一正道"的**错误结论**(两条都不通)。
 
+### 4.-1b ★★login 连接时好时坏的真因 + 动态选健康后端(2026-08-07 定案,已推翻旧 pin 规程)
+**症状**:同一把 key(`.ssh_laptop/id_ed25519`)连 `crs-m2m-cpu-spur-login` 有时成功、有时失败;campaign 远端 bench 偶发 rsync 255 崩 round / 卡住。
+**真因(修订版)**:`crs-m2m-cpu-spur-login.crusoe.amd.com` 只解析到**单个 VIP** `10.180.168.227`,轮询发生在 **VIP 后端**(-005/-009/-012…),而**后端各机会各自 flap**:接受 TCP + **key auth 成功**("Server accepts key")后,后端立刻 **post-auth 掐断 session**("Connection closed by … port 22")。表现为**成片抖动**(一阵 12/12 通,一阵 0/8 断),不是 fail2ban、不是 key 问题,是后端 session-setup 侧的故障。命中健康后端就通,命中正在 flap 的就断。
+- ⚠ **旧结论已作废**:早前说"后端直连主机名 firewall 挡、直连不通、只能走 VIP"是**错的**。实测**后端直连 FQDN 可达**:`crs-m2m-cpu-spur-005/012.crusoe.amd.com` 直接 `ssh` 通;哪台健康是随时间 flap 的(如 08-07 -009 DOWN、-012 UP)。因此客户端**可以按 FQDN 直选后端**,绕开 VIP 轮盘。
+- ⚠ 所有后端共享同一 `/shared_nfs`,但**只有部分后端挂了我们的队列目录**(`/shared_nfs/kyle/q*`);选后端必须同时满足**可达 + 挂了对应队列**。
+**修复 = 动态解析健康后端(取代 pin -009)**:见 memory `project_crusoe_dynamic_backend_resolve`。
+- **`sync/crusoe/resolve_login.sh <need_dir>`**:探测后端直连 FQDN(默认序 `012 009 005 006 007 008 010 011 013 014`,可 `CRUSOE_BACKEND_IDS=` 覆盖),打印第一个可达且 `test -d <need>` 通过的 `user@host`,按 `<need>` md5 缓存 `/tmp/crusoe_login_*`;`CRUSOE_RESOLVE_FORCE=1` 跳缓存换后端。
+- **`sync/crusoe/lib.sh`**:`CRUSOE_LOGIN` 为空即经解析器动态选(4 套 push/rexec 共用);`crusoe_exec` 轮询中途后端死会 `crusoe_relogin`;仍可 `export CRUSOE_LOGIN` 覆盖。
+- **`cursor_campaign.py` `CrusoeRemoteHarness`**:删 `-009` 常量,`_resolve_login(force=)`;`sync()`/`_docker()` 推送与轮询失败都 `force=True` 跳健康后端重试 → 后端 flap 不再崩 round。
+- **在飞老代码 campaign 保活**:已在跑的 campaign 不热加载 .py,仍用固定 `-009` 名 → 靠 `/root/.ssh/config` 里 `-009` 别名的 `HostName` override 转到健康后端;**`sync/crusoe/refresh_alias.sh`**(cron)在别名后端掉线时自动重指,健康时静默。
+- ★换机/pool 全变时**只改 `resolve_login.sh` 的 `IDS` 顺序**即可,不用动 campaign。
+- ⚠ **`pin_009.sh` 已弃用**(ControlMaster 硬钉单台 -009 的老法):-009 会 flap、钉死反而崩;保留文件仅作历史。容器重建清 `/root/.ssh/config` 后,新 campaign 靠解析器自愈,无需手动补 config;老代码在飞进程才需 refresh_alias 维持别名。
+
 ### 4.-2 ★★文件队列 agent = 唯一可用的持续通道(2026-07-28 端到端验证)
 思路:节点上常驻一个轮询循环,从 NFS 读 `.job` 脚本执行、结果写回。login 侧只需 scp 文件。
 
@@ -90,13 +92,13 @@ echo "[agent] $(hostname) starting $(date)" >> "$Q/agent.log"
 # 1) 起容器(已存在则复用 —— 换 job 重跑时不会重复 docker load)
 if ! docker ps --format '{{.Names}}' | grep -qx gpt-oss-docker; then
   docker images | grep -q gpt-oss-docker || \
-    docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar
+    docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260807.tar
   docker rm -f gpt-oss-docker 2>/dev/null
   docker run -d --name=gpt-oss-docker --network=host --ipc=host \
     --device=/dev/kfd --device=/dev/dri --group-add video \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     -v /shared_nfs/kyle:/workspace/code \
-    gpt-oss-docker:kyle-20260720 sleep infinity
+    gpt-oss-docker:kyle-20260807 sleep infinity
   sleep 5
 fi
 echo "[agent] container up: $(docker ps --format '{{.Names}}' | tr '\n' ' ')" >> "$Q/agent.log"
@@ -174,6 +176,16 @@ sleep 5 && RSH 'cat /shared_nfs/kyle/q/mytask.out; cat /shared_nfs/kyle/q/mytask
 - ⚠ **区分 §4b 的 sbatch agent(带 docker load,换节点用)vs 本节的 loop-only agent(容器已在,纯加并行度)**:
   换了节点(容器没了)用前者;同节点加队列用后者。
 
+### 4.-2c ★4 套环境的成品传输系统(2026-08-07,已端到端验证)
+本仓已把上面的多队列模式落成 **4 套 Crusoe-native 传输系统**,一套一环境,别再手搓 job:
+- 核心 `sync/crusoe/lib.sh`(`crusoe_rsh/push/exec`)+ 通用 worker `sync/crusoe/qloop.sh`(部署为 NFS `crusoe_qloop.sh`)。
+- 每套薄封装 `sync/<env>/{push.sh,rexec.sh}`,固定该 env 的 venv/独立队列/repo:
+  mxfp4→`/opt/venv`+`q_mxfp4`;tensorwise→`/opt/venv-tw`+`q_tw`;syncv3→`/opt/venv-syncv3`+`q_syncv3`;syncv4→`/opt/venv-syncv4`+`q_syncv4`(各自 `<env>/Primus-Turbo`)。
+- 用法:`sync/<env>/push.sh [relpath]`(rsync→login NFS,永不 --delete)/ `sync/<env>/rexec.sh [-g GPU] 'cmd'`(命令里 `"$VENV/bin/python"`)。
+- `node_agent.sh` 已加 `CRUSOE_ENV_LOOPS` 段,换节点自动重起 4 条队列 loop。
+- 完整说明见 `sync/crusoe/README.md`;设计与验证见 [[../../../../.claude/memory/project_syncv4_env]]。
+- ★坑:薄封装用 `set -euo pipefail`,`crusoe_rsh` 必须整体 `... || true`(否则 grep 空匹配 / login ssh 抖动的非零会静默 abort);一次性 `qrun.sh` 无 `set -e` 故免疫。
+
 ### 4.0 跑前先确认节点活死(2026-07-22 血泪)⚠️
 `squeue` 的 `R` 状态**会滞后 ~2min** —— 节点 NODE_FAIL 后 squeue 快照仍可能显 `R`(301 实测:06:35:06 NODE_FAIL,而 06:33 快照还是 `R 4:56:34`,信了它会拿死节点跑/或以为数据有效)。**别信 squeue 的 R**:
 - 确认死活:`squeue -j <JOBID>`(返回空=job 已终止)+ `spur accounts`/账务库看 `NODE_FAIL`;或直接 `bash ~/dx.sh <NODE> <脚本里第一行 hostname>` 看是否连得上并落在预期节点。
@@ -195,12 +207,12 @@ compute 节点自带 **dockerd + containerd**(本地存储 `/mnt/m2m_nobackup/do
    sleep infinity
    ```
    `squeue -u xianzhao -o "%i %j %T %N"` 拿节点名(如 crsuse2-m2m-171)。
-2. **node-ssh 进节点** → **首选 = 从保存的 tar `docker load`**(§4c 存的 `gpt-oss-docker:kyle-20260720`,flydsl 0.2.2/egg-fix/双 venv 全烤好,免 §6 重装):`docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar`(24G,~3-4min)。**兜底** = `docker pull rocm/primus:v26.3`(节点常已缓存 v26.2/3/4;harbor 代理 `harbor.crusoe.primus-safe.amd.com/proxy/...`),但要再走 §6 装 flydsl。
-3. **docker run 起持久容器**(镜像用 tar 的 `gpt-oss-docker:kyle-20260720`;兜底用 `rocm/primus:v26.3`)：
+2. **node-ssh 进节点** → **首选 = 从保存的 tar `docker load`**(§4c 存的 `gpt-oss-docker:kyle-20260807`,flydsl 0.2.2/egg-fix/4 套 venv(含 venv-syncv4)全烤好,免 §6 重装):`docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260807.tar`(24G,~3-4min)。**兜底** = `docker pull rocm/primus:v26.3`(节点常已缓存 v26.2/3/4;harbor 代理 `harbor.crusoe.primus-safe.amd.com/proxy/...`),但要再走 §6 装 flydsl。
+3. **docker run 起持久容器**(镜像用 tar 的 `gpt-oss-docker:kyle-20260807`;兜底用 `rocm/primus:v26.3`)：
    ```
    docker run -d --name=gpt-oss-docker --network=host --ipc=host --device /dev/dri --device /dev/kfd \
      --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size=64G \
-     -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260720 sleep infinity
+     -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260807 sleep infinity
    ```
    实测容器内 torch 2.10.0+8 GPU + /workspace/code 挂载 OK；ROCm 7.2.1、arch gfx950。
 4. 干活 `docker exec gpt-oss-docker bash -lc '...'`。**换节点**：容器在 node-local，节点变了要重 docker load+run(tar/代码在 /shared_nfs,几分钟)。
@@ -214,8 +226,8 @@ sbatch -A amd-primus -p amd-spur --qos=amd-burst-qos -N1 --exclusive -t 12:00:00
 squeue -u xianzhao -o "%i %T %N"            # 拿 NODE(如 crsuse2-m2m-301)
 # ②login 端: 把下面脚本写到 /shared_nfs/kyle/_load_run.sh(用 base64 -d 落地,避免引号)
 #   内容:
-#     IMG=gpt-oss-docker:kyle-20260720
-#     docker image inspect $IMG >/dev/null 2>&1 || docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar
+#     IMG=gpt-oss-docker:kyle-20260807
+#     docker image inspect $IMG >/dev/null 2>&1 || docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260807.tar
 #     docker rm -f gpt-oss-docker 2>/dev/null
 #     docker run -d --name=gpt-oss-docker --network=host --ipc=host --device /dev/dri --device /dev/kfd \
 #       --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size=64G \
@@ -228,19 +240,21 @@ bash ~/nbg.sh <NODE> /shared_nfs/kyle/_load_run.sh /shared_nfs/kyle/_load_run.lo
 ⚠️ node-ssh 里的**内层命令用双引号**(`ssh NODE "docker ..."`),别用单引号 —— 会和 RSH 的 `bash -lc '...'` 外层单引号碰撞,命令截断跑到 login 上("docker: command not found" 就是这坑)。
 
 ## 4c. 持久化容器(docker commit + tar)✅
-容器是 **node-local**，节点变/容器删就没了。venv-tw/flydsl 0.2.2/egg 修复/finder/git config 等**改动在容器可写层**(代码在 bind-mount /shared_nfs/kyle 不在镜像；`.so` 也在 repo=共享盘)。**commit/save 在节点 host 跑(不是 docker exec)**：
+容器是 **node-local**，节点变/容器删就没了。venv-tw/venv-syncv3/venv-syncv4/flydsl 0.2.2/egg 修复/finder/git config 等**改动在容器可写层**(代码在 bind-mount /shared_nfs/kyle 不在镜像；`.so` 也在 repo=共享盘)。**commit/save 在节点 host 跑(不是 docker exec)**：
+> **★ 2026-08-07 最新 tar = `gpt-oss-docker:kyle-20260807`**:在 20260720 基础上多烤进 **`/opt/venv-syncv4`**(承载 mxfp4_syncv4 campaign,见 [[../../../../.claude/memory/project_syncv4_env]])。现镜像内共 **4 套 venv**:`/opt/venv`(mxfp4)、`/opt/venv-tw`(tensorwise)、`/opt/venv-syncv3`、`/opt/venv-syncv4`。save 因 docker load 会超 ssh 2min → **必须后台 nohup + 轮询 `.tar` 大小/`.done` 标记**(本 session 用 `sync/crusoe/qrun_host.sh` + `_commit_save.sh` 跑通)。
 ```bash
 # 在节点上(node-ssh 进去,或 nbg 脚本后台):
-docker commit gpt-oss-docker gpt-oss-docker:kyle-20260720
+docker commit gpt-oss-docker gpt-oss-docker:kyle-20260807
 mkdir -p /shared_nfs/kyle/images
-docker save gpt-oss-docker:kyle-20260720 -o /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar   # ~22G,慢(NFS),后台跑
+# ~28G,慢(NFS),后台跑:
+nohup bash -c "docker save gpt-oss-docker:kyle-20260807 -o /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260807.tar && echo OK > /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260807.tar.done" >/shared_nfs/kyle/images/save.log 2>&1 &
 ```
 换节点恢复：
 ```bash
-docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260720.tar
+docker load -i /shared_nfs/kyle/images/gpt-oss-docker_kyle-20260807.tar
 docker run -d --name=gpt-oss-docker --network=host --ipc=host --device /dev/dri --device /dev/kfd \
   --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size=64G \
-  -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260720 sleep infinity
+  -v /shared_nfs/kyle:/workspace/code gpt-oss-docker:kyle-20260807 sleep infinity
 ```
 tar 在共享盘 → 任何节点 `docker load` 即用，省去重装 flydsl/重 build。跑法 helper：`~/nbg.sh <node> <script> <log>`(node-host 后台) 对应 `~/dxbg.sh`(容器内后台)。
 
@@ -273,7 +287,7 @@ tar 在共享盘 → 任何节点 `docker load` 即用，省去重装 flydsl/重
 
 ## 7. 存储 ✅
 - `/shared_nfs`(50T 集群共享)→ coding base `/shared_nfs/kyle`(和 /shared_nfs/<user> 放一起)；容器里挂到 `/workspace/code`。**跨节点存活**,换节点只需重 `docker load + run`,代码/harness/镜像 tar 都不用重传。
-  ⚠**2026-07-28 实测那里只有 `meta-attn` 和 `images/`,没有 `Primus-Turbo`** —— 要跑 turbo 相关(如 fwd campaign)必须先把整个仓传过去,**含 `.git`**(campaign 要做 git 操作)。
+  ⚠ 新仓要跑 turbo 相关必须先把整个仓传过去,**含 `.git`**(campaign 要做 git 操作)。2026-08-07 起 NFS 上已有 `syncv3/`、`syncv4/`(mxfp4_syncv4 campaign)等多套 Primus-Turbo。
 - `/home/xianzhao`(5T NFS)→ ssh key/脚本/日志，别放大模型。
 - `/mnt/m2m_nobackup`(compute 本地)→ 大模型 + docker 存储；`/mnt/m2m_nobackup/huggingface/` 有预置。
 
@@ -293,8 +307,11 @@ tar 在共享盘 → 任何节点 `docker load` 即用，省去重装 flydsl/重
 | build 报 dubious ownership | git safe.directory 没设 | `git config --global --add safe.directory '*'` |
 | login 进程被杀 | Guardian 限内存 | 重负载挪 compute 节点 |
 | host key changed | login 多台轮询 | `StrictHostKeyChecking=no UserKnownHostsFile=/dev/null` |
+| login/rsync 时好时坏、bench 偶发 rsync 255 崩 round | VIP 后端各自 **flap**(auth 成功后 post-auth 掐断);硬钉单台会随其 flap 崩 | 动态选健康后端:`sync/crusoe/resolve_login.sh`(lib.sh+cursor_campaign 已接入,失败跳后端);在飞老代码进程靠 `refresh_alias.sh`。**别再用 pin_009**。详见 §4.-1b + memory `project_crusoe_dynamic_backend_resolve` |
 | squeue 显 R 但节点其实挂了 | R 状态滞后 ~2min(NODE_FAIL) | `squeue -j <id>` 查空 + `hostname` 探活;换活节点重 docker load+run(§4.0) |
 | 改 flydsl kernel 后行为没变 | JIT 缓存 | `rm -rf /root/.flydsl/cache` |
+| campaign 的整树 `rsync` 挂死几十分钟、0% CPU | **login 节点的 NFS 客户端间歇性卡在 >32 KB 的写**(170 用户 / load avg >200 时高发;小写进 page cache 照样返回,所以 `echo x > f` 骗你说没事)。`dd bs=64k count=4 conv=fsync` 才能测出来。GPU 节点自己那份挂载是好的(实测 125 MB/s) | ①别再整树 rsync,**只推改动**;②文件 >32 KB 就改推 `git diff` 的 gzip+base64(几 KB),塞进 job 文件里,让健康的 GPU 侧 `git apply`(见 `flydsl_campaigns/*/\_fast_remote.py` 的 `patched_run`);③ssh 传输用**短超时+多次重试**(45 s × 25),别用一次 180 s —— 卡住的窗口是间歇的,长超时只会白烧 deadline |
+| 杀掉本地 rsync 后远端仍写不进那个目录 | 远端 `rsync --server` 变孤儿,卡着 `.<name>.XXXXXX` 临时文件的 inode;该目录连 `rm` 都会挂 | 在 login 上 `kill -9` 那些 `rsync --server`;临时文件即使删不掉,换一个全新文件名照样能写 |
 
 ## 10. 已验证里程碑(2026-07-20)
 - 容器 gpt-oss-docker(rocm/primus:v26.3) on crsuse2-m2m-171：torch 2.10.0 / 8 GPU / gfx950 / ROCm7.2.1 ✅

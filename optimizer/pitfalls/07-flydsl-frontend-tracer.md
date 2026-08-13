@@ -23,7 +23,7 @@
 - **应 re-specialize 的 shape 但共享 dtype key**：被 stale cache 掩盖。相关坑：`make_buffer_tensor(t)` 要保持默认 `max_size=True`——因为 key on dtype not shape，首个 shape 捕获的 `num_records` 会在后续更大 tensor 上静默截断。
 
 - **comgr 缓存**：除 `~/.flydsl/cache` 外还有 `/root/.cache/comgr`。
-- **in-memory ASM 缓存 `_MX_WL_ASM_CACHE`**：env 驱动改 asm 发射时，须把 env flag **全部加进 key**，否则内存层也复用旧 asm。
+- **in-memory ASM 缓存 `_MX_WL_ASM_CACHE`**：**任何**改变 asm 发射的编译期变体都必须进 key —— 不只是 env flag，**发射函数自己的参数同样算**。实证：`call_mxfp4_wholeloop` 新增 `half_n` 参数分岔出第二份 K-loop，但 key 没跟着加，两个臂跑的是同一个二进制，A/B 报「半-N 慢 1.6%」——**假负，整次测量作废**；key 补上 `half_n` 后实测是正收益并最终 ship。判据同「金标准验证」：一组本该不同的变体给出逐字节相同的时间就是 key 漏了。in-process 扫变体时用 `FLYDSL_RUNTIME_ENABLE_CACHE=0` 旁路磁盘层（内存层仍需 key 正确）。
 
 **金标准验证（唯一可信的判缓存是否失效的办法）**
 - 故意把核**改算错**（如 scale×2）**不清缓存**跑：出 NaN/错 = 缓存正常失效；仍出旧正确 SNR = 缓存陈旧，你之前所有结果都不可信。

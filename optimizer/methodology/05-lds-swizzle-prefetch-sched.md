@@ -176,6 +176,26 @@ mxfp4 grouped 的 NT(fwd/dgrad)吃 band-cyclic,**wgrad 却必须留在 `xcd=1`**
   必须片上判(别引入 host D2H)。与 [[project_wgrad_reach_fwd_campaign]] 的单-window split-K 同源
   (都靠 `group_offs` 的 wave-uniform SALU policy,见 methodology/08 §运行时自适应单-window split-K)。
 
+#### ★★ 第三条路:粗分区的不均可以靠**轮转"类→超块内位置"**修掉,不必退回 identity(2026-08-11 syncv3 wgrad var-K TN 实测 +5.3%)
+上面两条把选择写成二选一(留 `xcd=1` / 逐 band 放宽),漏了一条**保留亲和又不吃不均**的形态:
+- 场景:`TILES_PER_GROUP < NCU` 的 wgrad(down 2880x2880,TPG=144 < 256)会把 dispatch id 切成
+  **gp 组一块的超块**(`gp=2, k=nxcd/gp=4`:类的低 log2 k 位选组内 run、高位选超块里的**哪一组**)。
+  这样每个 XCD 的类又回到"一组的 tile",L2 slab 复用保住了。
+- 病灶:超块里的位置**跨超块不动**——类 c 永远服务每个超块的同一侧。叠上降序-K(LPT)组序,
+  那一侧恒是**重的**那组 ⇒ 静态 `bid % 8` 分区自己给自己造 8~11% 的 per-XCD 不均(离线模型),
+  实测 down `strong1.3` CU 时间占用 0.911。
+- 解:**每过一个超块把位置也推进一格**(等价于把类的步长从 1 改成 k+1),同一批 tile、同一批 band、
+  同样的 run,只是"谁服务重侧"轮着来。落地只有 3~4 条 SALU(`sb=slot>>log2 gp;
+  (sb<<log2 gp) | ((slot+sb) & (gp-1))`),ISA 实测 **+1 SGPR、VGPR 不变、0 spill**。
+- **步长必须是奇数**:ragged tile(`2880=11.25x256` ⇒ 边界块跑半体)本身更便宜,偶步长会把它们冻在
+  固定几个类上,变成下一个静态不均(离线模型:偶步长吐回三分之二收益)。
+- 收益/代价(交错 A/B,3 base × 4 cand):`down.strong1.3` 比值 1.1682 → 1.2303(**+5.3%**,两臂分布不相交),
+  `unbal1.07`/onehot/balanced 全部不动(前者组间只差 7%,后者被 hot 门排除),balanced 一侧
+  **反而 +0.4pp**(bal_dn 0.990 → 0.994)。门控复用降序-K 的 reorder 谓词 ⇒ 均匀负载走原图。
+- ⇒ **判据**:粗于 1 tile 的 XCD 分区在 per-tile-contraction skew 下的不均,先问"不均是**分配份额**错了
+  还是**同一份额被钉在重侧**";后者只要轮转位置就够,别为它放弃亲和的 L2 收益。
+  离线"N slots/XCD 贪心"模拟器在这条上再次可信(预测 +5.0%,实测 +5.3%)。
+
 ### ★ attention bwd 上的 XCD remap(2026-07-27 meta hd64 实测,单项最大杠杆)
 - **形式**:`xcd = block_id % 8`(片上实测确认此式,别猜),让每个 XCD 拿一整块 `(batch, kv_head)`,
   使读同一份 K/V 的 GQA work-group 挨在一起。dq 实测 **L2 hit 86.5→94.8%、miss −62%**;dkdv **+2.81%**、dq **+0.54%**。

@@ -195,6 +195,116 @@
 6. **★occ-2 latency-bound bwd 上,warp-spec/8-wave/dual-wave 常是陷阱——先量 baseline 是否已双-WG 共驻**:occ-2 = 每 SIMD 常驻 2 个**独立** WG,一个卡 barrier 时另一个照发 MFMA → **baseline 已免费享无屏障跨-WG dual-wave overlap**。8-wave 单-WG(合并两 WG)= 把这免费 overlap 换成带 `gpu.barrier` 屏障税的组内 overlap,MfmaUtil 反跌、天花板 < baseline(dkdv 实测 1029<1116)。→ 想显式并行 GEMM↔softmax 前,先确认 baseline occ,occ-2 双-WG 就别做(fwd 常 occ-1 无跨-WG overlap 才是 dual-wave 正场)。真正 register-neutral 的净胜是**冷 load 寄存器预取**(下一 head lse/delta 塞进本 head GEMM2 MFMA shadow,dt==DT-1 发射,+1.81% dkdv hw-exp),不是重构 wave 结构。
 7. **VGPR 读 ISA 别读 rocprof**:rocprofv3 --pmc/kernel-trace 的 VGPR_Count 对 256-VGPR 内核**误报 128**(methodology/03);ISA `.vgpr_count` 才权威。dkdv 真值 256(占满 occ-2),据 128 判寄存器余量会全错。
 
+### ★★ 2026-08-04 融合 bwd(dq 折进 dkdv,单趟 5 GEMM)r08:三条可迁移结论
+基线 850 → 855~860 conv TF(B=3 S=8192 Hq64/Hkv8 D64 full-causal),同进程交错 A/B ≥11 trials × ≥2 session 同号。
+1. **✅ 上面第 6 条的"冷 load 预取"要延伸到 q-block 边界**:head 轴预取只覆盖 h→h+1,**每个 q-block 的最后一个
+   head-step 没有下一个 head 可取**,于是每 8 个 head-step 就有一个从裸 HBM 延迟开始。让它改取**下一个 q-block 的
+   head 0**(Q/dO + 该 group 的 lse/-delta),值沿 q-loop 的 iter_args 传 ⇒ +0.29%/+0.55%(2 session);
+   与"GEMM1 改 ks-outer 发射(同 k-step 的四个 kv tile 连发,相邻 MFMA 写不同 accumulator)"叠加 = **15/15 +0.57%**。
+   两者互补:ks-outer 只在操作数已经到位时有用,而跨 q-block 预取正是保证它到位的那一半。单 WG 独占 CU
+   (LDS 118,784 B)时没有别的 WG 覆盖这个 prologue,所以这条对"一 CU 一 WG"的 body 普遍成立。
+2. **★对角(masked)q-block 的钱要按时间量,不能按 visit 数估**:causal KV-outer 里每个 WG 恰好一个对角 q-block
+   = 6.06% 的 visit,直觉给 1.7~3.5%;**让所有 wave 都跳过它(结果算错,纯诊断)实测只有 +0.37%**。
+   真做(只让 kv 行全在因果边之上的 wave 跳,输出**逐位不变**)= +0.22/+0.24/+0.33%(3 session)。
+   ⇒ 在 makespan 受限的 kv-outer 里,visit 份额 ≠ 时间份额,差了 5 倍;先跑"全跳"探针再决定要不要实现。
+   代价:scf.if 要把 16 个 accumulator 当 phi 穿过去,VGPR 249→256、8 dword spill、s_nop 198→370。
+3. **★★ 减法探针给融合体定的账**:去掉**所有** q-block 的 GEMM1+GEMM2(S/dP/exp/dS/pack/dV/dK)= 4.845→3.247 ms
+   ⇒ 这四个 GEMM 只值 1.60 ms,而它们的 MFMA 管道时间纸面算出来是 1.55 ms(2.08e8 条 ×16 拍 /1024 SIMD /2.1 GHz)
+   ⇒ **主 GEMM 已经跑在 97% 的 MFMA 管道效率上,那里没有钱**。对照第五个 GEMM(dQ):1.18 ms 里 MFMA 只有 0.39 ms。
+   ⇒ 融合体剩下的钱**全在 dQ split-K 的字节**(nb=Skv/BLOCK_KV=32 ⇒ 写 3.32 GB + dqred 读 3.32 GB)。
+   给它定价:让 dqred 只读 16 个 band(dQ 算错,纯诊断)= **+6.0%(0/11)**,写侧同量级 ⇒ band-pair 折叠 ≈ +11%。
+   **拦路的是一条与切分方式无关的算术**:一个 WG 的 dK/dV accumulator = (WG 的 kv 行数 × D × 2)/512 线程 dword,
+   256 行 = 64 dword、512 行 = 128 dword,**怎么在 8 个 wave 之间分(含 D-split)都不改这个总数**——D-split 只是
+   把同样的 dword 换个 wave 放,而让两个 WG 各拿一半 D 就要各自重算一遍 S/dP(= 再花 1.6 ms)。
+   ⇒ 想拿这 11% 必须先在别处腾出 64 dword(已知报价:K packs 出寄存器 = 32 dword / −2.0%)。
+
+### ★★★ 2026-08-10 gpt-oss bwd D128 r3:把上面那笔账在 D128 上重测,结论变了三处
+形状 Hq64/Hkv8/**D128**、Sq=Skv=8192、B=2、THD、full-causal、BLOCK_KV=128(nb=64)。融合体 6.78 ms。
+1. **★★★ 减法探针要一次做完三层,否则会把 DCE 当成收益**:`skip 分块存储` 这一个探针同时删掉了
+   GEMM3 的 MFMA——`_g3` 累加器没人读,LLVM 把整条 GEMM3 链 DCE 了。三层拆开量才是真账:
+   6.78(基线)→ **5.70**(存储指令照发、地址落到一个越界 SRD ⇒ 只去掉访存)→ **4.91**(存储+GEMM3 一起没了)
+   → **4.18**(再去掉 dqred)。⇒ 分块写的 **访存 1.06 ms**、**GEMM3+发射 0.79 ms**、**reduce 0.63 ms**。
+   只跑中间那一档会把 1.82 ms 全记到"字节"头上,高估 72%。
+2. **★★ D128 融合体的计算相已经和 D64 打平,差距 100% 在 dQ split-K 工作区**:同法量 D64,
+   store 0.554 / reduce 0.233 / 其余 2.12 ms。**其余 ×2 = 4.25 ms,D128 是 4.18 ms(还快 1.5%)**;
+   而 store 1.82 vs 1.11、reduce 0.63 vs 0.47 ⇒ 0.88 ms 的超额恰好等于实测 0.96 ms 的整体差距。
+   ⇒ 在这类"D 翻倍但寄存器封顶 BLOCK_KV"的融合 bwd 上,**别去抠 GEMM/LDS/occ,先量 split-K 字节**。
+3. **★ 字节的边际单价远低于 roofline 价**:把 64 个 band 的分块写全部别名到同一个 slab(dQ 算错,纯诊断)
+   省掉 ~8.5 GB 的 DRAM 写只值 **0.60 ms ⇒ 0.071 ms/GB**,而 roofline 价是 0.161 ms/GB。原因是这些写
+   已经和计算重叠了。**r1 用 0.161 ms/GB 给所有字节杠杆定的价,在流水化之后系统性高估 2.3×**——
+   定价前先用"别名/丢弃"探针量一次真实边际价,别拿 roofline 直接乘。
+4. **✅ 落地的杠杆:band 交错(band-interleave)**。工作区从 `[band][B][Sq][Hq][D]`(每 band 一个
+   268 MB slab)改成 `[band/8][B][Sq][Hq][band%8][D]`,即 8 个相邻 band 在**行内**交错。降序 q 走法
+   (QDESC)本来就把并发 band 压在同几个 q block 上,所以同一时刻 64 个 band 在写**同一批 q 行**:
+   slab 布局下这 64 笔写分散在 268 MB 间距上(一个 q 行 64 个 DRAM page),交错后落进一段连续
+   `ILV*D`,并发 band 一起把整页填满。实测 ILV=1/2/4/8/16 → 813.2/811.5/820.1/818.6/819.7 conv TF,
+   **4 以上就平了 ⇒ 机理是 DRAM page 局部性,不是 cache line 共享**。输出**逐位不变**(每个 band 仍
+   独占自己的元素,无 atomic),body 寄存器 460 不变(`band%ILV` 是 wave-uniform,进 SGPR)。
+   ⚠ **上限是 buffer descriptor 的 32-bit num_records**:reduce 侧的 slice = `B*Sq*Hq*D*2*ILV`,
+   ILV=16 时 4.29 GB 越界。**ILV=64 的探针测出 +18% 是假的**——slice 回绕成 0,所有分块写被硬件
+   丢弃。凡是改 SRD 覆盖范围的实验,先算 num_records 会不会溢出,再信那个数。
+5. **❌ 判负(都别再试)**:(a) 分块存储的 cache policy 全谱——nt 801.0 / sc1 799.6 / nt|sc1 811.4 /
+   sc0 816.2,都不如默认 cached 817.0;(b) 把工作区改成 **head-major** `[band][B][Hq][Sq][D]`(想让一个
+   head-step 写 16 KB 连续)= **7.17 ms,−5.8%**,反而大输——q-major 下 8 个 kv-head 的 WG 协同把同一批
+   q 行填满,比单 WG 自己连续更重要;(c) dqred 速率旋钮在 alloc_body=460 上重扫一遍,现役
+   (block512, vec8, uc1, rpw2)=814.4 就是峰值(block256 810.0 / block1024 784.4 / vec4 775.3 /
+   uc2 769.8 / rpw4 813.6)⇒ P1 的后续项就此关闭。
+6. **★ band-pair 折叠在 D128 的真实报价与真实拦路点(报价已按 2026-08-11 实测改写)**:把 partial 减半 =
+   写侧 ~0.9 ms + **实测**读侧 0.34 ms(让 dqred 按 2 倍 band 宽度读)= **~+18%**,是本形状唯一的大钱。
+   拦路的是 §216 那条算术,但**那条算术只覆盖代价的一半,过去三轮拿它当全价是错的**:
+   - **旧报价(不要再用)**:"accumulator = `BLOCK_KV*D*2/256` = 128 dword ⇒ pair 要 +128 dword,而 body
+     只剩 52"。
+   - **正确报价 = 两项,分属两个不同的堆**:(i) **累加器 +128 dw —— 这一半可以进 AGPR**(见
+     pitfalls/01 §「AccVGPR 不与 arch 竞争分配」);(ii) **与之同量级的一份算子/地址类状态,只能占
+     arch**(两条 half 的 kv 行号、两条 dS staging 链、两条 dK/dV store 地址链;见 pitfalls/01
+     §「LDS 地址逻辑也吃占用」——LDS 寻址逻辑增长 arch_vgpr,一个 AGPR 都进不去)。occ=1 时
+     `V cap=512 / A cap=256` 是**两个独立堆**(pitfalls/01 §「4-wave (occ=1) 的 VGPR headroom」),
+     所以判"装不装得下"必须**分堆算**,不能只算合并总量。
+   - **实测(gpt-oss D128 fused, Skv=8192, 4 wave)**:供体地板 `k_reg=0,q_pref=0,g3_kreg=0` = v=336
+     **agpr=80 arch=256(已满)** spill=0 —— 捐了 119 dw,足够放下 (i) 的 128 dw(80+128=208≤256),
+     但 (ii) 无处可去。于是 `bkv=256 + KV_HALVES=2`(dK/dV 跨 256 行、S/dP/dS 仍 128 宽)= v=512
+     agpr=256 arch=256 **spill=743**,timed 388.7 TF vs 808.6。
+   - **2026-08-11 追加两个数,把这条彻底钉死**:(a) 把每 pass 缩到 64 行(`KV_HALVES=4`,NT 2→1,
+     transient 减半)只把 spill 从 743 降到 **655** —— 说明溢出的不是 pass 宽度那部分;(b) 在
+     bkv=256 上**所有供体完全无效**:`k_reg=0`、`g3_kreg=0`、两者一起,spill 逐字都是 655。
+     ⇒ **一旦累加器吃满 A 堆(256)且 arch 也满(256),供体腾出的那类寄存器不是溢出的那类**,再加供体
+     只是在同一个堆里挪。LDS 反而不是拦路(halves=4 时 135168 < 163840)。
+   ⇒ **能走通的都要付重算**:例如一个 WG 拿 pair 的 dK+dQ、兄弟 WG 拿它的 dV,只重复 GEMM1(+20% flop
+   换 −1.25 ms)。**别再试第四次寄存器折叠 / 加供体**;要动就动"每 pass 活着的地址链条数"或付重算。
+
+### ★★★ 2026-08-11 gpt-oss D128 fused bwd:**vmcnt 是 load/store 共享且按序的 ⇒ 预取的发射点相对重存储的位置值 +3.9%**
+gpt-oss D128 fused(Hq64/Hkv8、Sq=Skv=8192、B=2、full-causal、bkv=128、4 wave/occ=1),score =
+convTF(D128 fused)/convTF(D64 fused):**0.8754 → 0.9094**,convtf_d128 804 → 836.4,SBHD 同步 +2%,
+门(双 layout SNR≥47 + byte-det)全绿,D64 对照臂 919.4→919.7 平坦。**改动只有一行:把下一个 head 的
+Q/dO 预取发射点从"GEMM3 之后"挪到"GEMM3 之前"。**
+1. **机理(可迁移到任何 occ=1、既有重存储又有预取的核)**:gfx950 只有**一个 vmcnt**,load 和 store 共用
+   且**按发射序退休**。核体每 head-step 顶部要把上一步预取到 VGPR 的 Q/dO 写进 LDS,编译器为 8 条
+   `ds_write_b128` 排了递减的 `vmcnt(7..0)`。预取发在 GEMM3 的 4 条 dQ partial store **之后**时,
+   "等第 1 条 load 回来"在按序语义下**必须先让那 4 条 store 退休** —— 于是每个 head-step 以"把 16 KB
+   partial 排空到 L2"开场,末尾那条还是整条 `vmcnt(0)`。把预取挪到 store **之前**,同样的等待变成
+   `vmcnt(11..4)`,store 留在飞行中,唯一会等它的是一整个 head-step 之后对其源寄存器的 WAR。
+2. **ISA 判据(比 wall 更早、更便宜)**:整核 `s_waitcnt vmcnt(0)` **16 条 → 1 条**;等待深度分布从
+   (7..0) 抬到 (11..4);`s_barrier` 35、`lgkmcnt(0)` 104、`v_mfma` 2560 **逐字不变** —— 说明改的不是
+   指令数,是"等待时还有哪些访存在飞"。寄存器代价 v 455→461 agpr 199→205 spill=0、LDS 不变。
+   ⇒ **判这类改动看 `vmcnt(0)` 的条数,不要看 `s_waitcnt` 总条数。**
+3. **★对照臂把机理钉死**:同一条预取,发射点只挪到 store **后面几条指令**(point 1)= **785.0 TF
+   (−2.4%)**,发在前面 = 831.2(+3.4%)。**跨过 store 边界的 5.7% 摆幅**,寄存器读数几乎一样
+   (461 vs 463)⇒ 不是寄存器压力,就是 vmcnt 顺序。
+4. **❌ 同轮判负的三条(都别再试)**:(a) 管理者点名的 `dma_grp=2`(DMA 路线分组 Q/dO 全局读,目标把
+   `s_waitcnt vmcnt` 条数从 104 压向 split pair 的 53)—— 实测**压到 18**、寄存器还更好(v 432 spill 0),
+   却 **−5.3%**(0.8291);`dma_grp=4` 直接 LDS 200704 > 163840 build fail。⇒ **等待的"条数"不是成本,
+   "深度"才是**:DMA 路线把 graded 等待换成 group 边界上的整条 `vmcnt(0)`。(b) Q/dO 双 LDS slot 把
+   head-step 的两个 barrier 减成一个(`s_barrier` 35→19,LDS 102400→135168 仍合法)= **−6.0%**,
+   v 455→481 —— 拿掉 barrier 同时拿掉了它当"调度墙"的作用,分配器立刻把 staged tile 拖得更长。
+   这是本 body 上**第三个**"用少一次 rendezvous 换调度自由度"的结构判负(另两个是 QDO_TAIL、G3_DEFER
+   的反向)。(c) GEMM3 patch 形状 `g3_qt=1/4` = 765.3/752.8、`g3_krt=2` = 791.1、`g2_half=0` = 769.3。
+5. **⚠ 判决会随这一行迁移,复扫是必须的**:同一批旋钮在改前/改后读数不同 —— `g3_defer=0` 改前 802.8
+   (≈中性)、改后 **789.5(−5.6%)**;`g3d=8` 两次都≈噪声;`g2d=3` 两次都是崖(−5.6%/−6.6%)。
+   ⇒ 落地这类"改变访存在飞结构"的改动后,**至少把 defer/ring 深度这一族重扫一遍**。
+6. **⚠ 测量纪律再次兑现(别把分母漂移当收益)**:`g1_ks_outer=0` 两次都读到 ratio +0.7~1.0%,但
+   **convtf_d128 两次都平坦**(804.2 / 836.9),涨的是 D64 分母掉了(919→913,两次一致)。同进程双臂
+   互相有功耗/DVFS 耦合 ⇒ **判 D128 改动只看 convtf_d128,ratio 只在分母平坦时才可信**。
+
 ### ★★★ 2026-07-29 gpt-oss bwd r11:odo 融进 dq 兑现(+1.1%),并首次量到 occ-3 的**真实单价**
 gpt-oss 形状(Hq64/Hkv8/D64、Sq=Skv=8192、B=2、SBHD、full-causal),基线 785.6 → 本轮 842.4 conv TF。
 1. **✅ 上面第 3 条("辅助核优先融掉")在本形状上兑现,给出量级**:dq 是 q-outer 且 GEMM1b 的 B-operand
@@ -231,6 +341,31 @@ gpt-oss 形状(Hq64/Hkv8/D64、Sq=Skv=8192、B=2、SBHD、full-causal),基线 78
    每 trip 128 KB 的 dQ partial store(实测量级 8.7 TB,远超收益)⇒ **别再重新推导这条**,
    两核结构就是本 gate 下的正解。
 
+### ★★ 2026-08-09 GB300 trace 对标(首个 gpt-oss FUSED bwd 外部硬件基准)+ SWA campaign
+> ⚠**别与本卡上半的 H100 验收混淆**:那是 **Meta DENSE bwd**(B1 Hq128/Hkv16 square-causal 对 H100 FA-v3,
+> "SWA 2.12-3.41× 超标"=对 H100 更慢的 SWA 的比值)。**本条是 gpt-oss FUSED dq+dkdv bwd**(B3 **Hq64/Hkv8** D64
+> SBHD full-causal,§198 起那条线)对 **NVIDIA GB300**(Blackwell,cudnn sm100 flash bprop/fprop)。两个 regime、
+> 两个参考硬件,数字不可互引。conv-FLOP 口径同本卡 line 13(`10·Hq·S²·D·frac`,B 因子外提)。
+- **GB300 权威读数**(trace `trace/gb300/rank-0.json`,gpt-oss-20b B=3 S=8192,各 24 calls):
+  full-causal bwd mean **4252.5µs = 969.7 conv-TF/s**;SWA(128) bwd mean **445.7µs = 289 eff-TF/s**;
+  full fwd 1310.6µs / SWA fwd 284.0µs。**SWA wall dividend = 9.54×**(bwd)、4.62×(fwd);
+  bwd/fwd wall = 2.95×(**不是** 2.5 的 FLOP 比——含 delta/reduce 辅助核 + 核效率差,别当 FLOP 比用)。
+- **我们(964b290a,`_bench` 口径,013 实测)**:full-causal median **~944 conv-TF**(区间 925–963;phase-3
+  best-config 重测 964.64)⇒ 对 GB300 **落后 ~2.7–3.7%**(≈115–160µs/层)。SWA(128) baseline **215.6 eff-TF**。
+- **★SWA 曾是我们的结构短板,现已反超**:NV 靠 window 天然省 kv-band 拿 ~9.5× 的**wall dividend**,而我们旧核
+  `MASK_SKIP = FUSE_DQ and window_left < 0` 在 SWA(window_left≥0)下**关掉** band-trim → 每 kv-band 把全 causal
+  q-loop 算完再全掩=纯浪费。折算 wall:我们**旧 SWA wall≈596µs**(dividend 仅 **7.3×**,低于 GB300 9.54×);
+  SWA campaign(dir `20260808_153438`,base 964b290a,进行中)best **298.1 eff-TF**(wall≈432µs)⇒ dividend 升到
+  **10.1×,已反超 GB300**、SWA eff-TF **~+3% 快过 GB300 的 289**。杠杆=window-aware q-loop 上界,全裹
+  `const_expr(window_left>=0)` 保 full-causal 字节不变(见 [[project_gptoss_swa_bwd_campaign]] / [[project_fwd_swa_and_latency_floor]])。
+- **★与旧记 [[project_gptoss_sbhd_native]] 不矛盾(时点+HW 不同,非回归)**:那条是 **pre-fusion SBHD** 核对 **B200**
+  (766 vs 812 conv-TF,−5.7%);本条是 **post-fusion** 核对 **GB300**(944 vs 970)。fusion(786→879→964)与这场
+  SWA(216→298)是两段独立提升。B200 亦见同款 ~9× SWA dividend 模式(不同 B/pre-fusion 核,**绝对 µs 不可横比**)。
+- **★下一步(full-causal 追 GB300 那 ~3%)**:走 §3(r08 减法探针)的 **dQ split-K band-pair 折叠**(报价 ~+11%,
+  但须先在别处腾 64 dword,如 K packs 出寄存器 −2.0%)+ §3(r11)的 **occ-3**(报价 +2.5%,门槛 168 VGPR,代价须来自
+  "不加流量"处)。★**别再走 dual-wave/8-wave/warp-spec/shared-GEMM1**——全在本卡 DEAD 段判死。禁天花板结论:
+  这 3% 有 sized 报价(band-pair + occ-3),不是"到顶"。
+
 ### ❌❌ 2026-07-29 gpt-oss bwd r14:fwd 侧两条"零源码风险"的赢**都不迁移到 bwd**(同基线 843.0,3 臂/1 门)
 本轮零收益,但关掉了两个大族,都是**同一把尺子、同一进程、每臂 3 次**测的(当天噪声地板仅 0.1%)。
 1. ❌❌ **编译器调度策略族(fwd r15 记 +0.6~0.7%)在 bwd 上一致为负,别再试**:
@@ -252,6 +387,10 @@ gpt-oss 形状(Hq64/Hkv8/D64、Sq=Skv=8192、B=2、SBHD、full-causal),基线 78
    *合并后仍不掉 WG/CU*(fwd 是 4 waves/SIMD、LDS 只装 K/V 与 BLOCK_M 无关,合并后仍 ≥2 WG/CU)。
    bwd 两核都是 occ-2 VGPR-locked,任何加宽 CTA 的做法都会撞到 1 WG/CU 这道墙 ⇒
    **bwd 侧想省请求,只能在"不加 CTA 波数"的前提下做**(=加大 tile,而那被寄存器锁死)。
+   ⇒ ★ **另加一条 20 秒的前置判据(2026-08 mx8tw 实测):先 PMC 量本核与对标核的
+   `TCP_TCC_READ_REQ`,比值 < 1.1 就说明请求路径已经打平,这条杠杆没有可动面,别花轮次。**
+   mx8tw 那场量到 73.76 M vs 72.58 M = **1.02×**(HBM 合计 1.90 vs 1.84 GB、功耗 1399.5 vs 1374 W
+   也都持平),于是整条"省请求买时钟"的方向当场关掉,改攻同步指令密度。
 3. ❌ **dkdv 的 2-tile 分组暂存(r13 在 dq 上 +0.2% 的那个机制)在当前 dkdv 上过不了 ISA 门**:
    dkdv 早就有这个机制(`_PB["dmastage"]`,stage base 是编译期常量、LDS 16 KB/槽,r10 建的),
    `dmastage=2` 现在 = vgpr 243→**256、spill 0→29、scratch 0→120 B**(r10 在旧 body 上是 0 spill / −0.13%)。
@@ -744,3 +883,21 @@ goal/KB 都按「`v_mfma_*_fp8` 是 bf16 的 2× ⇒ −27% wall」给 fp8-PV �
 - `llvm.call_intrinsic` 的 `results_` 是**单个 Type 不是列表**,且 `T.f32` 不是 `ir.Type`(要 `ir.F32Type.get()`)。
 - `remote.sh` **不清 FlyDSL JIT 缓存**(只有 `bench` 分支清),经它做的任何 ISA/PMC 都要自己
   `rm -rf /root/.flydsl/cache`,否则读到上一次的 `21_final_isa.s` —— 本 campaign 被骗过两次(vgpr 读错档)。
+
+## ★宽 MFMA(32x32x16 换 16x16x32)减不了 LDS 读——算术级结论,别再实现一遍
+
+2026-08-04,gpt-oss fused attn bwd(gfx950,D64)实测/推导:
+
+- **LDS 读的条数由数据量决定,与 MFMA 形状无关**:`ds_read_b64_tr_b16` 恒给 64 lane × 8 B、
+  `ds_read_b128` 恒给 64 lane × 16 B。
+- **4 条 16x16x32 组成的 2×2 patch 与 1 条 32x32x16 覆盖同一个 32×32 输出块、用同一批 fragment。**
+  逐条核对 dQ GEMM:两种形态都是每 wave 每 pass 64 条 tr。换宽 MFMA **唯一**的变化是
+  MFMA 指令数减半(1536→768),而指令发射通常远不是瓶颈(该核 0.14 LDS + 0.06 MFMA 每 CU-cycle)。
+- ⇒ 想减 LDS 读只有三条真路:**每 wave 摊到更多 MFMA 的 fragment 复用(加大 N-tile)**、
+  **跨 head/跨 tile 共享 fragment**、**加宽写(layout 置换)**——前两条都要寄存器,通常就是那道墙。
+
+**软最大值一侧还有一条结构性禁令**:softmax 的 P/dS 若留在寄存器里喂下一个 GEMM 的 B operand,
+它就锁在上一个 GEMM 的 C-layout 上(16-wide:lane0-15 持 n=0..3、lane16-31 持 n=4..7)。
+而 32x32x16 要求**一个 32-lane 半区内所有 lane 持同一组 k**,k 的置换自由度救不了
+(k→列 的映射必须在半区内 lane-uniform)⇒ **该 GEMM 根本换不了宽 MFMA**,除非加 cross-lane
+shuffle 或多走一次 LDS。设计 attention bwd 的 tile 形状时先查这条,再排工作量。

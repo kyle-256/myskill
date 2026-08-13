@@ -64,11 +64,16 @@
 | 32x32x8 f16/bf16 | 32 |
 | 16x16x32 fp8 | 16 |
 | 32x32x16 fp8 | 32 |
-| 16x16x128 f8f6f4 (CDNA4) | 16 或 32（A或B为FP8则32）|
-| 32x32x64 f8f6f4 (CDNA4) | 32 或 64 |
+| 16x16x128 f8f6f4 (CDNA4) | 16 或 32（A或B为FP8则32）★gfx950 实测 **32.0** |
+| 32x32x64 f8f6f4 (CDNA4) | 32 或 64 ★gfx950 实测 **64.0** |
 | 16x16x4 f32 | 32 |
 | 32x32x2 f32 | 64 |
 | f64 16x16x4 | 64 |
+
+- ★ 表里的「延迟」就是**管道占用**，可直接用 `SQ_VALU_MFMA_BUSY_CYCLES / SQ_INSTS_MFMA` 实测（两个 scaled
+  f8 变体 2026-08-05 在 gfx950 上分别读到恰好 32.0 / 64.0，两条 mxfp8 GEMM 的聚合 MFMA busy 在同 FLOP 下
+  **逐位相同**）⇒ **同族里换更大的 MFMA 形状不带来任何吞吐余量**，只改「每相位的独立累加链条数」，
+  少了反而更慢（实测 −2%，见 pitfalls/05 §MFMA 形状轴关闭）。任何「减 MFMA 条数提速」的立项先算这一格。
 
 ## CDNA4 MFMA 依赖 NOP（Table38）
 - XDL写→同 XDL 读 SrcC（累加，完全相同 vDst）= 0-2（有 forwarding）。
@@ -98,6 +103,10 @@
 | LDS/CU | 64 KiB | 160 KiB |
 | FP8 格式 | FNUZ | OCP |
 - MI355X 液冷 1400W ~2.4 GHz；MI350X 风冷 1000W ~2.2 GHz；两者均 288 GB HBM3E 8 TB/s。
+  ⚠ **2.4 GHz 是 boost 标称，不是满载实测**。MXFP4 grouped GEMM 满载下实测 **2.09 GHz**
+  （`GRBM_GUI_ACTIVE / duration / 8`，8 个 dispatch 全落在 2.079–2.121）。**凡是要把 cycle 换算成
+  时间、或反过来从 wall 推 MFMA util 的，必须用实测值**：mxfp4 campaign 的 round-1 用 2.4 算出
+  in-loop util 52.8%，round-2 用实测 2.09 重算是 **62.6%**，整整一轮的优化方向建立在错的坐标系上。
 
 ## 回归根因常见模式速查
 - 循环边界翻倍=更多工作；加 `s_barrier`=额外 sync stall；tile 变小(BLOCK 64→32)=占用率差/更多迭代；循环内加 load=更多流量；fp16→fp32=2x 带宽和寄存器；删 prefetch/double-buffer=暴露 load 延迟；`waves_per_eu` 2→1=降占用；`num_stages` 1→2=Triton pipeline 变化。

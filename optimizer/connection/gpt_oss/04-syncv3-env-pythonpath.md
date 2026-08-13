@@ -1,18 +1,36 @@
-# syncv3 三-repo / 三-venv 环境（wgrad skew 工作）★踩坑最深
+# syncv3/syncv4 多-repo / 多-venv 环境（venv 隔离）★踩坑最深
 
-> 类别: 连接 · 主题标签: syncv3, venv隔离, source-activate坑, PYTHONPATH-override, editable-finder, import路径验证, 血泪教训
+> 类别: 连接 · 主题标签: syncv3, syncv4, venv隔离, source-activate坑, PYTHONPATH-override, editable-finder, import路径验证, 血泪教训
 
-容器 `mlperf_gptoss` @ `chi2798`，宿主盘 `/mnt/vast/kyle/code2` ↔ 容器 `/workspace/code`（bind-mount，改宿主即容器可见）。**同一容器里有三份 Primus-Turbo repo，三个 venv，一一对应**。选错就测错代码。
+容器 `mlperf_gptoss` @ `chi2798`，宿主盘 `/mnt/vast/kyle/code2` ↔ 容器 `/workspace/code`（bind-mount，改宿主即容器可见）。**同一容器里有多份 Primus-Turbo repo，多个 venv，一一对应**。选错就测错代码。
 
-## ★ 三 repo ↔ 三 venv 对应表（`bin/python -c "import primus_turbo; print(__file__)"` 实测）
+## ★ repo ↔ venv 对应表（`bin/python -c "import primus_turbo; print(__file__)"` 实测）
 
 | venv 解释器（直接调）             | import 的 repo                                   | HEAD       | 用途 |
 |----------------------------------|-------------------------------------------------|------------|------|
 | `/opt/venv/bin/python`           | `/workspace/code/Primus-Turbo`                  | e361efe3   | main（生产/bwd16384 campaign）|
 | `/opt/venv-tw/bin/python`        | `/workspace/code/Primus-Turbo-tensorwise`       | —          | tensorwise 分支 |
-| `/opt/venv-syncv3/bin/python`    | `/workspace/code/syncv3/Primus-Turbo`           | fa1ac492   | **wgrad skew 优化（我的 fix 在这）** |
+| `/opt/venv-syncv3/bin/python`    | `/workspace/code/syncv3/Primus-Turbo`           | fa1ac492   | wgrad skew 优化 |
+| `/opt/venv-syncv4/bin/python`    | `/workspace/code/syncv4/Primus-Turbo`           | fbb1f3a4   | **干净 origin/main（2026-08-04 建）** |
 
-- 宿主对应：`/workspace/code/syncv3/Primus-Turbo` = 宿主 `/mnt/vast/kyle/code2/syncv3/Primus-Turbo`（= push.sh 的 target）。
+- 宿主对应：`/workspace/code/syncvN/Primus-Turbo` = 宿主 `/mnt/vast/kyle/code2/syncvN/Primus-Turbo`（= 各自 push.sh 的 target）。
+- 隔离靠 **各 venv 自身 site-packages（cp -a，非共享）里的 editable-finder MAPPING + repo 路径**，不是新容器。本地设施在 `sync/syncv3/`、`sync/syncv4/`（各含 push.sh/rexec.sh/_smoke_wgrad.py）。见 memory [[project_syncv3_env]] / [[project_syncv4_env]]。
+
+## ★ 再建一套（syncvN 实操，2026-08-04 syncv4 实测跑通）
+
+同容器新开隔离环境（干净 origin/main 为例）：
+```bash
+# --- 远端（chi2798 容器内，rexec.sh 或 docker exec）---
+cd /workspace/code && cp -a Primus-Turbo syncv4/Primus-Turbo      # 带 .git + gitignored .so（免重编）
+git config --global --add safe.directory /workspace/code/syncv4/Primus-Turbo   # cp 改属主 → 必加，否则 fatal: dubious ownership
+cd syncv4/Primus-Turbo && git fetch origin && git checkout -B main origin/main && git reset --hard origin/main
+cp -a /opt/venv /opt/venv-syncv4                                  # 7.9G，独立 site-packages
+F=/opt/venv-syncv4/lib/python3.12/site-packages/__editable___primus_turbo_0_0_0_finder.py
+sed -i 's#/workspace/code/Primus-Turbo/#/workspace/code/syncv4/Primus-Turbo/#g' "$F"   # MAPPING 改指向
+grep -rIl '/opt/venv/bin/python' /opt/venv-syncv4/bin/ | xargs -r sed -i 's#/opt/venv/bin/python#/opt/venv-syncv4/bin/python#g'  # shebang
+/opt/venv-syncv4/bin/python -c "import primus_turbo,torch,flydsl; print(primus_turbo.__file__,torch.cuda.device_count(),flydsl.__version__)"  # 必须打印 syncv4
+```
+坑：① cp -a 到 NFS 刷 "preserving permissions: Operation not permitted"（cosmetic，内容照拷完）；② git dubious-ownership 必先 safe.directory；③ **各 sync 目录的 `rexec.sh` 在 `sync/syncvN/` 子目录下，不在 `sync/`**——从 `sync/` 里 `bash rexec.sh` 会退码 127（No such file），要 `bash syncvN/rexec.sh`；④ `.so` 是别的分支 Jul-3 构建的，reset origin/main 后靠 gitignored 保留复用，冒烟通过=ABI 兼容，不通过再 `python setup.py build_ext --inplace`。本地 canonical：cp 本地 syncv3 → syncv4 后 `git fetch`（`.ssh_docker` key 直连 github）+ reset origin/main + `git clean -fd`（清 `_*` 实验脚本，保留 ignored）。
 
 ## ★★ 头号坑：必须直接 `bin/python`，严禁 `source activate`（尤其别叠加）
 

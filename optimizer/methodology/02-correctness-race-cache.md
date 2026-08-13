@@ -14,6 +14,22 @@
 - 坑:dq 与 dkdv 模块的**默认 exp2 模式可能不同**(dq 默认 `fast_exp2=True`、dkdv 默认 poly)。测试脚本若统一喂 poly 格式 lse,dq 会 NaN 而 dk/dv 正常——**这是测试脚本 bug,不是交付 bug**。查法:用真 wrapper(格式自匹配)跑 `_test_final` 两模式,若那里 dq 正常(fast 35dB/poly 52dB、det bit-identical),则探针脚本的 NaN 是格式不匹配。修:探针里 build 模块的 exp2 flag 与所喂 lse 格式对齐。
 - 一般化:**看到某个输出全 NaN 而同 kernel 其它输出正常时,优先怀疑该输出的输入预处理(格式/缩放)不匹配,而非 kernel 逻辑**。
 
+### ★★ block-scaled(mxfp4/mxfp8)的 SNR 探针**必须喂随机 E8M0 指数**,否则对"拿错 scale 套"整类 bug 全盲(2026-08-08 实测)
+
+- 踩证:mxfp4 grouped 的折叠尾相 `emit_peel_fold` 从 round-9 起**从未为 trailing 半 k-block 重发 scale**,
+  它乘的是**两个相位之前**的那套 E8M0。这条错了 19 轮没人发现,12 个计分配置一直在给错数打分。
+- 为什么所有门都放行:
+  * bench 的 SNR 形状 `K%256==0` ⇒ `_K128=0` ⇒ **折叠路径根本不执行**(形状盲,见本卡"门的形状必须覆盖分支");
+  * det 门看的是 run-to-run 一致,拿错的是**固定**的那一套 ⇒ 每次都错得一模一样,`det=True`;
+  * 而 SNR 探针当时用 `randn` 量化出 scale —— **N(0,1) 每 32 元素块的 amax 几乎总落在同一个 2 的幂档里**,
+    per-block E8M0 指数近似恒定 ⇒ 拿错那套和对的那套**数值相同**,SNR 照样 49.60 dB。
+- 换成 `torch.randint(122, 132)` 的随机指数后,同一份码立刻掉到 **10.98~14.00 dB**;补上重发 = 全部 49.60 dB。
+- ⇒ **判据**:凡是"scale 的寄存器套/缓冲槽由发射器管理生命周期"的核(whole-loop、ping-pong scale set、
+  peel/tail 变体),SNR 探针的 scale **必须独立随机**,不能由 `randn` 数据量化得到;
+  数据本身可以随机,**scale 的随机性是另一个自由度,而它才是这类 bug 的唯一探针**。
+- ⇒ 配套:融合两个相位(把 phase A+B 合成一个 peel)时,**逐项清点被合并掉的 prefetch** ——
+  未融合体在 phase A 里做的 scale/operand 预取,融合体不会自动继承。
+
 ### fp8/fp4 SNR 阈值(硬编码在 test/bench,不在 get_tolerances)
 | 类型 | 阈值 | 位置 |
 |---|---|---|
