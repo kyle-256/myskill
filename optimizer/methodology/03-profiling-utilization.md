@@ -394,3 +394,32 @@ hd64 fwd 实测(3 waves/SIMD,A=1127.0 TF):把 row-sum 从 issue-bound 的 QK 簇
 
 ---
 来源: flydsl-fp8-gemm-tuning/SKILL.md, 10-8wave-scvgpr.md, flydsl-kernel-authoring/SKILL.md, agpr_rawasm_progress.md, project_mxfp4_epilogue_store.md, gemm-optimization/SKILL.md, 07-benchmarking.md, 07-benchmark.md, capture-kernel-trace/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, kernel-trace-analysis/SKILL.md, tool-rocprof/SKILL.md, diag_4w_vs_8w.md, prefetch-data-load/SKILL.md, gemm/overview.md, programming-model.md, 08-att-root-cause.md, project_mxfp4_k28672_ceiling.md, lds-optimization/SKILL.md
+
+## ★ 共驻两个 kernel 时,用 **full − nored 分解**把"body 变慢"和"共驻核被赶走"分开(2026-08-13)
+
+**场景**:一条流水里主核与辅助核(reduce/epilogue/prefetch 核)**共享同一个 512 dword 寄存器池**并
+共驻在同一批 CU 上(判据见 methodology/04 的 `ceil8(body) + n*alloc(sibling) <= 512`)。这时**越过
+共驻线的旋钮读起来和一次普通的调度回归一模一样**:wall 慢几个百分点,指令数、spill、LDS 全没变。
+
+**方法**:同一个候选跑两遍 —— 一遍完整流水,一遍**把辅助核整个关掉**(结果算错无所谓,这是定价探针,
+按 §「上界≠可达」只用来分账),两个数相减就是该候选下辅助核的 **exposure**。于是
+`Δwall = Δbody + Δexposure`,两项各自归因。
+
+**实测(gpt-oss D128 fused bwd,dkdv body + 共驻 dQ reduce)**:
+
+| 臂 | full | nored | exposure |
+|---|---|---|---|
+| ref(462 dw,线内) | 6.3868 | 5.7149 | 0.657 |
+| `g2d=1`(**471 dw,越线**) | 6.9951 | 5.8769 | **1.118** |
+| `g3_kreg=0`(415 dw,2 个 reduce WG) | 6.6191 | 5.8376 | 0.782 |
+
+⇒ `g2d=1` 表面是 −0.6 ms 的 ring-depth 回归,**实际是 0.15 body + 0.46 驱逐**;而"共驻得更多"
+(415 dw 让第二个 reduce WG 进来)反而把 exposure 从 0.657 抬到 0.782。**没有这个分解,前者会被
+错记成"ring 深度很敏感",后者会被错记成"共驻越多越好"。**
+
+**同一把尺还能廉价证伪机理假说**(都是先猜机理、再用能改那个机理的旋钮量它):
+* "辅助核共驻时只跑到独占带宽的 1/4,是**每线程 MLP 不足**" → 在装得下更宽 wave 的 body 上把每线程
+  in-flight load 翻倍:exposure 0.782 → 0.768(≈0)⇒ **不是延迟,是按字节走的共享 fabric 成本**。
+* "让 reduce 按生产者写入顺序读,能吃 MALL 余温" → 反转 grid 顺序:0.004 ms ⇒ 死。
+⇒ 判一个共驻核该不该继续调形状(wave 数/WG 宽/向量宽/顺序),先用这两个探针问"exposure 是字节项
+还是延迟项";是字节项的话,**所有形状旋钮都无效,只有减字节有效**。

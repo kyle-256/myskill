@@ -287,3 +287,34 @@ cd /tmp && $V/bin/python -c "import primus_turbo;print(primus_turbo.__file__)"  
 **传输脚本**(syncv4 版,其余环境照抄改路径):
 `sync/syncv4/push_smci.sh`(rsync,永不 --delete,带 --chmod)、
 `sync/syncv4/rexec_smci.sh`(base64 → wrapper → docker exec,三层引号免疫)。
+
+### 6. ★ 跑 e2e/mlperf 还要 **Primus**(训练框架)—— 同样一环境一份(2026-08-13)
+kernel bench 只需 Primus-Turbo;**e2e/mlperf 还要 Primus**,按 §5 同构结构各环境一份:
+```
+本地 canonical sync/Primus  →  /home/xianzhao/smci_repos/syncv4/Primus  ↔  容器 /workspace/code/syncv4/Primus
+```
+传输脚本 `sync/syncv4/push_primus_smci.sh`(照 push_smci.sh:`--chmod=a+rwX --no-o --no-g`、**永不 --delete**)。
+- ❌ **别用宿主 `/home/xianzhao/code/Primus`**:它 `.git` 属主是 `nobody:nogroup`(xianzhao 连 fetch 都
+  `.git/FETCH_HEAD: Permission denied`),而且**不在 kyle_dev 的挂载里**(容器只挂 `smci_repos`)→ 容器根本看不见。
+- ⚠️ 若曾在**容器内**建过这棵树(如 git clone),文件属主是 nobody → 从 xianzhao 侧 rsync 覆盖时
+  `mkstemp ... Permission denied (13)`。先 `docker exec kyle_dev chmod -R a+rwX <树>` 再推(同 §5 坑 1 的另一个方向)。
+- `third_party/Megatron-LM` 是**空 gitlink**,`megatron.core` import 不到 → `git submodule update --init
+  --depth 1 third_party/Megatron-LM`(37M)。跑法见 methodology/17 变体 C。
+
+### 7. ★★ 容器内没有 GitHub key,`git fetch/push` 全废(2026-08-13)
+`kyle_dev` 的 `/root/.ssh` 是**空的**(容器重建即清,同 [[project_claude_container_persist]]);宿主 `xianzhao`
+也只有集群 key(`ssh -T git@github.com` → `Permission denied (publickey)`)。⇒ 容器内 git 网络操作一律报
+`Please make sure you have the correct access rights` —— **别误判成 repo 权限或网络故障**(外网是通的:
+容器内 `curl -sI https://github.com` → 200)。修 = 把本地 `.ssh_docker`(kyle-256)装进容器,**只放容器内、
+不落共享盘**(NFS 上是 `drwxrwxrwx`,私钥不该躺在那):
+```bash
+cat /workspace/code/.ssh_docker/id_ed25519 | <wrapper> 'docker exec -i kyle_dev bash -c "
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat > /root/.ssh/id_ed25519 && chmod 600 /root/.ssh/id_ed25519
+  printf \"Host github.com\n  IdentityFile /root/.ssh/id_ed25519\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n\" > /root/.ssh/config"'
+# 验证: docker exec kyle_dev ssh -T git@github.com   ->  Hi kyle-256!
+```
+- **本地 Bash 侧同理**:`sync/Primus` 的 fetch 也要显式指 key ——
+  `GIT_SSH_COMMAND="ssh -i /workspace/code/.ssh_docker/id_ed25519 -o IdentitiesOnly=yes"`
+  (本地 `~/.ssh` 只有 `campaign_key_ed25519`,默认 key 上不了 github)。
+- ★ **目标 commit 不在任何分支上时**(如别人 PR 的 merge commit),`git fetch origin <40位sha>` 可**直接按
+  sha 取**(实测通,`--depth 1` 的 clone 也适用);别去拉 `refs/pull/*`(几分钟且常超时)。

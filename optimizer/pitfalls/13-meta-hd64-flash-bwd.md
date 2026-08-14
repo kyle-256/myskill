@@ -269,8 +269,36 @@
      bkv=256 上**所有供体完全无效**:`k_reg=0`、`g3_kreg=0`、两者一起,spill 逐字都是 655。
      ⇒ **一旦累加器吃满 A 堆(256)且 arch 也满(256),供体腾出的那类寄存器不是溢出的那类**,再加供体
      只是在同一个堆里挪。LDS 反而不是拦路(halves=4 时 135168 < 163840)。
-   ⇒ **能走通的都要付重算**:例如一个 WG 拿 pair 的 dK+dQ、兄弟 WG 拿它的 dV,只重复 GEMM1(+20% flop
-   换 −1.25 ms)。**别再试第四次寄存器折叠 / 加供体**;要动就动"每 pass 活着的地址链条数"或付重算。
+   - **2026-08-13 修正上一条的归因,并给这条路收尾**。上面两个"供体无效"的读数有个混淆:`k_reg`/
+     `g3_kreg` 在 `_pair` 配置里**本来就是关的**,所以 spill 逐字不动只说明"没改到东西"。换三个
+     配置里真正开着的供体重测(`g3d=2→1`、`g2d=2→1`、`exp_iglp=0`),配 `block_q=32`(它把
+     transient/dS/dQ patch 全缩一半,是唯一能让 bkv=256 **spill 归零**的旋钮):
+     `.vgpr_count` 逐字 **510 / 512 / 510,spill 全 0** —— 真机理是**分配器把整个文件占满**
+     (A 堆 256 被累加器吃满、arch 堆随后也满),不是"腾错了类"。**结论比原来更硬:任何大小的供体
+     都推不动两 band 的 body,一次 ISA 屏就能封掉整族,不必再做供体扫。**
+   - **共驻线才是真正的判据(2026-08-13)**:两 band body 的地板 510 > 该 kernel 对能存在的**最高**
+     共驻线 **488**(dqred 最瘦形态 = 4-wave WG × 24 dw/SIMD;部署的 8-wave WG 是 464)⇒ 折叠**必然**
+     驱逐共驻的 reduce。驱逐单价用 full−nored 单独量出来 = **0.46 ms**,而折叠全部收益只有 0.58
+     (读侧 0.38 + 写侧 0.20)。附带一笔:两 band body 还多 **54% `ds_read_tr16`**(1328→2048,两个
+     kv half 各自重读 q 侧算子),唯一能修它的 `kv_halves=1`(dstr 1536)spill **577**。
+   ⇒ **三条形态全封**:寄存器折叠(共驻线)、重算(2026-08-13 campaign r4 实测 −0.97 ms)、
+   LDS 承接累加器(bkv=256 单 dV 就 128 KB,而 K tile+Q/dO+dS 已占 96/160 KB)。**别再试第四次**;
+   更根本的原因见下一条的 D/A 定律 —— 这不是这个核的实现问题。
+
+### ★★★ 2026-08-13 **split-K partial 字节是寄存器文件的函数,不是循环序的函数(D/A 定律)**
+attention bwd 里"哪个梯度要走 split-K partial"看起来是拆法选择,实际两种拆法定价完全一样:
+* **kv-outer**(WG 持 dK/dV,dQ 出 partial):A = `BLOCK_KV*D*2` 个累加 float ⇒ partial 字节
+  = `(Skv/BLOCK_KV)*|dQ|/2` = **B·Sq·Skv·Hq·D²/A**。
+* **q-outer**(WG 持 dQ,dK/dV 出 partial):A = `BLOCK_M*G*D`(G = 该 WG 覆盖的 GQA sharer 数)⇒
+  partial 字节 = `(Sq/BLOCK_M)*(Hq/G)*(Skv/2)*D*2` = **同一个 B·Sq·Skv·Hq·D²/A**;而且 dK/dV partial
+  通常必须 fp32 ⇒ 还要 ×2。**所以 kv-outer 是较优的那一侧,不是随手选的。**
+
+⇒ **partial 字节/flop = D/A**:固定寄存器文件下**线性于 head dim**。gpt-oss fused bwd 的 D128 恰好
+是 D64 的 2×(D64 能开 bkv=256、D128 只能开 128,因为 A 一样),**这就是它 D128:D64 分数差的全部**。
+可迁移的判断法:遇到"partial/workspace 字节太多"的 bwd 核,先算 D/A,再决定是不是值得开一场
+campaign —— 能动它的只有 (a) 更大的 A(硬件的 512 dword 池),(b) 累加器换一层存储(LDS 通常差一个
+数量级,且要和 K/V tile、staging 抢同一 160 KB),(c) 重算(边际 MFMA 在 occ=1 上是 1.18× 纸面,
+基本必负)。**换个 band 分组方式 / 换个循环序都在同一条 D/A 上,不用试。**
 
 ### ★★★ 2026-08-11 gpt-oss D128 fused bwd:**vmcnt 是 load/store 共享且按序的 ⇒ 预取的发射点相对重存储的位置值 +3.9%**
 gpt-oss D128 fused(Hq64/Hkv8、Sq=Skv=8192、B=2、full-causal、bkv=128、4 wave/occ=1),score =

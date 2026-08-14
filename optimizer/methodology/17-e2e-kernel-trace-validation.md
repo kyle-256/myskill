@@ -17,6 +17,38 @@ kernel 名字。别在 python 侧加 print 探针**——派发路径可能跟�
   **不经** `PrimusTurboGroupedLinear`(该类根本没实例化),也**不经**公共 `grouped_gemm_fp8` wrapper。
   我 print 加错了代码路径。**结论:验证 kernel 是否真跑,第一手段是 trace,不是 print。**
 
+## ★★ 第二头号教训:e2e 崩了却看不到 traceback —— 三层遮蔽,真日志在 Primus 自己的 rank 目录
+
+真事(2026-08-13,syncv4/smci355):`primus-cli direct` 跑 mlperf,rank 崩了只给 `exitcode: 1`,
+stdout/stderr 干干净净全是 MLLOG,**连跑 6 次都以为是"静默崩溃"**,一路误判到怀疑硬件/通信。
+三层遮蔽依次是:
+
+1. **`--local-ranks-filter 0`**:`runner/primus-cli-direct.sh` 按 NODE_RANK 硬算(**无 env 开关**),
+   非 rank0 的输出根本不进 console → 崩在 rank2 就只剩一个退出码。
+2. **torchrun 重定向**:加 `--redirects=3 --log-dir=<dir>` 能拿到 per-rank 文件,但**崩溃 rank 的
+   `stderr.log` 是 0 字节**,`stdout.log` 停在 Gloo 那几行。⚠️ 非 rank0 本来就被 Primus 的 rank0-only
+   logging 静音,**几百字节是"正常静默"不是"卡在这里"的证据**——我据此误判过一轮。
+3. **addr2line**:`TORCH_SHOW_CPP_STACKTRACES=1` 只打出 `symbolizing C++ stack trace for exception;
+   if this hangs, rerun with TORCH_DISABLE_ADDR2LINE=1`,符号化耗 56s 后**异常正文整个丢失**。
+   要 C++ 栈必须同时设 **`TORCH_DISABLE_ADDR2LINE=1`**。
+
+**✅ 真 traceback 一直躺在 Primus 自己的 loguru 落盘里**(和 stdout 完全无关):
+```
+<PRIMUS_PATH>/output/<team>/<user>/<exp>/logs/pre_trainer/rank-<N>/{info,debug,warning}.log
+# 实例: output/amd/root/gpt_oss_20b/logs/pre_trainer/rank-0/info.log
+```
+⚠️ **`error.log` 是 0 字节**——名字最像的那个恰恰是空的;完整 `RuntimeError`+调用栈在 **`info.log`/
+`debug.log`**(`warning.log` 有摘要首行)。**e2e 排障第一步就 tail 这几个文件,别在 stdout 里刨。**
+
+**两个提速手段**:
+- **不改 Primus 也能给 torchrun 加参数**:`runner/primus-cli-direct.sh` 把 `${LOCAL_RANKS:-}` **不带引号**
+  拼进 torchrun argv(注释明说留给 word-splitting)→ `export LOCAL_RANKS="--redirects=3 --log-dir=<dir>"`
+  即可加 per-rank 日志,无需 patch 仓库。
+- **single-process direct**:绕开 torchrun+primus-cli,自设 `RANK/WORLD_SIZE/LOCAL_RANK/MASTER_*` 后直接
+  `python -u -m primus.cli.main train pretrain --config $EXP --backend_path <Megatron-LM>`,输出不经任何
+  重定向。**1 卡复现出同一个崩溃 = 立刻排除通信/多卡因素**(本例正是这样把范围缩到 kernel 层),
+  且此时唯一的 rank 就是 rank0,不受第 1 层遮蔽。
+
 ## 复现步骤(mock 冒烟 + profiler)
 
 1. **run wrapper**(本地 `sync/_run_gptoss_mlperf.sh`,NOT git-add;容器内路径
@@ -145,5 +177,39 @@ H=hidden=2880、I=moe_ffn_hidden=2880、E=32、topk=4、L=24、S=4096、GBS=64�
 
 复现脚本(NOT git-add)= `/shared_nfs/kyle/_smoke2_body.sh` + `_smoke2_launch.sh`;profiler patch(可选,给 fallback dir)= `/workspace/Primus/primus/backends/megatron/patches/torch_profiler_patches.py` 加 `PRIMUS_TRACE_DIR` env fallback(但 profile:true 后 tensorboard_dir 会自动生效,通常用不上 fallback)。
 
+## 变体 C — smci355/syncv4 跑 **官方 mlperf EP1 config**(2026-08-13 跑通)
+
+环境 = smci355 `n01-25` 容器 `kyle_dev`、venv `/opt/venv-syncv4`、repo `/workspace/code/syncv4/{Primus,
+Primus-Turbo}`(见 connection/smci355/01、gpt_oss/04)。★**Primus 也要 sync**:本地 canonical `sync/Primus`
+→ `sync/syncv4/push_primus_smci.sh`(与 Primus-Turbo 各一份远端拷贝,一个环境改 HEAD 不影响另一个)。
+跑通口径:**8 卡 EP1/TP1/PP1、GBS32/MBS4、mock、8 iter、FLYDSL grouped GEMM** → `torchrun finished
+successfully (code 0)`,284s,MLLOG `overall_throughput 19.36`;`eval_accuracy: NaN` 是 **mock 数据的必然
+结果**(合成 token,loss 无意义),不是 bug。
+
+这份 config(`examples/mlperf/gpt_oss_20b/config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh`)是给**官方容器布局**
+写的,搬到自建环境**每条都会直接崩**,照抄这张清单:
+
+1. **`.so` 陈旧 3-arg 会在新环境复发**:syncv4 是 `cp -a` 老容器来的 → 首个 fwd MoE quant 就报
+   `expected at most 3 argument(s) but received 4`。修法见 pitfalls/08 §stale-quant-so。
+   ⚠️ **smci355(256 核 / MAX_JOBS=96)实测重编 ~18min**,不是 Crusoe 记的 6–7min,**别按 7min 设超时**。
+2. **Megatron-LM submodule 必须 init**:`third_party/Megatron-LM` 是空 gitlink,否则 `megatron.core`
+   import 不到。`git submodule update --init --depth 1 third_party/Megatron-LM`(37M)。
+3. **config 硬编码部署路径**:`PRIMUS_PATH=/workspace/Primus`、`EXP`、`PYTHONPATH` 全在 config 里 export
+   → **必须 source 之后再覆盖**,顺序反了全部无效(`run_and_time.sh` 还会 `cd $PRIMUS_PATH/...`)。
+4. **config 拼 `${PYTHONPATH}` 无守卫**(其 line 20)→ wrapper 带 `set -u` 会 `unbound variable` 当场退。
+   source 前先 `export PYTHONPATH="${PYTHONPATH:-}"`。
+5. **LR 三值联动**:`PRIMUS_LR_DECAY_ITERS` 是 source 时按 `TRAIN_ITERS-WARMUP` **算死**的。冒烟只改
+   `PRIMUS_TRAIN_ITERS=8` 会留下 decay=1199872 > train_iters → megatron 拒绝。**三个一起改**。
+6. **`mock_data` 这版仍是硬编码 `false`**(不像 `profile`/`train_iters` 已插值):节点没有 c4 数据集就得
+   加插值 `${PRIMUS_MOCK_DATA:false}`——**与变体 A 相同的、唯一需要的 yaml 改动**(default 保留生产行为)。
+7. ★**grouped GEMM backend 默认是 `triton`**(`${PRIMUS_TURBO_GROUPED_GEMM_BACKEND:-triton}`)→ 要测
+   FLYDSL **必须显式 export**,否则你以为在测 FLYDSL、其实跑的是 triton(和 04 卡"跑前先验 import 路径"
+   同一类自欺)。
+8. `MLPERF_RUNTIME_SERIES=v26.3`(容器镜像 rocm/primus:v26.3);默认 v26.5 分支会去调
+   `/opt/mlperf-gpt-oss-20b/prewarm_attention.py`,该路径在自建容器不存在。
+
+wrapper(NOT git-add)= `sync/syncv4/_run_mlperf_gptoss.sh`,四模式 `smoke|profile|full|direct`;
+`SMOKE_GPUS=1/2/4` 缩世界规模调试(GBS32/MBS4 在各规模都整除,grad-accum 吸收差异,只有通信路径变)。
+
 ---
-来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss)+ 2026-08-08 Crusoe 177 pretrain-yaml 真跑取 grouped-gemm FLOPS;见 [[project_kpad_e2e_trace_validated]]、[[project_gptoss_e2e_trace_grouped_flops]]、[[project_syncv3_so_rebuild_4arg]]、connection/gpt_oss/02·03·04、connection/crusoe/01、pitfalls/07(glob/tracer 坑)、pitfalls/08(重编 .so)
+来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss)+ 2026-08-08 Crusoe 177 pretrain-yaml 真跑取 grouped-gemm FLOPS + 2026-08-13 smci355/syncv4 官方 mlperf EP1 config 跑通(变体 C + 崩溃排障三层遮蔽);见 [[project_kpad_e2e_trace_validated]]、[[project_gptoss_e2e_trace_grouped_flops]]、[[project_syncv3_so_rebuild_4arg]]、connection/gpt_oss/02·03·04、connection/smci355/01、connection/crusoe/01、pitfalls/07(glob/tracer 坑)、pitfalls/08(重编 .so)
