@@ -116,6 +116,7 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
   - 修后重跑：失败 shape + 一个相邻边界 shape。
 
 - **create_buffer_resource 的 max_size 坑**：`max_size=True` 会 OOB 读垃圾（把 descriptor 范围拉满，越界读进相邻内存）。必须用 `max_size=False, num_records_bytes=...` 精确给范围。（与「gfx950 HW-walled 死路」章 fp8 ISA 小节同条，此处保留 WHY；fp8 cast 等其余硬约束见该小节。）
+  - ★★**它还有一个性能伪装形态**：写错回绕的 grid 解码/索引（例如"加完只减一次模数"，被加的项没归约就会留下越界下标）配 `max_size=True` **不崩、det 门照样 True**，而且因为触到的 cache line 变少、越界 store 被硬件丢弃，会读出 −13% 这种漂亮数字。⇒ **任何改 grid 解码/索引的臂，必须先离线穷举证明「是置换且在界内」再看时间**（对所有实际发射的 grid 宽度枚举，不是对部署形状枚举——同一份二进制常被按 chunk 发出更窄的 grid）；顺序反过来就会把越界当成赢出货。
 
 来源: 08-deadends.md, 04-tn-wgrad-kernel.md, 02-nt-fwd-kernel.md, oob-detection/SKILL.md, flydsl-sync/SKILL.md
 

@@ -202,8 +202,16 @@ mxfp4 grouped 的 NT(fwd/dgrad)吃 band-cyclic,**wgrad 却必须留在 `xcd=1`**
 - **★★内层最快轴 dq 与 dkdv 必须相反**:**dq 要 kv-head 相邻,dkdv 要 q 位置相邻**(split_idx 最快)。
   同一个 remap 只是内层顺序选错 = **−2.5% 对 +2.4%**。⇒ 迁移这个 lever 时,
   **先问"这个 kernel 的 co-resident WG 之间复用的是哪一份数据"**,让那一维相邻,而不是照抄另一个 kernel 的顺序。
-- **门控**:需 `num_kv_heads % num_xcd == 0`,其余 head 数走原解码;双射性**离线穷举验证**(遍历所有部署的 `(B, q_split, tile 数)`)后再上机
-  —— 历史上一次 naive nested-division remap 直接 GPU-fault,曾被误记为"方向死"。
+- **门控**:双射性**离线穷举验证**后再上机 —— 历史上一次 naive nested-division remap 直接 GPU-fault,曾被误记为"方向死"。
+  ★**穷举口径是「实际发射的 grid 宽度」,不是部署形状**:同一份二进制常被按 chunk 发出更窄的 grid(nb=1),
+  按 `(B, Hkv)` 验证过的取模形式在那条 launch 上就是非双射 ⇒ fault。⇒ 优先用**余数摊派**形式
+  `x*(G/8) + min(x, G%8) + bid/8`(`x = bid % 8`),它对**任意** G 恒为置换,只多两条 SALU,于是
+  `num_kv_heads % num_xcd == 0` 这个门可以整个去掉 —— 2026-08-15 gfx950 实测 Hkv=6 的窗口 dkdv body **−9.1%**,
+  说明"其余 head 数走原解码"是一笔 4% 量级的欠账,不是中性 fallback。
+- **★★共驻例外:remap 的符号取决于这条流是否独占 fabric。** 同一套连续切分用在**独占发射**的 reduce 上是
+  −5.4% / −1.8%,用在与 body **共驻**的同一个 reduce 上是 **+12%**(2026-08-15 gfx950 实测):把读流固定到一个
+  XCD 的 L2 片,正好对准邻居 body work-group 正在写穿的那片,两边争同一批 set。⇒ 判"要不要给某个 kernel 做
+  XCD 连续切分"必须先看它是独占 dispatch 还是与另一个 kernel 共驻;共驻时用"同片内错相位"而不是"独占一段"。
 - **⚠ TCC hit% 不是判据**:hit 率大涨可能值 0 wall。判这类改动看 **`SQ_WAIT_ANY` / `SQ_VALU_MFMA_COEXEC_CYCLES`**。
 
 ### ★ 派发顺序 = list-schedule 顺序(同轮发现,+2.50%)

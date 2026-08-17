@@ -42,13 +42,29 @@
    `(batch, kv_head)` → 共读同份 K/V 的 GQA WG 落在同一 L2 slice。dq L2 hit 86.5→94.8%、miss −62%;dkdv **+2.81%**。
    ★**内层最快轴对不同 kernel 是相反的**:dq 要 **kv-head 相邻**、dkdv 要 **q 位置相邻**。选反 = **−2.5% vs +2.4%**。
    ★门控 `num_kv_heads % num_xcd == 0`,双射性**离线穷举验证**后再上机(naive remap 曾直接 GPU-fault 并被误记为"方向死")。
-2. **派发顺序就是 list-schedule 顺序 —— 工作量单调时用 LPT(长任务优先)。**
+2. **派发顺序就是 list-schedule 顺序 —— 先取 trip-count 剖面,再按剖面形状选顺序。**
    因果掩码下每 WG 工作量 `(q_tile+1)*BLOCK_M/BLOCK_KV` 单调递增 → 降序 q_tile 派发 = **+2.50%**。
    ★**别假设 in-order 已最优**:同一份代码里 dkdv 的 in-order 恰好已是 LPT,而 dq 是反的。可先用"N slots/XCD 贪心"离线模拟排序候选。
+   ★**剖面不单调时"升序 vs 降序"是错的二选一**:矩形因果 + 有限窗口的 dkdv,live band 的 trip 数是**帐篷形**
+   (两端 2、中间 16),升序与降序同样差(都以最窄的 band 起手),正确形式是**从帐篷中点向两侧走**
+   (`i` → `mid ± i/2`,O(1) 下标算术,输出逐位不变)= **body −4.3% / wall −2.7%**(2026-08-15 gfx950 SWA bwd)。
+   ⇒ 顺序选择的输入是剖面形状:单调 → 降序;单峰/帐篷 → 中点向外;恒定 → 动它没有钱(同 campaign 的另外三格 in-order 已最优)。
+   ⚠️ **但离线贪心 list-schedule 模型给的是上界,别据它下注**:同一格上,把 8 个 family 的 live 段互相错相位(消掉 live 段
+   同时涌入)在贪心模型里预测 body −3.8%,12 次跨进程交错实测 **−0.25%(噪声内)**;另一形式(相邻 family 的 live 段
+   首尾相接)模型预测 −3.8%、实测 **+0.4%**。模型把 dispatcher 当成"每 XCD 一条独立队列 + 纯 trip-count 代价",
+   而零工作 WG 的掩护、跨 XCD 的 DRAM 争用都不在模型里 ⇒ 剖面形状这一阶效应可信,二阶的相位重排要按实测判。
 3. **padding 落在最贵还是最便宜的 tile 上?**
    `num_q_tiles*BLOCK_M` 超出 `seq_len_q` 的部分,若锚在 row 0 则**全部浪费在因果范围最长的末 tile**。
    把原点下移 `floor(pad/BLOCK_KV)*BLOCK_KV` 让 overshoot 落到 tile 0(最短)= **+0.96%**(kv-block 访问 7481→7396)。
    ★必须是 BLOCK_KV 整数倍且 `BLOCK_M % BLOCK_KV == 0` 以保持对齐;首 tile 夹到 row 0 并加 owned-end store 界(共享行重算但只写一次,det 不变)。
+
+4. **想把辅助核(reduce/odo)藏进主核 = 先算 fill quantum,再按"body 税 + 尾巴"计价,别看辅助核自己的时间。**
+   主核若是 1 WG/CU(LDS > 一半),**一个 chunk 少于 CU 数就白付一整轮 `T_wg`**(实测 573~690 µs),
+   而要藏的 reduce 全长可能只有 300 µs ⇒ 细分永远亏。★但**对齐 fill 也救不了 D128**:
+   把 chunk 做成**恰好 2 个整 fill**(512 WG)后,body 仍 **+18%**、共驻 reduce 自己慢 **3×**,
+   净 wall −0.6%(噪声内)⇒ r14 记的"亏在 0.75 fill 的额外一轮"是**不充分**解释,真绑定项是
+   body 的寄存器/发射位压力(D128 body 498/512 ⇒ 税 18~23%;同代 D64 body 449/512 ⇒ 税只有 3.6%,
+   净赢 85 µs)。⇒ **共驻可行性按"主核寄存器余量 + 主核受干扰后的时间"判,不是按 fill 对齐或辅助核字节判。**
 
 ★ 判这层改动看 **`SQ_WAIT_ANY` / `SQ_VALU_MFMA_COEXEC_CYCLES`,不要看 TCC hit%** —— hit 率大涨可以值 0 wall。
 

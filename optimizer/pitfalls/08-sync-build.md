@@ -71,6 +71,21 @@
 - ssh 中断 ≠ 杀远程：本地 Ctrl-C 只断 ssh，远程 `docker exec` 里 pytest 仍在跑。多次中断重跑 → 僵尸 pytest 抢同块 GPU 越来越慢。重跑前先 `docker exec <容器> pkill -9 -f "pytest <file>"`。
 - 参数爆炸：`test_grouped_gemm_fp8.py -k FLYDSL` 选中 ~2.3 万 case（大多运行时 skip，但跑到的每个做 per-shape autotune 编译极慢，全量几百分钟）。只跑有界子集：`-x` 停首个失败，或定死 shape（`-k "FLYDSL and Format.E4M3-..."`）。deterministic 版对 flydsl 全 skip，没用。
 
+### ★★ 官方测试「全绿」不等于你的 FlyDSL 改动被验证过（test-coverage-blind）
+- 踩证(2026-08-17,mxfp4 PR):`gemm_helper.py` 里该补的 16 个符号(13 函数+3 个 DPP 常量)全丢、
+  `grouped_gemm_mxfp4_kernel.py` 一 import 就 `ImportError`,
+  `tests/pytorch/ops/test_grouped_gemm_fp4.py` 照样报 **2108 passed**。
+  因为那些 case 走 CK/triton backend,**根本没导入 FlyDSL grouped 模块**。
+- ★**跨分支搬 helper 符号要按传递依赖迭代到不动点**:只补内核直接 import 的那 7 个不够,
+  `_lane_tbl_load` 还要 `_lane_load_i32`、后者又牵出 `_dpp_add_i32`+3 个 `_DPP_*` 常量,
+  两轮才收敛。写法=循环"扫当前文件里 in-campaign 但未定义的名字 → 追加",直到一轮无新增;
+  ⚠ 起点别用"已追加过的符号集"当已定义(会让它们的依赖不被展开,我因此漏了 9 个)。
+- ⇒ **改 FlyDSL kernel 必须自己写一个直调 kernel 的冒烟**(import + 真跑一次 + 逐字节确定性 + finite),
+  别拿官方测试当验证。判据:冒烟脚本里 `from primus_turbo.flydsl...kernel import <你的函数>` 必须真出现。
+- ⚠ 反过来 dense 侧 `test_gemm_fp4.py` **是**覆盖 FLYDSL backend 的(错误里带 `BackendType.FLYDSL`),
+  正是它用 45 个失败抓出了被覆盖丢失的 `beta` 参数。⇒ **两个同名族的测试覆盖面可以完全不同,逐个确认**。
+- 同族教训见 [[feedback_bench_scope_blind_sibling_path]](计分 bench 没盖到的 layout 可被改断而零告警)。
+
 ### bench OOM（oom）
 - bench 每个 shape 后必须 `del` + `torch.cuda.empty_cache()`，否则累积 fp8 tensor（grouped 的 b 是 3D 大）把 300GB HBM 撑爆 OOM。
 

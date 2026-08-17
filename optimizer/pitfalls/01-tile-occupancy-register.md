@@ -50,6 +50,18 @@
     A cap=256 是**两个独立堆**(见本卡 §「4-wave (occ=1) 的 VGPR headroom 只有 88」),此时把 256 个
     累加器搬进 AGPR 是真的腾出 arch 空间 —— mx8tw 的 NT 核实测 arch VGPR **246 → 184**(空闲 10 → 72)。
     ⇒ **判「搬 AGPR 有没有用」先看 waves/SIMD,不是看 kernel。** 写法见 methodology/06 §tied-operand。
+  - ★★ **勘误(2026-08,mxfp8 grouped r16/r17):上面那句「两个独立堆」会被读成「arch 256 + acc 256
+    合计 512 可各自随便用,所以 1 wave/SIMD 能开更大的 tile」,那是错的,而且与本卡开头「512 合并池、
+    门槛值指合并总量 R = arch + accum」自相矛盾。** 正确读法是两条约束**同时**成立:
+    ① `acc` 与 `arch` 各自的**ISA 字段编码上限都是 256**(a0-a255 / v0-v255);
+    ② 两者之和仍受合并池 `512 / (waves per SIMD)` 约束。
+    ⇒ **`BM·BN / lanes ≤ 256` 是任何波数都绕不过的硬上限,tile 面积封在 `256 × lanes = 65536`。**
+    本卡 §「4-wave headroom 88」记的 `V=424 / A=256` 里的 424 是 `.amdhsa_next_free_vgpr`
+    (= arch+acc **合计**,其中 acc 256),**不是 arch 424**;拿它跟「arch 上限 256」比会算出不存在的余量。
+    实测代价:按「独立堆」推出的 4-wave 256×384(384 accs/lane)**编码不出来**;256×512 死在
+    `ScaleBComb` 的 `n_tiles_b` assert(连寄存器那道门都走不到),512×256 直接 ISel 崩溃。
+    ⇒ 判 tile 放大可行性的顺序是:先算 `BM·BN/lanes ≤ 256`,再算 `BM·BN/lanes + arch ≤ 512/waves`,
+    最后才是 LDS 与 scale slab 布局(见 pitfalls/05 §「放大 tile 的真入口是先把 scale slab 重排」)。
   - ⚠ 两条 AGPR 路线不是一回事:**`amdgpu-agpr-alloc` 属性路线对 scaled-MFMA 无效**(LLVM 会把 AGPR 当
     spill slot,实测 1155 条 `accvgpr_read` + 43 VGPR 落 scratch、6.2× 慢);**tied-operand
     `"=a,v,v,0,v,v"` 路线可用**。别用前者的失败去否定后者。

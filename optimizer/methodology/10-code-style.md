@@ -136,6 +136,25 @@ git commit
 # force push
 ```
 - 冲突文件**整文件取一方**(`git checkout <ref> -- file`),别 `-X theirs` 逐 hunk 合(两套并行实现会拼出坏代码)。
+- ⚠️★★**「整文件取一方」只在 main 没碰过该文件时成立**。先查
+  `git log --oneline <分叉点>..origin/main -- <file>`:**只要 main 动过,覆盖就是把 main 的改动删掉**。
+  2026-08-17 踩证:mxfp4 PR 用 `git show <campaign>:file > <main路径>` 整文件覆盖,
+  丢掉了 main 的 `f857e429`(grad-accum fuse 的 `beta` 参数)/`9c1e61c1`(TACCW fp16 修正),
+  **45 个 dense 测试直接红**(`got an unexpected keyword argument 'beta'`)。
+  ⇒ 正解是**三方合并**,base 取分叉点那版:
+  ```
+  git show <分叉点>:<旧路径> > /tmp/base.py     # main 若重命名过,base/theirs 用旧名
+  git show origin/main:<新路径> > /tmp/ours.py
+  git show <campaign>:<旧路径> > /tmp/theirs.py
+  git merge-file -L main -L base -L campaign /tmp/ours.py /tmp/base.py /tmp/theirs.py
+  ```
+  剩下的冲突逐块判**归属**:一方为空 = 另一方的新增(取有内容那侧);两边都有内容 = 同一实体的两个版本,
+  **必须手工合并而不是二选一**(本例 `StoreCPlain` 一边有 `beta_is_one`、一边有 `ilv`,grouped 内核用了
+  `ilv` 17 处,丢哪边都崩)。写个断言挡住"无脑取一方":`assert not [x for x in theirs if x.strip()]`,
+  它当场拦下了我两处错误合并。
+- ★**两边独占功能共存后,要查新增的快路径有没有绕过另一方的语义**:本例 campaign 新加的无掩码
+  `_store_rowaddr` 只写不读,`beta=1` 走它会**静默跳过累加**——测试测不出(没有覆盖该组合),
+  只能靠读代码发现。解法是让 `beta=1` 绕过快路径、走可累加的通用路径。
 - 新旧 main 间 `csrc`/`cmake`/`setup` 零改动 → `.so` 不用重编;editable 装的 Python 改动 rsync 后即时生效。
 
 ---
@@ -166,3 +185,17 @@ if sig(cand) != sig_before: skip()   # ★ 动到代码 → 拒绝这条
 
 ★ 另外两条:①改 docstring 要**从 AST 取 col_offset 自动补缩进**,手写缩进必错(嵌套 6 层的 docstring 是 16 空格);
 ②删函数/整块用 **AST 的 `lineno/end_lineno`**,别用 review 给的行号 —— 前面每删一处,后面的行号就全变了。
+
+### ★★ 门禁检测器本身会误报,先验检测器再信它(2026-08-17)
+
+跑注释门禁时我写的两个检测器都错了,差点照着假结果去改代码:
+1. **手搓 docstring 状态机把代码算成注释**:在 `git diff` 的 `+` 行上跑"遇到 `\"\"\"` 就翻转 indoc"——
+   added 行不连续,状态机根本对不上,报出 **115 行的"注释块"**(不可能)。
+   ⇒ 注释块/docstring 一律用 **AST**(`ast.get_docstring`)在**全文件**上取,别在 diff 片段上手搓。
+2. **把上游原有的 docstring 算成自己的**:只判"这行不在 base 行集合里"就算新增,`gemm_helper.py`
+   报出几十个超标 docstring,**实际归我的只有 6 个**。
+   ⇒ 判归属要**按符号名比对两版的 docstring 全文**(`old.get(name) != cur[name]`),不是按行匹配。
+   这条直接对应门禁里"共享文件只管自己动过的"。
+
+★ **假阳性识别**:`rg -i 'debug|tmp|...'` 那条门禁在 kernel 里必然命中寄存器命名
+(`ntmp`/`_vtmp`/`sctmp` 都含 `tmp`)——**看上下文再判**,别为了让计数归零去改变量名。
