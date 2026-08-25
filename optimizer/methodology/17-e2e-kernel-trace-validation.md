@@ -211,5 +211,70 @@ successfully (code 0)`,284s,MLLOG `overall_throughput 19.36`;`eval_accuracy: NaN
 wrapper(NOT git-add)= `sync/syncv4/_run_mlperf_gptoss.sh`,四模式 `smoke|profile|full|direct`;
 `SMOKE_GPUS=1/2/4` 缩世界规模调试(GBS32/MBS4 在各规模都整除,grad-accum 吸收差异,只有通信路径变)。
 
+## 变体 D — smci355/`kyle_train` 跑**真 C4** EP1 down-padk,复现 huangwei 0824 trace(2026-08-25 跑通)
+
+**目标**:在真实 e2e 训练里复现 huangwei 0824 的 down-padk fp8 grouped GEMM trace
+(本地参照 `trace/huangwei_0824/gptoss-fp8-down-padk-rank0-step100-gpu-only.pt.trace.json.gz`,
+rank0/step100/GPU-only)。跟变体 C 的差异是**用真 C4 数据(非 mock)+ venv-syncv3(近期 down-padk 优化版)**。
+
+**环境 / transport**:节点 `smci355-ccs-aus-n02-29`,容器 **`kyle_train`**(C4 挂 `/data`、tokenizer `/model`),
+venv **`/opt/venv-syncv3`**(用户硬令:syncv3 的 Primus-Turbo 才是近期优化的 down-padk 版)。传输
+= `kyle_wgrad_work/kt.sh '<cmd>'`(base64 过 login `n01-29` → 节点 `n02-29` → `sudo docker exec -i kyle_train`)。
+容器真实脚本在 **`/workspace/code/syncv4/`**(不是本地镜像 `gpt_oss_docker/sync/syncv4/`——两者不同挂载,
+Edit 工具改本地这份到不了容器,要么 sync 要么在容器里 `sed`)。
+
+**跑通口径**:8 卡 EP1/TP1/PP1、GBS32/MBS4、**真 C4**、110 iter、profile step 100 →
+`torchrun finished successfully (code 0)`、108.45s、samples 3520(=110×32)、零报错。
+config 清单照变体 C 第 1–8 条(`.so` 4-arg、Megatron submodule、source 后覆盖、LR 三值联动、
+`MLPERF_RUNTIME_SERIES=v26.3`),**再叠加下面 D 专属三条**:
+
+1. ★**`use_turbo_grouped_gemm` 默认 false → 必须开**:mlperf yaml line 187 硬编码 `false`(走 hipBLASLt),
+   改成插值 `use_turbo_grouped_gemm: ${USE_TURBO_GROUPED_GEMM:false}`(default 不变),wrapper 里
+   `export USE_TURBO_GROUPED_GEMM=true`。**不开的话 grouped GEMM 全走 hipBLASLt(`Cijk_*`),trace 里
+   一个 flydsl 核都没有**——第一次就栽这。
+2. ★★**必须强制 `export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=FLYDSL`**:只开 `use_turbo_grouped_gemm`
+   还不够——**syncv3 全训练路径的默认 dispatch 会静默落到 Triton**
+   (`_grouped_fp8_persistent_gemm_kernel`/`_grouped_variable_k_gemm_kernel`,名字全不对、比 flydsl 慢 2–5.5×;
+   fallback 警告在 `torch.compiler.is_compiling()` 下被吞)。**这就是变体 C 第 7 条那句"默认 triton"在真
+   C4 路径的复发**。强制 FLYDSL 后 grouped GEMM 全出 down-padk 核,`can_handle` 全通过、**不 raise**。
+   自欺检查:别信"我开了 turbo",一定 trace census 看核名。
+3. **DATA_CACHE_PATH 要可写**:`export DATA_CACHE_PATH=/workspace/code/syncv4/_datacache`
+   (Megatron GPTDataset 建索引缓存,默认落只读处会崩)。真 C4 用 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`。
+
+**LR/profile 旋钮**(到 step 100):`PRIMUS_TRAIN_ITERS=110`、`LR_WARMUP=10`、`LR_DECAY=100`(三值联动)、
+`PRIMUS_PROFILE=True`、`PROFILE_STEP_START=100`/`END=101`(单 step 100)。脚本
+`_run_c4_step100_flydsl.sh` = 由短诊断版 `_run_c4_force_flydsl.sh`(20 iter/step15,先验强制生效)`sed`
+改 iter/step 派生。init ~4min,110 iter ~108s;**Bash tool 2min 超时,run 在容器里继续**,`nohup ... &`
+后另起 poll(`pgrep -f _run_c4_step100_flydsl` + tail log)。
+
+**验收 census(rank0/step100/`cat==kernel`,单 step = 24 层×2 投影 → 各核 n=48)**——我方 vs 参照:
+
+| kernel | huangwei 0824(参照) | syncv3 强制 FLYDSL(我方) |
+|---|---|---|
+| `kernel_grouped_nt_persistent`(fwd) | n=48, avg **1701.7µs** | n=48, avg **1494.9µs**(更快) |
+| `kernel_grouped_nn_persistent`(dgrad) | n=**23**, 1477.2µs | n=**48**, 1326.6µs |
+| `kernel_grouped_tn_wgrad_4wave`(wgrad) | n=**23**, 1704.7µs | n=**48**, 1507.3µs |
+| `kernel_grouped_tn_wgrad_reduce` | 无 | n=48, 5.8µs(0.28ms 可忽略) |
+| `quantize_tensorwise_pad_row_kernel` | n=119, **226.5µs** | n=144, **225.1µs**(<1%) |
+
+**判读(★这是关键,别再误报"完全对上")**:
+- **核身份对上、fwd 逐核对齐、quantize 单调用 225.1 vs 226.5µs(<1%)= 同核同形状铁证**;单调用普遍更快
+  = syncv3 tip `072e225a` 比 0824 build 多了后续 down-padk 优化。
+- ⚠️**参照的反向是「混合」不是全 flydsl**:`nn/tn` 只 n=23(≈24=**只 down 投影**走 flydsl),另一投影
+  **gate_up 的 dgrad+wgrad 落 hipBLASLt**(参照反向窗里有 `Cijk_..F8BS..MT256x256x128/MT256x192x128`
+  共 ~45 条)。成因=**per-shape `can_handle`**:down 反向(padded variable-K)flydsl 接住 → FLYDSL;
+  gate_up 反向在 0824 build 里 flydsl `can_handle`=False → fallback → HBL(hipBLASLt)。fwd 两投影都被
+  `nt_persistent` 接住(n=48)。
+- 我方**强制 FLYDSL 把 gate_up 反向也拽上 flydsl(48 vs 23)**,比参照更激进/更快,**不是逐核 n 相等的
+  忠实混合**,但对"down-padk 核有没有真跑"这个验证目的**完全达标**(用户 08-25 拍板"确认我们的就行")。
+  要逐核复现那个混合,得 down 走 FLYDSL、gate_up 单独钉 HBL(单个 env 做不到)——非当前目标。
+- 别用我犯过的两个错:(a) 早期不强制那次全落 Triton 却报"对上了"被用户当场否(名字都不对、慢 2–5.5×);
+  (b) rank0 trace 用 `ls *rank*0*` 会**被时间戳里的 '0' 匹配到 rank7**,要 `"rank[0]"` 字面过滤
+  (同 §解析 trace 的 glob 字符类坑)。
+
+wrapper(NOT git-add,均在容器 `/workspace/code/syncv4/`)= `_run_c4_smoke.sh`(20iter 冒烟)、
+`_run_c4_force_flydsl.sh`(强制诊断)、`_run_c4_step100_flydsl.sh`(step100 复现)。见
+[[project_gptoss_fp8_wgrad_skew_padk]]、[[project_gptoss_down_padk_native_campaign]]、[[feedback_no_unilateral_campaign_model_change]]。
+
 ---
-来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss)+ 2026-08-08 Crusoe 177 pretrain-yaml 真跑取 grouped-gemm FLOPS + 2026-08-13 smci355/syncv4 官方 mlperf EP1 config 跑通(变体 C + 崩溃排障三层遮蔽);见 [[project_kpad_e2e_trace_validated]]、[[project_gptoss_e2e_trace_grouped_flops]]、[[project_syncv3_so_rebuild_4arg]]、connection/gpt_oss/02·03·04、connection/smci355/01、connection/crusoe/01、pitfalls/07(glob/tracer 坑)、pitfalls/08(重编 .so)
+来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss)+ 2026-08-08 Crusoe 177 pretrain-yaml 真跑取 grouped-gemm FLOPS + 2026-08-13 smci355/syncv4 官方 mlperf EP1 config 跑通(变体 C + 崩溃排障三层遮蔽)+ 2026-08-25 smci355/`kyle_train` 真 C4 EP1 down-padk 复现 huangwei 0824 trace(变体 D:强制 FLYDSL 破静默 Triton fallback + per-shape can_handle 混合判读);见 [[project_kpad_e2e_trace_validated]]、[[project_gptoss_e2e_trace_grouped_flops]]、[[project_syncv3_so_rebuild_4arg]]、[[project_gptoss_fp8_wgrad_skew_padk]]、connection/gpt_oss/02·03·04、connection/smci355/01、connection/crusoe/01、pitfalls/07(glob/tracer 坑)、pitfalls/08(重编 .so)
