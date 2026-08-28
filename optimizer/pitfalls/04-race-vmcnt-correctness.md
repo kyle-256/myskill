@@ -225,5 +225,20 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
 
 来源: debug-flydsl-kernel/SKILL.md, attention/optimization-directions.md
 
+## graded drain 的 vmcnt 是按**发射条数**标定的,不是按字节:少发一半 g2s → det 0/10
+
+2026-08-17 实测(gpt-oss-20b dgrad NN 边界块窄化)。边界块只需要 B 的一部分列,自然的想法是
+**把 b1 那一半 fill 整个丢掉**,g2s 发射数直接减半。结果:编译通过、跑得动、**逐字节确定性 0/10**。
+
+- **根因**:graded drain 的 `s_waitcnt vmcnt(n)` 里的 n 是"还允许有几条在飞",它是按这一段
+  **原本会发几条 load** 标定出来的。发射数变了而 n 没变,等待点就落在错误的位置,LDS 里
+  还没写完的半区被 s2r 读走 —— 典型 partial-drain race(本卡首节)。
+- **正确做法**:要省字节就**两半一起窄**(保住发射条数与配对结构),或者把该段 drain 改成全
+  `vmcnt(0)`。别用"丢掉一整路 fill"的方式减发射。
+- ⚠ 这条 race 不会被 SNR 抓到,只能靠**多次 bit-exact 复跑**(本例 10 次里 10 次都不同)。
+- **附带实测(别再重踩)**:即使把窄化做对(两半都窄、逐位相同),wall 也只有 **±0.3% 噪声内的 0**
+  (5 组种子:−0.51/−0.62/+0.42/+0.24/−0.44%)。根因是边界块只占 1/12 的 tile,省下的字节落在
+  occ≈2 的 sibling wave 已经盖住的延迟里。**「少搬字节」在边界块上不产速度**;要动 feed 就去量主体块。
+
 ---
 来源: 10-grouped-wgrad-4wave-3buf.md, 05-dead-ends.md, gfx950-vmcnt-race-debug/SKILL.md, 08-deadends.md, 04-tn-wgrad-kernel.md, 02-nt-fwd-kernel.md, oob-detection/SKILL.md, flydsl-sync/SKILL.md, verify-accuracy/SKILL.md, debug-flydsl-kernel/SKILL.md, fp8-gemm-bench/SKILL.md, attention/optimization-directions.md

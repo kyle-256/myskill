@@ -95,3 +95,42 @@
 
 ---
 来源: 08-att-root-cause.md, kernel-trace-analysis/SKILL.md, gfx950/kernel-implementation-notes.md, agpr_phase5_lds.md, diag_4w_vs_8w.md, 03-nn-dgrad-kernel.md, gemm-optimization/SKILL.md
+
+## ★★ 想写「半深 K-tail body」省掉 K-pad 的 MAC 之前:先算 `ceil(K_real/inst_k)` 对 `ceil(K_pad/inst_k)`
+
+2026-08-17 gpt-oss-20b down-projection(fp8 grouped,`K_real=2880`,`K_pad=2944`)实测教训:
+计划里挂了两轮的「NN/NT 各 ~20 µs 的半深 K 尾体」,按指令粒度一算是**零**。
+
+- 这两个核唯一的 fp8 MFMA 是 `v_mfma_f32_16x16x128_f8f6f4`(单条覆盖 K=128),
+  且 `SQ_INSTS_MFMA == M·N·K/32768` **逐条吻合**(32768 = 16×16×128)⇒ 收缩轴的**指令粒度就是 128**。
+- `ceil(2880/128) = 23`,`ceil(2944/128) = 23` ⇒ **两边条数相同**,尾体省不下**一条** MFMA。
+  纸面上那 2.2% 的 "pad MAC 浪费" **被向上取整整个吃掉了**,不可寻址。
+  能省的只剩尾迭代的 feed 字节(该核 feed 搬运 84 µs 的 2.17% ≈ **2 µs**)。
+- 同源踩证:只把**声明**的收缩深度从 2944 改到 2880(不动指令粒度)= **逐位相同但 −1.70%** ——
+  那 1.70% 全是丢掉 2944 行 pitch 的 128 B 对齐,不是省下了什么。
+- ⇒ **通用配方**:`inst_k` 是硬粒度。判一个 K-pad 值不值得做尾体,只看
+  `ceil(K_real/inst_k) < ceil(K_pad/inst_k)` 成不成立;不成立就**只能换 `inst_k` 更小的 MFMA**
+  (本例 `32x32x64` 的 K 粒度 64,且 2880 = 45×64 整除 ⇒ 真能吃到 2.17%,顺带每条指令的 operand
+  复用翻倍:16 MAC/B 对 8 MAC/B),但那是整套累加器 layout + epilogue 的改写,
+  且 pitfalls/01 记着「MFMA nonkdim 32 永远不赢」⇒ 先在孤立单核上比每-MAC 发射效率,别直接改生产核。
+
+### gfx950 fp8 的两条 f8f6f4 MFMA:同宽操作数、2× MAC、4× 累加器（汇编器实证）
+
+`llvm-mc -arch=amdgcn -mcpu=gfx950` 两条都汇编通过（**5 秒判据,别靠猜有没有这条指令**）:
+
+| 指令 | 单条 MAC | 操作数(每侧) | 每字节复用 | 累加器 VGPR |
+|---|---|---|---|---|
+| `v_mfma_f32_16x16x128_f8f6f4 v[0:3], v[16:23], v[24:31], v[0:3]` | 32768 | 8 VGPR = 32 B/lane | 8 MAC/B | **4** |
+| `v_mfma_f32_32x32x64_f8f6f4 v[0:15], v[16:23], v[24:31], v[0:15]` | 65536 | 8 VGPR = 32 B/lane | **16 MAC/B** | **16** |
+
+- 🚨 **但「条数减半」不是吞吐杠杆——这条轴已判负,别立项**:`SQ_VALU_MFMA_BUSY_CYCLES / SQ_INSTS_MFMA`
+  实测 **恰好 32.0 对 64.0** ⇒ 32x32x64 单条占管道**正好 2 倍长**,同 FLOP 的管道周期**守恒**。
+  实测同核只换主环 MFMA(ISA 除条数 1104→552 外逐项相同):聚合 MFMA_BUSY **逐位相同**,e2e **12/12 慢 0.8–3.0%**。
+  根因是 32×32 tile 一个相位只剩 **2 条独立累加链**(16×16 有 8 条)⇒ 遮 SrcC RAW 与 barrier convoy 的独立工作减半。
+  **详卡 pitfalls/05 §MFMA 形状轴关闭 · 决策索引第 64 行。**
+- ⚠️ **同理「每字节复用翻倍」也是假的**:复用翻倍是**每条指令**的账,而该指令占管道 2 倍时长 ⇒
+  **每周期的 operand 需求完全相同**,feed 侧一分钱不省。上表只能用来算 K 粒度与累加器占用,
+  **不能用来推吞吐或 feed**。
+- ⚠️ 附带代价:256×256 / 8-wave 的累加器 128 AGPR → **256**,512 共享池下 occ 2 waves/SIMD → **1**。
+- ⇒ **正确读法**:这张表回答的是「K 粒度能不能整除真实收缩深度」(选 `inst_k` 用)与「累加器要多少寄存器」,
+  **不是**「换大形状能不能提速」。后者已有 12/12 的反面实测。

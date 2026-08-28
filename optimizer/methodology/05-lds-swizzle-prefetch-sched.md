@@ -89,6 +89,39 @@ gpt-oss skew 配置上逐配置实测 `xcd=8` 明显优于 `xcd=1`(R2:两个 min
 **快筛配置集必须同时覆盖 (窄N,短K) 与 (宽N,短K)** —— 本轮只筛了 `dgrad gate_up`(长 K)就漏掉了
 `fwd gate_up` 的 12% 崩塌。
 
+★★ **第三个数据点 + 可预判的判据(2026-08-17,gpt-oss-20b down-projection padN dgrad NN 实测)**:
+这条轴之所以「随核而变」,是因为真正决定方向的是 **`B[g]` 装不装得进一个 XCD 的 4 MB L2 slice**:
+- **装得进** ⇒ B[g] 可以整块常驻,tile 顺序只影响均衡 ⇒ 越均衡越好,`xcd=1` / 小 `xcd` 赢(上面 2026-07-30 那组)。
+- **装不进**(本例 `B[g]` = 2944×2944 fp8 = **8.67 MB** > 4 MB)⇒ B 必然是**流**,唯一能做的是让
+  「共用同一个 B column-block 的 WG 同时在同一个 XCD 上跑」⇒ **`xcd` 必须等于物理 XCD 数 8**,
+  且 band 要窄到那批 WG 真的同驻。部署点(4096 tokens/expert)实测、**逐位相同**:
+  `(xcd=8,gm=4)` 对 `(xcd=4,gm=8)` **balanced +2.95% / heavy +2.49% / 几何 skew +0.03%**;
+  而这张卡为 grouped 核推荐的 **group-major + `xcd=1` 在这里是 −5.72%**。
+  band 宽度单峰:`gm` 3/6 = −1.3/−1.7%,`xcd=16`(每 XCD 两条 band)= −6.3%。
+- **`heavy` 不再是反方向**:B 是流的时候,hot expert 压在一个 XCD 上的代价被「B 命中」赚回来,
+  所以 heavy 也是正的 ⇒ 「xcd 大 = skew 脆」只在 B[g] 能常驻时成立。
+- **PMC 判别器(比命中率好用)**:赢的时候 `MemUnitStalled` 12.4%→10.7%(−13.7%),而
+  `TCC_REQ` / `TCP_TCC_READ_REQ` / `TCC_HIT`(~76%)**三项都不动** ⇒ 收益来自 **TCP→TCC 请求路径排队**,
+  不是少搬字节。**别用 L2 hit-rate 判这条轴有没有生效**——hit-rate 可以一动不动而 wall 快 3%。
+  (本例离带宽墙很远:2.6 TB/s vs ~8 TB/s HBM 峰值。)
+- ⚠️ 这个 pick 竞速**选不到**,因为竞速打分的 M 不是部署 M ⇒ 落地形态见 pitfalls/06 §静态 lead。
+
+★★★ **判据升级:决定方向的不是"B[g] 装不装得进",而是"这个核每个 tile 流的是私有 slab 还是共享切片"**
+(2026-08-17 续测,同一台机、同一个 campaign 的**三个核**同时定档,全部部署 M、多回合 palindrome、逐位相同):
+
+| 核 | 每个 tile 流什么 | 最优 band | 把另一个核的赢家搬过来 |
+|---|---|---|---|
+| fwd NT / dgrad NN | `B[g]` = per-expert **私有** slab(8.67 MB > 4 MB slice) | `xcd=8, gm=4` | `xcd=1,gm=2` **−2.26%**;`xcd=1,gm=4` −5.72% |
+| wgrad TN(变-K,收缩 M) | 两个操作数都是 `[M,*]` 的 token-major 切片,**被该 group 的全部 144 个输出 tile 共享** | **`xcd=1, gm=2`**(group-major 窄带) | XCD-仿射矩形/宽带落后 **0.8~1.0%** |
+
+⇒ 前一条「B[g] 装不进 ⇒ xcd=8」只覆盖了**私有 slab** 那一类。**共享切片类(wgrad/变-K)是反的**:整机本来
+就在读同一批行,XCD 分区只会把这份共享**切碎**,所以 `xcd=1`(HW 按 `bid%8` 逐 tile 轮转)+ 最窄的
+group-major 带才对。wgrad 实测 balanced **+0.78~0.98% / heavy +0.99% / 几何 +0.76%**,`gm=1` 掉到 −5.06%
+(带太窄 ⇒ 同驻的 WG 不再共用一段行)。
+⇒ **规矩:同一个 campaign 里也别把一个核的 band 赢家抄到另一个核上**;先按「私有 slab / 共享切片」
+预测方向,再扫 3~5 个点验证单峰。两类的落地都用 pitfalls/06 §静态 lead(竞速只在 balanced 上打分,
+分不出窄带和"同样在 balanced 上赢但 skew 崩"的臂:`(4,6)` 是 heavy −2.0%/几何 −34.6%,`(8,3)` 是 −3.7%/−39.3%)。
+
 ### ★★ 过发射 grid 上做 XCD remap:`total_pids` 必须是**活 tile 数**,不是 grid 上界(2026-08-03 mxfp4 grouped 实测 +1.4% gm)
 
 grouped/MoE 核的 grid 是**上界**(每组 round-up 的最坏情况,`(ceildiv(total_M,BM)+G)*n_blocks`),

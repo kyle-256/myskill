@@ -121,6 +121,17 @@
 - `rocdl.update_dpp / ballot / readlane / readfirstlane`、`llvm.intr_ctpop` 在 flydsl 里都能直接 emit（wave64 的 `ballot` 必须 `res=i64`；`readlane` 的 lane 参数允许传 Python int）。
 - ⚠️ 该 build 的 `llvm.TruncOp.__init__(self, res, arg, overflowFlags, *, loc, ip)` 是**三个位置参数**，按 `(res, arg)` 两参调用直接 `TypeError: missing 1 required positional argument`。**用 `arith.trunci(target_type, value)`**（`flydsl.expr.arith`，签名 `(out, in_, *, overflow_flags=None)`，稳定）把 `ctpop` 的 i64 收成 i32。
 - DPP 前缀扫描要求**满 EXEC**（放 kernel 入口、任何分叉之前），`bound_ctrl=True` 让移入的 lane 贡献 0，就不用再修 bank_mask。
+- **`rocdl.permlane16_swap`(CDNA4)的三个签名坑**（2026-08-18 实测，用于 epilogue 行合并，见 methodology/07）：
+  ① 它是**双结果** op（`vdst_old`/`vdst_new`），`rocdl.Permlane16SwapOp(t, t, a, b, False, False)` 前两个参数是
+  **两个结果类型**不是操作数；取值用 `op.results[0] / op.results[1]`，写成 `op.result` 会 `ValueError`。
+  ② **只吃 i32**：f32 或 packed bf16x2 都要先 `llvm.bitcast` 进 i32、出来再 bitcast 回去（`vector<2xbf16>`
+  的 bitcast 是合法的，无指令代价）。
+  ③ 语义是**交换第一操作数的奇行组与第二操作数的偶行组**（行组 = 16 lane），即
+  `(a.r0,b.r0,a.r2,b.r2)` 与 `(a.r1,b.r1,a.r3,b.r3)`；**不是** lane 内交换高低半，也不是 32-lane 整体互换。
+  推 row 索引时按 `row_half = (lane//32)*8` + `4*result_idx` 展开，别照 DPP 的直觉写。
+- ⚠ **`buffer_store_short_d16_hi` 在 flydsl 路径上拿不到**：epilogue 走 `rocdl.RawPtrBufferStoreOp`，而
+  AMDGPU 后端的 `d16_hi` 存选择只对**通用 store**（`llvm.store` + addrspace(1)）生效。⇒ 想存 packed
+  bf16x2 的**高半**必须自己付一条 `v_lshrrev_b32`。要省掉它只能上 inline-asm（得手工重建 v4i32 SRD）。
 
 ## FlyDSL ThrVal/atom layout 静默错：#1 静默产错结果 bug 源
 
@@ -144,6 +155,22 @@
   - ❌ 别再试：让 bitSize 不能整除 valBits（如 96b/64b = 1.5）。`layoutRecast` 会**静默产垃圾**，无报错，程序员必须自己发现。
 
 - **verify 必须拒绝非法元组**：新 MmaOp/CopyOp 的 verify（`genVerifyDecl=1`）必须拒绝不支持的 `(m,n,k,elemTy)` 元组并给清晰 `emitError`。否则非法配置会静默命中 `emitAtomCallSSA` 的 `return failure()`，且无诊断信息 → 又一条静默错路径。
+
+## `S2RLoaderTr` 的 c0→c2 立即数只在 `n_waves == width // 16` 时才是真跳距(两操作数不同宽度会静默算错)
+
+`gemm_helper.py:S2RLoaderTr._issue_one` 用一个立即数 `RS` 表示 c0→c2 / c1→c3 的 **+64 K-行**跳转。
+代码里写的是 `self.round_stride = n_waves * chunk_stride`,而 `_ptr_off` 的 `W/r_step` 这一对是
+**以 chunk_stride 为单位的位置计数**(`K_log // rows_per_wave`),所以真正的 +64 行跳距是
+`(width // 16) * chunk_stride`。两者**只有在 `n_waves == width // 16` 时相等**
+(最初写它的 8-wave / width-128 情形)。
+
+- **为什么现网没炸**:今天每个 caller 的 A、B 两侧**共用同一个 loader 配置**(如 4-wave wgrad:
+  width=128 / n_waves=4,比值差 2×)。跳错落在两侧是**同一个 K 置换**,而收缩是对 K 求和,
+  所以乘积配对不变 —— 实测两个取值给出的 grad_b **逐位相同(rel 0.0)**。这是"恰好抵消",不是正确。
+- **什么时候会炸**:一旦某个 kernel 给两个操作数**不同的 width**(例如只把 B 侧窄到 64 做边界块),
+  两侧置换不再一致,立刻**静默配错 K 行** —— 实测 maxerr **24**,编译无警告。
+- **规矩**:改窄任何一侧的 `width` 之前,先把 `RS` 换成 `(width // 16) * chunk_stride`;
+  只要还是"一套配置喂两侧",就别为了"修正"去动这个立即数——那是在无收益地扰动热核的 ISA。
 
 ---
 来源: flydsl-sync/SKILL.md, pr-merge-gate/SKILL.md, 03-emit-knobs.md, debug-flydsl-kernel/SKILL.md, FlyDSL/CLAUDE.md, programming-model.md, mxfp8-8wave-devloop/SKILL.md, mxfp8-grouped-gg-devloop/SKILL.md, feedback_flydsl_cache_staleness.md, project_mxfp8_grouped_wgrad_wl.md, remote-sync/SKILL.md, 08-deadends.md, prefetch-data-load/SKILL.md, flydsl-kernel-authoring/SKILL.md, flydsl-tile-programming/SKILL.md, agpr_phase5_lds.md, add-target-atom-op/SKILL.md

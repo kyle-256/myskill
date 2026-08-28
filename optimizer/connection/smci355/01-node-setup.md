@@ -101,6 +101,40 @@ $SSHK "docker exec kyle_dev bash -lc 'export PATH=/opt/venv-tw/bin:\$PATH; \
 - ⚠️ **两个 build 别并行**（ninja CPU 满 + LLVM 易 OOM）→ 串行。
 - 改 csrc 后必 **clean 重编**（`rm -rf build primus_turbo/lib/*.so`），增量 `pip install -e .` 不真重编（旧 mtime/hipify 中间件骗过 ninja）。
 
+## 6d. ★★aiter 升到 turbo 钉的版本(2026-08-20 实测,两层坑)
+
+turbo 在 `primus_turbo/common/aiter_utils.py` 钉 `AITER_VERSION = "0.1.14.post1"`。镜像自带的是
+`0.1.1.dev1611`,**老版 `_flash_attn_forward()` 没有 `out=` 参数** ⇒ 凡是 dispatcher 回落到 aiter 的用例
+全炸 `TypeError: ... unexpected keyword argument 'out'`(attention 两个测试文件 **2309 failed**)。
+
+⚠**四个 venv(`/opt/venv`、`venv-tw`、`venv-syncv3`、`venv-syncv4`)共用同一份 `/workspace/aiter`
+可编辑安装**(`amd-aiter.egg-link`)⇒ 升级会影响所有环境,动之前先确认没有 campaign 在跑。
+
+```bash
+cd /workspace/aiter
+git diff > /workspace/aiter_local_mha_atomicfp32.patch   # 存本地补丁(有人把 is_v3_atomic_fp32 默认 True->False,5 处)
+git rev-parse HEAD > /workspace/aiter_prev_head.txt      # 回滚锚点
+git checkout -- aiter/ops/mha.py
+git -c submodule.recurse=false fetch --no-recurse-submodules --tags -q origin   # ★带子模块会挂在 CK 的 "not our ref"
+git -c submodule.recurse=false checkout --no-recurse-submodules -q v0.1.14.post1
+git submodule update --init --depth 1 3rdparty/composable_kernel                # ★★这一步绝不能漏
+export PATH=/opt/venv-tw/bin:$PATH
+rm -rf /workspace/aiter/amd_aiter.egg-info
+pip install -q setuptools_scm
+GPU_ARCHS=gfx950 pip install --no-build-isolation -e .
+pip install -q 'flydsl==0.2.2'        # ★必须最后:aiter 的 setup.py 会 subprocess 强装 flydsl 0.1.7
+rm -rf /workspace/aiter/aiter/jit/build/mha_bwd_*   # 清掉编译失败的 JIT 产物
+```
+
+**第二层坑(我第一次漏了)**:只切主仓不切 CK 子模块 ⇒ aiter 自己的 `csrc/cpp_itfs/mha_bwd.cu` **编不过**
+(`cu_seqlen_q_ptr` 被当成 `int`、`nhead_q` 窄化成 `float`,典型结构体字段错位),表现为 `FAILED: mha_bwd.cuda.o`,
+剩 **182 failed**。v0.1.14.post1 要求 CK `10cb6916c`,而本地停在 `+7968368d9`(`git submodule status` 前缀
+`+` 就是不一致)。同步后 **7090 passed / 0 failed**。
+
+**遗留**:版本串是 `0.1.14.post2.dev0+g0f3c58e6e.d20260820`(`.d` 后缀=树 dirty),turbo 的 `_versions_match`
+只 warn 不阻断;本地补丁未重打(turbo 自己显式传 `is_v3_atomic_fp32`,走 `PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32`)。
+**副产品**:我 memory 里长期记的"ragged varlen 走 AITER 回退、dk/dv SNR 只有 6.6dB"其实就是这个老 aiter,一并好了。
+
 ## 7. 从 agent sandbox 同步代码（rsync，用 .ssh_laptop key）
 ```bash
 cd /workspace/code/gpt_oss_docker/sync/meta-attn/meta_aiter_attn/flydsl
@@ -318,3 +352,52 @@ cat /workspace/code/.ssh_docker/id_ed25519 | <wrapper> 'docker exec -i kyle_dev 
   (本地 `~/.ssh` 只有 `campaign_key_ed25519`,默认 key 上不了 github)。
 - ★ **目标 commit 不在任何分支上时**(如别人 PR 的 merge commit),`git fetch origin <40位sha>` 可**直接按
   sha 取**(实测通,`--depth 1` 的 clone 也适用);别去拉 `refs/pull/*`(几分钟且常超时)。
+
+---
+
+## ★★ 2026-08-20 容器镜像固化 + tar 包(这台第一份;起因=容器被外部重建、5 个 venv 全丢)
+
+**为什么要有**:2026-08-18 12:42 `kyle_dev` 被外部重建(`docker inspect` 的 `Created` 会告诉你),
+`/opt/venv*` 全部消失 —— venv 装在容器 rootfs 里、**不在 bind mount 上**,容器一没就全没。
+当时是照 `_setup_smci_<env>.sh` 一步步重建回来的(clone venv→挪实体包→写 .pth→补 .so→pip flydsl 0.2.2),
+有包就不用再走一遍。chi 那份 `mlperf_gptoss-20260811-flat.tar.zst` 在 `/mnt/vast/kyle/code2/docker_images/`,
+但 **chi 集群 08-11 整体失钥后不可达**,且 smci355 上的 `/mnt/vast` 只是根盘上的空目录、没挂 vast。
+
+**包在哪(两份,内容 md5 相同 `d11145082e441cc00e6d1815010e1e33`)**
+| 位置 | 用途 |
+|---|---|
+| `/data/kyle_0814/docker_images/kyle_dev-20260820-flat.tar.zst` | 节点本地(`/dev/md0` 49T),恢复最快;节点重装即失 |
+| `/home/xianzhao/code_from_juicefs_20260623_0233/docker_images/kyle_dev-20260820-flat.tar.zst` | NFS,跨节点灾备;**= agent 侧 `/workspace/code/docker_images/`**(同一份挂载) |
+
+⚠ **`/data` 根下的惯例是每人一个用户名目录**(`kgoginen` / `zhuang12` / 我们的 `kyle_0814`)。
+别在根下另起目录(第一次建了 `/data/kyle_images`,是错的,已删)—— 自己的东西一律放 `kyle_0814/` 下。
+
+- 19G 压缩 / 93.8G 解压;`docker commit` 出的镜像 `kyle_dev:saved-20260820` (113GB) 也留在本地 docker 里。
+- 含**全部 5 个 venv**:`/opt/venv`(mxfp4) + `/opt/venv-tw` + `/opt/venv-syncv3` + `/opt/venv-syncv4` + `venv-mxfp4`,
+  已逐个 `tar -tf` 验过 `bin/python3.12` 在包内。
+
+**打包步骤(实操,~2min export + ~30s 校验)**
+```bash
+docker commit kyle_dev kyle_dev:saved-<date>              # 2m09s,113GB
+mkdir -p /data/kyle_0814/docker_images
+docker export kyle_dev | zstd -T0 -12 -f -o /data/kyle_0814/docker_images/kyle_dev-<date>-flat.tar.zst.partial
+echo "PIPE=${PIPESTATUS[0]}_${PIPESTATUS[1]}"             # 必须 0_0
+zstd -t -T0 <.partial>                                     # 完整性
+zstd -dc <.partial> | tar -tf - | grep -E '^opt/venv[^/]*/bin/python3\.12$'   # 5 个 venv 都要在
+mv <.partial> <定名>                                       # 校验全过才定名
+```
+- 写 `.partial` 是防半包被当成品;`PIPESTATUS` 双段都要查 —— **只看 `$?` 取的是 zstd 的码,docker export
+  报错走 stderr 而 zstd 仍成功**,会误判(见 `../common/03-docker-disk-crash-guard`)。
+- 这台 docker root 在 **`/data`(44T 空闲)**,不像 chi2798 根盘 95% 满,所以 `docker save` 分层格式其实也跑得动;
+  仍走 `export` 是为了**恢复步骤与既有文档一致**(`docker import`),少一套心智负担。
+
+**恢复(扁平包 → 必须 import,不是 load)**
+```bash
+zstd -dc /data/kyle_0814/docker_images/kyle_dev-20260820-flat.tar.zst | docker import - kyle_dev:saved-20260820
+# 然后照本卡 §3 的固定 flag 起容器(run 显式带 sleep infinity + venv 全绝对路径,
+# 不依赖镜像 ENV/CMD,故 import 丢元数据无影响)
+```
+⚠ 恢复后仍要确认 **finder/.pth 指向本机 repo 路径**(§4 的隔离 assert):包里固化的是打包时的指向。
+
+**边界**:`docker export` 自动排除 bind mount,所以 `/workspace/code` 下的源码/build 产物**不进包** ——
+这正是想要的(源码走 git,镜像只固化 rootfs:pip 包、apt 包、venv、editable 指针)。

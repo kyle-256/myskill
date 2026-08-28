@@ -44,6 +44,8 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | **store/LDS-bound** 想减 store | 00-decision-index §B → pitfalls/03,05 |
 | **quant/scale** 慢 | 00-decision-index §C → methodology/11,12 → pitfalls/05 |
 | **测量数字不可信 / DVFS 漂移** | pitfalls/02 → methodology/01 |
+| ★**周期口径的杠杆全排完了,kernel 还是慢** | **methodology/03 §Power/clock-bound** —— 换能量坐标系;MFMA 原子选择是能量杠杆(单轮 +9.17%),且 `SQ_VALU_MFMA_BUSY_CYCLES` 看不见它 |
+| ★**TF/s 读数低得离谱,尤其只有对手的一半** | **pitfalls/02 §逐次 synchronize** —— 先确认不是把**主机入队时间**算进了 GPU 窗口(踩证:650 vs 真值 1150) |
 | **build 失败 / 同步出错 / undefined symbol** | pitfalls/08 → connection/common/04 |
 | **跨代移植**(gfx942/RDNA)编译/数值错 | pitfalls/11 |
 | **flydsl 前端**(tracer/JIT/if-for)报错或静默错 | pitfalls/07 → methodology/09 |
@@ -77,7 +79,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [crusoe/01-access-spur-container](connection/crusoe/01-access-spur-container.md) — 登录(csh坑/host key轮询/node-ssh)+login红线(Guardian杀内存)+spur账号关联+**容器=节点dockerd+docker run**(spur --container-image是死路)+docker-exec引号helper+两venv build(clone pip-shebang污染/flydsl 0.2.2 egg坑/git safe.dir)+存储(/shared_nfs/kyle)+已验证dq 1100TF
 
 ### connection/smci355/ — smci355 SLURM+docker 节点连接卡（2026-07-20 迁移，chi 跳板挂掉后）
-- [smci355/01-node-setup](connection/smci355/01-node-setup.md) — 直连(.ssh_laptop key/IdentitiesOnly)+sbatch(--partition=Compute-DCPT)+起 kyle_dev(rocm/primus:v26.3)+FlyDSL pip 0.2.2(镜像自带 dev409 缺 expr.math)+meta-attn(FAST=0/FLYDSL_EXTRA_SOURCE_DIRS)+两套 turbo(mxfp4 /opt/venv、tensorwise /opt/venv-tw,CK 从 mxfp4 拷)
+- [smci355/01-node-setup](connection/smci355/01-node-setup.md) — 直连(.ssh_laptop key/IdentitiesOnly)+sbatch(--partition=Compute-DCPT)+起 kyle_dev(rocm/primus:v26.3)+FlyDSL pip 0.2.2(镜像自带 dev409 缺 expr.math)+meta-attn(FAST=0/FLYDSL_EXTRA_SOURCE_DIRS)+两套 turbo(mxfp4 /opt/venv、tensorwise /opt/venv-tw,CK 从 mxfp4 拷)+**★镜像 tar 与恢复:`/data/kyle_0814/docker_images/` 与 NFS `docker_images/` 各一份 19G,容器被重建时 `docker import` 秒回,别再手搭 5 个 venv**
 
 > ⚠️ connection/ 是 env-specific 层:只放**你自己环境**的连接卡;相邻/别人的环境(名字相近的容器·盘)严禁在此混入或触碰,见上「环境红线」。
 

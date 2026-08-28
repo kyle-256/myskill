@@ -60,6 +60,38 @@
 
 - ❌ **别再试**：8-wave / BK128 换 occ=2 藏 store。原生 occ=2 的 8-wave kernel 在 store-bound 形状实测**全负**：28672 −14%、6144³ −20%、8192²×4096 −20%。occ=2 能藏 7-15% store，但 8-wave compute 赤字 14-20%（per-warp tile 减半→B 复用减半→ds_read/mfma 翻倍）远大于收益。与 4w+BK128 −13% 同结论。（project_mxfp4_epilogue_store.md）
 
+## ★ 反面情形：候选是好的，但**竞速的打分 M ≠ 部署 M** ⇒ 它永远选不到 ⇒ 落地形态是「静态 lead」
+
+（2026-08-17 gpt-oss-20b down-projection padN dgrad NN 实测；与上一节「别接永不被采纳的候选」是同一枚硬币的两面）
+
+- **症状**：某个 `(num_xcd, group_m)` 在**部署形状**上稳定 +2.5~2.9%（逐位相同、5 回合 palindrome、三分布两正一中性），
+  但生产竞速**每次都选另一个**。查竞速口径才发现：它在 `canonical M = (1024, 8192) tokens/expert` 上取几何平均，
+  而这条算子**部署在 4096**。该臂在两个打分点是 −0.94% / +0.54%（几何 ≈ +0.2%）⇒ **过不了 1.5% 采纳门**。
+  ⇒ 竞速跑一万次也不会选它；这不是噪声问题，是**打分点与部署点错位**。
+- **判据**：任何 knob 都要在**部署 M** 上扫一遍再看竞速结论。竞速的 canonical M 是为了「一把钥匙开一族形状」，
+  代价就是**部署点可能落在两个打分点之间的凹处**。M-敏感性表（本例 1024 −0.94 / 2048 +0.32 / 4096 +2.5~2.9 / 8192 +0.54）
+  是判断「该不该给静态 lead」的必备证据。
+- **落地形态 = 静态 lead，不是新候选**：把它做成候选只是白占槽位（上一节）。正确做法是
+  **在一个能唯一识别部署形状的谓词上把候选表 reorder**，让它当 base、原 base 退化成「要赢 1.5% 才能顶掉」的挑战者。
+  本例谓词 = `n_stride != 0`（只有 N-padded 的 MoE projection 走这条路），因此**其余所有调用者的候选表与顺序逐字节不变**。
+- ⚠️ **静态 lead 必须复验「竞速没把它顶掉」**：写个探针，把**真入口**（含竞速）与两个候选的**直接编译产物**
+  在一个进程里 palindrome 计时。本例 prod 850.2 µs 贴 cand_x8g4 847.9、离 cand_x4g8 859.8 ⇒ lead 生效。
+  只看 bench 总分是看不出来的（差 1.4% 会被链稀释到 0.3%）。
+- ⚠️ **别用 heavy-skew 的链级比值单读去判死一个 ±2% 的核内 knob**：本 campaign 早前一轮就是这么把这个臂
+  以「heavy −5.68%」拒掉的，回到孤立核 5 回合逐位相同重测是 **heavy +2.49%**（min +2.43 / max +2.70），没复现。
+  链级 heavy 比值自身跨轮就有 ~3% 的行程，分辨不了 2%。
+- ⚠️ **静态 lead 要在「它的谓词覆盖到的每一个维度」上验非负，不能只验部署点**（2026-08-17 同 campaign 的 wgrad TN 一笔）：
+  谓词通常识别的是**形状族**（本例 `m_real or n_real` = padded-operand），而族里还含着别的 M ⇒ lead 会作用到那些 M 上。
+  wgrad 的 `(group_m=2, num_xcd=1)` 四点全非负（1024 **+1.47** / 2048 +0.27 / 4096 +0.78~0.98 / 8192 +0.95%），
+  可以放心把门开到整族；而同 campaign 的 NN lead（x8g4）在 1024 是 **−0.94%**，门就得更窄或接受那一档的损失。
+- ✅ **静态 lead 的正确降级行为**：lead 只是 base，竞速仍照跑。上面 wgrad 在 M=1024 处 `prod` 316.9 µs
+  **比 lead 自己（324.3）还快 2.3%** ⇒ 那里竞速用更好的候选把 lead 顶掉了。这是健康的：
+  **lead 保证不比原 base 差，竞速保留在别的点上超过 lead 的自由**。若某处 `prod` 比两个候选都慢，才是 bug。
+- ⚠️ **写探针时 group_offs 的两种口径别串**：`_balanced_group_offs` / `_skewed_group_offs` 返回的是 int64 offsets 的
+  **int32 view**（kernel 要的就是它）；但公共入口 `grouped_gemm_fp8_tensorwise_flydsl_kernel` 对 int32 输入会
+  `.to(int64)` 再 `.view(int32)` ⇒ 把 66 个 int32 当 66 个 int64 升位，offsets 全错，**直接 Memory access fault**
+  （不是 SNR 掉，是 GPU 挂）。喂公共入口传 `.view(torch.int64)`，喂 `_compile_*` 产物传 int32 view。
+
 ## persistent vs 非持久 / vmcnt_hint：fwd/dgrad 非持久优、wgrad 小-M 持久优
 
 - **fwd/dgrad 用非持久 (non-persistent)**：每 WG 做完一个 tile 后直接 `s_endpgm`，不进 `scf.for` 循环。持久内核会吃 `scf.for` 调度惩罚 **~11%**，非持久省掉这部分。WHY：fwd/dgrad tile 数与 CU 匹配良好，无需持久复用。

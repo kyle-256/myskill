@@ -91,3 +91,26 @@
 
 ---
 来源: remote-sync/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, flydsl-sync/SKILL.md, claim-mi355x-node/SKILL.md, build-flydsl/SKILL.md, fp8-gemm-bench/SKILL.md
+
+---
+
+## ★ 远端探针/臂-harness 的六个坑(2026-08-26 bf16 grouped 三场沉淀)
+
+1. **`remote.sh` 已经 cd 进容器仓库** `/workspace/code/mxfp4/Primus-Turbo`,而 `/workspace/Primus-Turbo` 还有一份陈旧 checkout。
+   自己再 `cd /workspace/Primus-Turbo` 会静默跑错树 —— 它 `ls` 起来就像个 Primus-Turbo 仓库,**唯一的破绽是你的探针文件不见了**。
+   ⇒ 永远不要在 `remote.sh` 的命令里 cd。
+2. **同步过来的树是只读的**:`cp` 覆盖源文件报 Permission denied,但 **`sed -i` 可以**(它换 inode)。
+   ⇒ 用 `cp` 搭的臂循环会**静默地把参考臂测六遍**。`open(path,"w")` 同样 PermissionError,改写 `path+".tmp"` 再 `os.replace`。
+   (那次失败也有用:六次同二进制读数 1.5449-1.5501 = **0.34% 噪声地板**白捡一个。⇒ 干脆**故意**在每轮放一条同二进制对照臂。)
+3. **臂 harness 按「编辑」而不是按「文件」备份会毁掉原件**:两次编辑落在同一文件时,第二次
+   `os.replace(path, path+".orig")` 把第一次的备份覆盖成已打补丁的文本,`restore` 就把补丁版放了回去。
+   更糟的是 rsync 按 mtime+size 比较,**会跳过重传**,于是污染活过下一次调用,下一条臂以 anchor count=0 失败
+   而参考臂还在跑、看起来还挺合理。⇒ 每个**不同文件**的原文在内存里各存一份,`patch` 放进 `try`,必要时 `touch` 强制重传。
+4. 不要在远端调用开头用 `rm -f` 清理遗留的 `*.orig`,也不要在 import 时"从备份恢复" —— 两者都可能毁掉 rsync 刚送到的好文件。
+5. **同一个常量在 NT 和 NN 两处出现且上下文完全相同**(`nt_vmcnt=3` 在 `grouped_gemm_bf16_kernel.py` 的 651 行和 820 行,
+   前面五行参数一模一样,没有任何唯一的多行锚点)⇒ **按行号打补丁**,否则你以为在改 fwd,实际改的是 dgrad。
+6. **共享 checkout 里探针目录会撞名**:`_probes_r15/` 已被另一场(NN autotune)campaign 的 r15 占用。
+   ⇒ 探针目录按**算子**而不是按轮次命名:`_probes_fwd_rNN`。
+
+★ **在负载中采功耗**:`amd-smi metric -p --csv | tail -1 | cut` 返回空,`amd-smi metric -p | grep SOCKET_POWER` 可用。
+python 线程采样器也没用 —— 一次 amd-smi 调用比一个 40 次迭代的窗口还慢 ⇒ 从 shell 对着一个跑 ~20 s 的 `spin.py` 采。

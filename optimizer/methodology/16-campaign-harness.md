@@ -28,7 +28,12 @@ Claude 预算紧就用 cursor 版,行为一致。**两者都从不 push**,所有
 - **REVIEW**(最后 `--review-rounds` 轮):按 code-review 方法论修,然后把**所有 kept commit squash 成一个**(作者 kyle-256,无 AI 署名)。
 
 每轮的判定链:
-- 候选跑 `--repeat` 次(默认 3),**取 MAX**(理由:选最少被节流的一次)→ 与 `best_score` 比。
+- 候选跑 `--repeat` 次(默认 3),**取 MEDIAN** → 与 `best_score` 比。
+  ⚠ **代码里有两处过时文本会骗你**:`--repeat` 的 argparse help 写着 "MAX is taken (least-throttled)",
+  轮次日志打印 "(3 reps, best)",字段也叫 `cand_best` —— 但实现是 `return median(scores)`
+  (`cursor_campaign.py` 的 `_measure`),函数注释与 `raw_scores.jsonl` 落盘的 "(median of [...])" 才是对的。
+  实测佐证(mxfp4_quant 场,14 个轮次逐个核对):`cand_best` **无一例外等于三读中位数**,没有一次等于 max。
+  例:baseline [3539.2, 3526.8, 3523.0] → `base_score` 3526.8;r15 [3924.1, 3896.5, 3894.2] → 3896.5。
 - 涨幅 ≥ `--keep-threshold`(默认 0.5%)才 **KEPT**(commit 成新 best);否则 "no new best" 但**保留工作副本继续迭代**。
 - 连续 `--revert-patience` 轮没新 best → 工作副本回滚到 best(给"先降后升"的重写留空间)。
 - 连续 `--stall-window`(5)轮累计涨幅 < `--stall-threshold`(2%)→ 插一轮 **REPLAN** 重写 goal。
@@ -115,6 +120,9 @@ goal 里最贵的一节不是目标定义,是**死路清单**。agent 只知道�
 
 1. **最后一行 stdout 是 JSON**,含 `ok`(bool)与 `--score-key`(数值)。其余输出随便打。
 2. **正确性门写在 bench 里**:SNR ≥ 阈值 **且** 逐字节确定性 → `ok`。`ok=false` 的候选无论多快都不计分。这是唯一防"改坏换性能"的闸。
+   ★★**SNR 单独顶不住偶发竞态**:2026-08-19 那个 half-M 折叠让 wgrad 有 25% 的冷跑逐位不一致,
+   但错的只有 127/47M 个元素 —— 对 SNR 毫无影响,整场 campaign 全程 `ok=true` 就这么出货了。
+   **逐位确定性这一半不能省**,而且要在**多次冷跑**里查(单进程内跑两次常常都对)。
 3. **热稳态计时**:连续满载预热(**不要 sleep**),再取中位数。
 4. ★★★**只计分一个 shape,campaign 就会拿别的 shape 去换分,而且日志里看不见**。踩证:fwd campaign 只计分
    full-causal S=16384,某一轮的 GQA-merge 买到 full-causal +1.8%、却让同形状 **SWA −12.2%**,而出货比例是
@@ -222,7 +230,10 @@ resume 只读 `state.json` 的进度,**参数取自 launcher 脚本** —— 所
 7. ★★**campaign 的 worktree 一删,收官 commit 就变游离**。分支头停在中途某轮(实测停在 r17=875.3),而真正的收官版(891.4)是个没有任何 ref 指着的 dangling commit,随时可能被 gc。**收官后立刻 `git branch <name> <squash_sha>`。** 判断"哪个是最终版"要看 `state.json` 的 `best_score` + run.log 的 `campaign done` 行,**不要看分支头**。
 8. **并发 campaign 的 `--gpu-pool` 不能重叠**。两场都含 GPU 6 时,任一场自动切卡就会两个 bench 抢同一张卡 —— 症状是分数**腰斩到约一半**(同一份 job 被并发执行)。
 9. `manager_status.md` 与 `state.json` 不一致时信后者(§4)。
-10. **`--repeat` 取 MAX,系统性偏高**(实测约 +0.2%,机器抖动大时更多)。验收要自己另跑中位数,见 §7。
+10. ★**别信 `--repeat` 的 help 和 "cand_best" 这个名字:实现取的是 MEDIAN**(§1)。
+    曾据 help 文本写成"取 MAX、系统性偏高约 +0.2%、验收要另跑中位数抵消"——**那条推论是错的,已作废**。
+    取中位数意味着**单次抖动不会把候选抬进 KEPT**,但也意味着**三读里只要有一读被邻居打崩,中位数就会
+    被拽下去**(见第 13 条)。验收仍要自己复跑,但理由是换尺子/换机器,不是抵消什么偏高。
 11. crusoe 后端的文件队列**单目录严格串行**:`.job` 迟迟不变 `.done` 先看 `ls -lat $Q/*.done`,可能只是排在队友的长 bench 后面,不是 agent 死了(`connection/crusoe/01` §4.-2b)。
 12. ★★★**一轮 CRASH 之后,工作区可能被回滚到最近一次 *commit*,把没提交的"KEPT_WIP"轮全部丢掉**。
     踩证(2026-08-01):r10 在收尾的 `rocm-smi` 上 TimeoutExpired 崩了;harness 回滚工作区,而
@@ -306,7 +317,8 @@ campaign 自报的数**不能直接当结论**。逐条过:
 
 1. `ok=true`、SNR ≥ 门限、`det=True`(从 `raw_scores.jsonl` / bench 输出确认,不是听 agent 说);
 2. **远端 md5 == 本地 HEAD** 的对应文件(防止测的是别的版本);
-3. **单独复跑取中位数**(≥5 次),抵消 `--repeat` MAX 的偏高;注明冷/热;
+3. **单独复跑取中位数**(≥5 次);注明冷/热。
+   (harness 本身已经取中位数了 —— 复跑是为了换一张卡/换一个时段验证,不是为了抵消什么偏高,见 §6.10。)
 4. 顺带跑一遍多形状正确性扫描(varlen / SWA / 非整 tile / 小序列),别只信打分那一个 shape。
 5. ★★**把目标文件 dispatch 的每一条分支都调一次真入口** —— 不是只跑计分的那几格。
    计分口径就是 campaign 的全部视野:**没被计分的兄弟路径可以被改断而全程不报警**。
@@ -366,11 +378,17 @@ cp <live_repo>/<bench>.py $V/ && cd $V && python3 <bench>.py    # 脚本目录�
     差 0.07%(噪声内)⇒ 确认无行为改变,`best_score` 取**提交后**那个数。
     (反例:r19 那次 hook 一次通过、diff 规模未变,就不必重测。)
 
-22. ★★**ratio 类 score 必须 ×100 再交给 harness**。日志打分数用 `round(s, 1)`,
-    对 TF(4139.5)刚好,对 0.97 这种比值会被压成 `"1.0"` —— **整场日志全是 1.0,读不出任何增益**,
-    监控和纠偏都瞎。第一次起场就踩了(dir 20260811_042510 作废重起)。
-    ⇒ bench 里同时输出 `gm_ratio`(原值,给人看)和 `gm_ratio_pct = ratio*100`(给 `--score-key`)。
-    ⚠ goal 里的目标值要跟着改成百分比,否则 agent 会拿 1.10 去对 100.5 的分数。
+22. ★**ratio 类 score 最好 ×100 再交给 harness,但真正致盲的只有「比值一整场卡在同一个十分位」**。
+    日志的**每-rep 读数**用 `round(s, 1)` 打印,对 TF(4139.5)刚好,对比值会压精度。
+    - **会致盲的情形(踩证 dir 20260811_042510,作废重起)**:ratio 全程 ~0.97、从没越过 1.0,
+      于是 `round(s,1)` **每一行都是 `"1.0"`**,连大方向都读不出。这种才该 ×100。
+    - ★**反例(gpt-oss padN 全链路场,20260817_065611):raw `ratio` 直接交 `--score-key`,全程没 ×100,
+      campaign 照跑 12 轮不瞎**。原因:比值**跨越了一整个十分位**(base 1.0→best 1.368),每-rep 行显示
+      `1.0/1.3/1.4` 已能看出大 arc;而**亚十分位的增益靠另外两处满精度信号**读:run.log 的
+      `round N: KEPT gain=+0.51%, best -> ...` 行和 `state.json`/`raw_scores.jsonl`(存 1.36811 全精度)。
+      ⇒ **判据不是「是不是比值」,是「比值会不会一整场卡在一个十分位」**。会,就 ×100
+      (bench 同时输出 `gm_ratio` 原值给人看 + `gm_ratio_pct=ratio*100` 给 `--score-key`,goal 目标值跟着改百分比);
+      不会(会明显跨十分位),raw 比值即可,靠 `gain=%` + `state.json` 读细粒度,别被每-rep 那行的 `round(s,1)` 误导成「没增益」。
 
 23. ★★**收官核对 `git diff --stat` 的基准选错 = 漏检探针**。我核 `<上一场 kept>..<本场 squash>` 得出
     "零探针夹带",实际 `_probe_wgcfg.py` 是**上一场那个 kept commit 自己带进来的**(§6.17),
@@ -403,3 +421,141 @@ cp <live_repo>/<bench>.py $V/ && cd $V && python3 <bench>.py    # 脚本目录�
        否则不知道收益出自哪一半(本场就测出配对门单独用反而压低 min)。
     6. 过了就 `commit`(只 add 目标核、`kyle-256` 署名),然后按第 21 条**在提交后的版本上重测**,
        再把 `best_score` / `kept_commits` / `rnum` 写回 `state.json`(旧值备份)。
+
+27. ★★★**A/B 开关可能根本没打到被测代码 ⇒ baseline 是「自己 vs 自己」的空 A/B,ratio≈1.0 + 两臂逐字节相同
+    看起来像「改动中性」,其实是尺坏了**。踩证(gpt-oss padN 全链路场,20260817_065611,R1 分析轮抓出):
+    bench 用 `import primus_turbo.pytorch.ops.grouped_gemm_fp8 as ggf8` 再 `ggf8._PADN_ENABLED = True` 翻开关,
+    但 `ops/__init__.py` 的 `from .grouped_gemm_fp8 import *` **把同名子模块属性覆盖成了那个 re-export 的函数对象**,
+    所以 `ggf8` 是**函数不是模块**,赋值只给函数挂了个没人读的属性,`forward()` 读的模块全局永远 False ——
+    **两条臂跑的都是 padK**。baseline bench 实测 `ratio=0.9978, match_rel=0.00e+00`,看着像「padN≈break-even」,
+    实为空操作;修好开关(op 里 `use_padn = _PADN_ENABLED or getattr(<函数对象>, "_PADN_ENABLED", False)` 两处都读)
+    后真实基线才掉到 **0.855**。
+    - **判据 = baseline 上「ratio≈1.0 **且** 两臂 match/diff 逐字节为 0」**。这正是 `pitfalls/02` 的「同进程 A/B
+      静默同二进制」指纹,只是这次它出现在 **baseline**、且被 goal 里写的旧基线数(0.86,来自别的量法)背书,
+      极易被当成「起点就接近 ship 线」放过去。**起 campaign 第一件事:用独立探针强制翻开关(绕过 bench 的
+      import 方式),确认两臂时间/字节**真的分岔**,再信 baseline。** module-attr vs re-export 函数对象、
+      `from x import *` 遮蔽、`getattr` 打在错对象上,都是常见成因。
+    - ★**修尺会「暴露」一个被掩盖的真回归 ⇒ 单独提交会被 orchestrator 当回归 revert,必须和补偿性 win 原子提交**。
+      本场单修开关会让 ratio 从 0.9978 掉到 0.855(真相,不是回归),若单提这一笔,harness 见分数暴跌直接 revert、
+      连尺都留不住。R1 的做法:**修开关 + 4 条纯 wiring 杠杆打成一个原子补丁**,一起过 bench(实测 ratio=1.1113)才 KEPT。
+    - ★**诚实对账**:修尺后拿到的 +11% 里,约 −618µs 是 padN 专属收益、约 −285µs 是 **padK 也能拿到的通用 K-pad
+      收益**(Triton→flydsl 后端切换等现代化),扣掉通用项 padN 净胜仍有 ratio 1.034。收官报吞吐时把「专属收益」和
+      「换谁都能拿的通用收益」分开写,别把通用现代化的功劳算到本 campaign 的 geometry 头上。
+
+28. ★★★**GPU-hang 的候选会让整场 campaign 永久卡死,`--repeat` 的 1200s 超时救不了你**
+    (2026-08-18 mxfp4_quant 场 r17,卡了 25 分钟才被人发现)。两层叠加,要分开记:
+
+    **(a) 根因 —— 编译期 trip count 与运行时圈数不符 ⇒ GPU 循环不终止。**
+    该轮唯一的实质改动是给 wholeloop 传 `nval_ct=(KI_LOOP // 2) * 2`(自称 "unlocks the static skew ring")。
+    ★**判据 = `rocm-smi` 显示 GPU use=100% 但功耗只有 363W**(该卡满载 fp4 GEMM 应在 600W+)。
+    100% 占用 + 低功耗 = **少量 CU 在空转**,不是"算得慢";主线程 100% CPU 是卡在 `synchronize()` 自旋
+    忙等,**不是在编译**(编译会有 clang/comgr 子进程或 hipcc,`ps --ppid` 一查便知)。
+    py-spy/gdb 在容器里通常都没有,别指望抓栈 —— 用功耗判就够了。
+
+    **(b) harness 缺陷 —— `run_bench(timeout=1200)` 杀不掉挂死的 bench。**
+    `subprocess.run(timeout=)` 只 kill **直接子进程**(`/bin/sh`),孙子 `ssh` 存活并继续持有 stdout 管道,
+    于是 `communicate()` 永远等不到 EOF —— **连 `TimeoutExpired` 都抛不出来**,主进程死在 `do_poll`。
+    症状:run.log 最后一行停在 "benchmarking candidate",进程还活着(`ps` 正常)、日志 mtime 却不再更新。
+    **`ps -o wchan` 看到 campaign 卡在 `do_poll` 就是这个。**
+    解法:外挂看门狗,只杀跑超阈值的那个 bench 进程(**不是停 campaign**,杀掉后 harness 会自己判
+    `empty result → retry`,4 次耗尽后 `FAILED gate (rc=137)` 正常判负进下一轮)。
+    模板见 `sync/syncv4/_bench_watchdog.sh`;阈值取正常耗时的 100 倍以上(该场正常 3s / 阈值 360s)。
+
+    **(c) 善后:进程杀掉后 GPU 仍 100%,孤儿 queue 不会自愈。**
+    容器内 `rocm-smi --gpureset` 报 `Not supported on the given system`,**必须到 host 上 sudo**
+    (smci355 的 xianzhao 有免密 sudo):`sudo rocm-smi -d <N> --gpureset` → `Successfully reset GPU N`。
+    ★reset 前必须确认该卡无任何 KFD 进程(`rocm-smi --showpids`,**第 3 列才是 GPU 号**),
+    共享机器上别误伤邻居。
+
+29. ★**三读跨度是判"邻居抢卡 vs 真回归"的硬指标**(mxfp4_quant 场 14 轮全量统计)。
+    正常轮三读跨度 `(max-min)/min` = **0.15% ~ 1.05%,中位 0.72%**;
+    被邻居(sglang 服务,占 112GB VRAM + 1.4TB SDMA)挤的那一轮 r16 = **15.82%**,分数被拽掉 28%。
+    ⇒ **跨度 >5% 先怀疑争用,不要归因到代码、更不要据此回退改动**。
+    因为 harness 取的是中位数(§1),三读里坏掉一读就足以把候选打成"大幅回归"。
+    交叉验证手段:`rocm-smi --showpids` 看邻居 VRAM/SDMA,以及计分卡的功耗/频率是否被顶到上限。
+
+30. ★★★**清缓存要连 comgr 一起清,否则你测的是旧二进制**(2026-08-19,追 mxfp4 wgrad 逐位不确定性)。
+    harness 每轮只 `rm -rf /root/.flydsl/cache`,但 **`/root/.cache/comgr` 也缓存编译产物**。
+    漏清的后果不是慢一点,是**改了 kernel 却在跑旧代码**:我因此连续拿到 90 次冷跑零失败,
+    据此宣布过一次"修复完成"(无效),中间整段 A/B 全部作废。清干净后失败率立刻从 0 回到 25%。
+    **手测冷跑的正确前置**:
+    ```bash
+    rm -rf /root/.flydsl /root/.cache/comgr
+    find <repo> -name __pycache__ -type d -exec rm -rf {} +
+    ```
+    ⚠ 这条同样解释了为什么"关掉某旋钮就好了"可能是假象 —— 两次跑的其实是同一份缓存二进制。
+
+    **配套:低频偶发 bug 的判定纪律。**
+    - "跑 N 次全过"**不是**修复的证据。25% 失败率下 8 次全过的概率有 10%;3% 残留率下 30 次全过是常态。
+      我先后用 8 次、30 次全过误判过两个"根因",都被后续数据推翻。
+    - **判据必须双向**:关掉必好 **且** 单独打开必坏,每组 ≥20 次冷跑,同一台卡同一套清缓存流程。
+    - **定位靠逐旋钮二分,不靠猜机制**:全关 → 单开 A / 单开 B / 单开 C。本场四个机制假设
+      (B-scale 交错映射、workspace 未初始化、prologue 缺 `vmcnt(0)` barrier、half-N 折叠)
+      全被实验证伪,其中 barrier 那个的推理**看着完全自洽**(whole-loop 的 phase barrier 确实留
+      `vmcnt(10)` in-flight)、实测却是失败率不降反升。二分只花了三组对照就锁定真凶。
+    - 失败率低到 ~3% 时,通过率对比已无判别力 ⇒ 改为**抓现场**(`-x --tb=long` 循环跑到失败),
+      拿到"哪个用例/哪个张量/哪个索引"才能定性。最初锁定 half-M 折叠,靠的正是错误坐标
+      `(5, 2878, 212)` 落在 `N=2880` 的边界尾块里。
+
+31. ★★★**远端测试前必须 rsync,否则你测的是别人的 commit**(2026-08-21,K256 odd-nval 定位)。
+    比 comgr 更阴的一种"测错东西":做基线对比的脚本会 `git checkout <base> -- primus_turbo/` 再
+    rsync 过去,**收尾只恢复了本地工作树、没有再 rsync**。之后我连跑 `360 passed ×3`、
+    `2112 passed ×2` 全绿,据此写了"修复完成"——实际远端躺着的是 `origin/main`,一个字节我的改动都没有。
+    是随后带清缓存的交替 A/B 拿到 `FIX 21/22/22 vs OFF 57/56/59` 才把这段结论推翻。
+    **纪律**:
+    - 每次远端 pytest/bench 之前**紧挨着**做一次 rsync,别依赖"上一步应该同步过了";
+    - 基线对比脚本收尾要**既恢复本地又 rsync**,并在最后打印远端文件的 md5/`git hash-object` 复核;
+    - 一份结论只要跨过了 `git checkout`/`git stash`/切分支,就默认它可疑,重测。
+    ⚠ 这条和第 30 条是**同一类错误的两种载体**(缓存 / 传输),都表现为"改了却没生效",
+    而且都会先给你一串漂亮的绿色。判据同样是双向 A/B:**OFF 必须复现失败**,否则你没测到自己的改动。
+
+32. ★★**"某个 group 恒定出错"是结构信号,不是随机**(2026-08-21,同场)。
+    6/6 次失败全落在 `grp=5`、且该组 `nval` 恒为 1 ⇒ 立刻怀疑 tile→WG 的映射而不是数值。
+    `_WGT=2` 让一个 WG 从**首尾两端**各取一个 tile,把 `_WGT=1` 一开就全绿 —— 三分钟锁定
+    "第二个子 tile 被上一个污染"。**手法**:先按 (group, nval, blk0, rowtile, coltile) 打表,
+    再拿"关掉分块/换顺序"这类**几何旋钮**做二分,比逐条读 kernel 快一个量级。
+    ⚠ 交换两子 tile 顺序后**全绿**这一点很重要:说明污染是有方向的(A→B 坏,B→A 不坏),
+    据此可以断定是"前一个 tile 的遗留",而不是"某个 tile 自身算错"。
+
+---
+
+## ★★ 两个 harness 级改进(2026-08-26,三场 bf16 grouped campaign 沉淀)
+
+### 1. agent 崩轮必须重试,且优先 **resume 已死的 session**
+
+`flydsl_campaign.py` 原本第一次 `_turn` 只要 `rc != 0` 就直接 return,**整轮作废**。
+实测 `API Error: Stream idle timeout` 是常态:effort=xhigh 崩 2/13 轮,effort=max 崩 2/3 轮
+(max 让单轮 turn 数和时长翻倍 ⇒ 暴露在流超时下的窗口成倍变长,**不是随机噪声**)。
+最贵的一次崩在 52 turns / $7.61 处。
+
+改法(已落地在 `_MAX_AGENT_RETRIES = 3` / `_RETRY_BACKOFF_SEC = 30`):失败后从残缺的流里 `_parse_stream`
+取出 session_id,**有就 resume 那个 session**(agent 已做的工作全保住),没有才从头重跑;
+`remaining < 300s` 就不再试;失败尝试的花费也计进 `total_cost`。
+**实测三场共救回 6 轮**(dgrad 场 5 轮、fwd 场 1 轮),按旧行为这 6 轮全废。
+
+### 2. 只给一个算子打分时,把**兄弟算子设成护栏**写进 bench
+
+三个算子共用代码(fwd/dgrad 共用 `dense_mma_pipeline_bf16`,三者共用 `gemm_helper` 的 loader/store),
+只给 fwd 打分的话,campaign 完全可能拿 dgrad 换 fwd 而无人发现。
+做法:bench 顺带测兄弟算子(balanced、两个 shape、几何平均),低于冻结下限就 `ok:false`,候选直接回退。
+fwd 场设了 dgrad ≥1215 / wgrad ≥1205 两道,终值 1253 / 1238,**全程没触发也没被绕过**。
+⚠ 下限要留 ~2-3% 噪声余量,并在注释里写清冻结时的实测值。
+
+### ★ 收官必须用**独立的第二把尺子**复核越目标的结果
+fwd 场 r15 单轮 +9.17%,量级与此前所有轮次不同 ⇒ 用另一套 bench(不同源、**参考值逐行全算**而非采样)复测:
+1414.8 vs campaign 报的 1417.1,差 0.16%,24 配置 SNR 全 55.6 ⇒ 确认为真。
+**采样式 SNR(如 512 行)挡不住"某些 tile 不再计算却仍按满 FLOP 计分"这类漏洞,越目标时要换全行参考。**
+
+### 启动期的三个固定绊脚石
+1. `--review-model` **默认是 sonnet**;要求全 opus 时必须显式写 `--review-model claude-opus-5`
+   (`--deep/--optimize/--supervisor` 写了不代表 review 也换)。
+2. harness 拒绝带**未提交的 tracked 改动**启动。挡路的几乎总是上一场遗留的探针
+   (`_isa_wgrad.py` / `_prof_dgrad.py`),`git checkout --` 还原即可 —— 三场里挡了两次。
+3. gpt_oss2 守卫是**纯字符串匹配** `venv-mxfp4` / `code3` / `mlperf_gptoss2`。
+   在 smci355 上用自己的 `/opt/venv-mxfp4` 是误判,加 `--allow-foreign-env`,并在 launcher 注释里写明为什么不是那个项目。
+
+### ⚠ rsync 被 `.git` 里的 nobody 文件挡住时,别删对象
+容器内 root 写 NFS 被 root_squash 成 `nobody:nogroup`,rsync 以 xianzhao 身份写不进去。
+`.rsync-exclude` 明确保留 `.git`,不能全局排除;远端还可能有本地没有的 object/pack ⇒ **删了就丢历史**。
+解法:host 侧以自己身份 `cp -a --no-preserve=ownership .git .git_reown` 再换名(核对条目数一致、nobody 归零)。
+⚠ **只 chmod 不够** —— `rsync -a` 还要 set permissions,那需要属主身份。

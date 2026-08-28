@@ -221,5 +221,27 @@ r9 逐配置:gate_up wgrad bal/mod/hvy **3022/2999/2970 TF**、down **2844/2741/
 ### Branchless f32→E2M1 (MXFP4) pack / W4A16-W4A8 打包
 - 详见本卡「跨 lane 原语与 MFMA/attention 数值」小节（branchless E2M1 pack / W4A16-W4A8 preshuffle）。
 
+## 让 flydsl wgrad 原生吐**真实 extent 的连续 C**:C pitch 与 operand pitch 解耦(tight-C)
+
+场景:操作数是 padded 的([G,Np,Kp]),但只有 `[:, :N, :K]` 会被读回。声明真实 extent(`m_real`/`n_real`)
+能让 boundary body 不对 pad 做 MFMA/store,但 **C 仍然按 padded pitch 分配**,返回的是 strided view。
+要让 C 也落在真实 extent 上(→ 原生连续),必须把 **C 的 pitch 从 operand 的 pitch 里拆出来**:
+operand pitch 必须保持 padded(g2s 寻址靠它),C pitch 收到真实 extent。
+
+`_compile_grouped_tn_wgrad_4wave` 上加一个 `c_tight` 开关后,**下面每一处 C 寻址都要跟着换**,
+漏一处就静默算错(实测漏掉 split-K 的 `band_row` → rel **1.42**、det **0/4**):
+
+1. epilogue store 的**行 pitch**:传 `C_N`,不要复用 operand 的 K-stride `_cn`(名字像、值在 tight 下不同)。
+2. store 的 row 上限 `(group_idx + 1) * C_M`。
+3. split-K 的 `band_row = _bnd * C_M`。
+4. reduce kernel 的元素偏移 `off = (sub * RED_ROWS + row_l) * C_N + col`,及列谓词 `col < C_N`。
+5. `make_row_band_resource(c_base, gi * C_M + bm_off, (gi+1) * C_M, C_N, 2)`——C 侧与 scratch 侧都要。
+6. **主机侧 scratch/输出的定尺**(`out2d = empty((G*C_M, C_N))`)与 ws 的 band 数。
+7. `c_tight` 必须进 **autotune cache key**;masked fallback 只会按 padded pitch 写 C,
+   `c_tight` 命中它时要**显式报错**而不是静默退化。
+
+收益口径:GEMM 本体基本不变(少写 pad 那几列),真正的收益在**下游**——见
+`pitfalls/02 §计分尺的 autograd API 口径`(非连续 grad 在 `.backward()` 里被 clone,实测 378 µs/10.2%)。
+
 ---
 来源: 04-tn-wgrad-kernel.md, 09-perf-numbers.md, project_mxfp4_epilogue_store.md, gemm/optimization-directions.md, 13-primus-turbo-prod.md, flydsl-fp8-gemm-tuning/SKILL.md, flydsl-kernel-authoring/SKILL.md, optimization-directions.md, attention/optimization-directions.md, attention/overview.md, tool-rocprof/SKILL.md, project_mxfp8_wholeloop_port.md

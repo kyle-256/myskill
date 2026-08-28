@@ -201,6 +201,45 @@ occupancy 2.985 → **3.978** waves/SIMD,功耗纹丝不动(1352 → 1353 W = 96
 ⇒ 判据:**占用率候选必须报 sclk**。只看 TF 会把一个 +3.9% 的周期改动读成 +0.5% 而错误放弃;
   反过来,在**没到功耗墙**的 kernel 上同样的改动应当拿到接近全额的周期收益。
 
+★★★ **MFMA 原子的选择在功耗墙下是「能量」杠杆,不是「周期」杠杆 —— 而且 MFMA-busy 计数器看不见它**
+(gptoss bf16 grouped **fwd** campaign 20260826 r15,gfx950 / 1400 W 封顶,**单轮 +9.17%**,是三场 campaign 里最大的一步)
+
+`Mfma32x32x16` → `Mfma16x16x32`(同一块 256×256 tile,每 wave 走两倍数量的小 tile):
+
+| | 32x32x16 | 16x16x32 |
+|---|---:|---:|
+| `v_mfma` 条数 | 2880 | **3600**(翻倍) |
+| `ds_read_b128` / `buffer_load_dwordx4` / `s_barrier` | 1080 / 360 / 361 | **逐字节相同** |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 2.12337e9 | **逐位相同** |
+| 每 dispatch 周期数 | — | **+8%(更差)** |
+| MFMA 利用率 | 84% | **77%(更差)** |
+| sclk @ 1400 W 不变 | 1.40 GHz | **1.667 GHz** |
+| **wall** | — | **−10.8%** |
+
+⇒ 机制:**32×32 原子在用累加器寄存器堆的能耗换指令条数优势**,每 MAC 的累加器 RF 字节数是 16×16 的两倍,
+功耗封顶的卡上 DVFS 直接为此收费。访存一字未动,周期变多,利用率变低,唯独时钟涨 19%。
+
+**两条判据(都是反直觉的,不写下来必然重犯):**
+- ❌ **绝不能用 MFMA util 做门禁** —— 这个 +9.5% 的改动会被 84%→77% 直接否掉。
+- ❌ **`SQ_VALU_MFMA_BUSY_CYCLES` 对原子速率是瞎的**,两边逐位相同。判原子改动只能看 **wall + sclk + power**。
+⇒ 排查"为什么 mfma 流慢"时,如果周期口径的维度(barrier/ILP/占用/带宽/代码量/AGPR)都排除干净了,
+  **换坐标系去看能量**:同工作量下比 sclk,而不是比周期。
+  (本项 KB 的前一场 campaign 在周期坐标系里排了二十多个维度、动用完整 ISA + HIP 微基准仍未破,
+   就是因为真正的货币是能量;换原子一轮解决。)
+
+⚠ 附带代价与残留:VGPR 220 → **256(触顶)** + 2-dword spill;`TCP_TCC_WRITE_REQ` +5.3%
+(ragged-tail body 的非配对 store 从 64 B 掉到 32 B 粒度)——r16 用配对写回把它压回 1.17965e7 的 64 B 地板。
+
+★ **16×16 的配对 store 不需要 permlane**:把一个累加器的两个**行** `cvt_pk` 成 dword 再 `permlane16_swap`
+是错的——row-major 的 C 里第 r 与 r+1 行相隔 `c_cols*2` 字节,packed dword 不是一段内存。
+可行构造是复用既有的**偶/奇列 16 列交错**,零 `v_permlane16_swap_b32` 就能达到 gfx950 的 64 B 写粒度。
+
+★★ **两个 launch 旋钮(GROUP_M / xcd_band)必须在「tile 成本分布」变化后重扫,不只是 shape 变化后**
+(00-decision-index row 40 说「band 赢家不跨 kernel 迁移」,实测**同一 kernel 内部也不迁移**):
+- r15:tile 快了约 20%,Down 的 GROUP_M 就从 8 翻到 4(slab 没动)。
+- r16:ragged 列块不再是补满的整价 tile,GateUP 的 `xcd_band` 就从 64 翻到 32(−0.58%,回文里每个位置都快)。
+⇒ 换过原子/几何/尾块之后,**当轮就要重扫这两个旋钮**,否则带着上一代的最优值跑。
+
 ★★ **在 ≥99% TBP 上「省周期」只兑现 20~45%(shape 相关,见下),「省能量」拿满额 —— 排杠杆时按这个折算率排序**
 (grouped mxfp8 NT,campaign 20260729 round 11 同 shape 同探针前后对照):
 周期口径 tw/mx 1.0315 → **1.0858**(+5.3%),但 wall 只 1.0172 → **1.0392**(+2.2%)⇒ **兑现 45%**。
@@ -241,6 +280,25 @@ pJ/FLOP:mx 0.5581~0.5607 vs tw 0.5749~0.5759 ⇒ **功耗高 ≠ 效率低**,mx 
 
 ### subtractive/HALF 编译期探针:PMC/ATT 不可用时的 stall 归因 + ★「上界≠可达」铁律
 - **技法**:PMC counter 被同集群别的 campaign 占锁、或无 ATT decoder .so 时,用**编译期门控探针**隔离每项成本:`skip_X`(跳过某段计算/store/barrier,故意破坏正确性只测时间)、`HALF_X`(跳一半 MFMA)、`REUSE_X`(某读塌成 1 次)。event-median ×40-60 隔离计时,逐项从 wall 里减出各成本;`skip_both`(同时跳两大计算)剩下的 residual = occ-1 暴露的结构延迟(HBM gather + 循环调度 + 依赖链串行,无第二 wave 掩盖)。
+- ★ **技法细化:`drop` 之外再加一个 `alias` 臂,能把 feed 成本拆成「搬运」与「发射」两笔**
+  (2026-08-17 gpt-oss padN dgrad NN 实测,主体块 4 条 g2s):
+  - `drop`(整条 g2s 不发)= feed 的**全部**成本:865.1 → 703.9 µs ⇒ feed = **155 µs = 18.6%**。
+  - `alias`(g2s 照发,但地址全指向 **k-block 0**,指令条数/寻址算式/LDS-write 一条不少,只是永远命中 L2)
+    = 865.1 → 774.0 ⇒ **84 µs 是数据搬运**(L2 miss 延迟),`155 − 84 =` **71 µs 是纯发射/寻址/LDS-write**。
+  - 再按操作数各来一遍 `alias`,得到每条流的份额(A 28 µs / B 47 µs;两者相加 10.16% vs 合并 10.58% ⇒ 可加、无共享瓶颈)。
+  - **为什么值得多写一个臂**:`drop` 的数字会让你去做「更深预取 / 更好局部性」,而那类杠杆**只能碰 84 µs 那笔**;
+    71 µs 只有「更少更宽的 g2s」能碰。少了 alias 臂就会把 2 倍于实际的空间算给预取,然后困惑为什么只兑现一半。
+  - ⚠️ 只动**主体块**的 g2s,prologue 与 K-tail 保持原样 ⇒ LDS 里始终是合法数据,核不会挂、只是算错;
+    这样 wall 才可比。⚠️ 这些包装是**探针专用**,production 树里不留任何 `_dbg` 参数(pitfalls/10)。
+- ★ **同一族的第三个臂:「把新增的那条跨 lane 原语 monkeypatch 成恒等函数」= 该改动的零成本上界**
+  (2026-08-18 gpt_oss dgrad NN 行合并实测)。改动本身 = ①新的寻址/行分组(减请求)+ ②为此付的跨 lane
+  VALU。把 helper 换成 `lambda a, b: [a, b]` 后,**行集合、写字节、store 发射条数、每条 store 的
+  lane→地址映射全部与真改动逐位相同**(只有值错了,所以这个臂只能读时间不能读 bit),于是
+  `gain(恒等臂)` = ①的全额、`gain(恒等臂) − gain(真臂)` = ②的价钱。本例 **+1.23% 对 +0.83% ⇒ 跨 lane
+  那半付掉 0.40 pp**,直接指向下一手(用 `d16_hi` 省掉 64 条 `v_lshrrev`)。
+  - **它和 `alias` 臂的区别**:`alias` 改地址(所以会改行集合、有 methodology/07 记的假阳性风险);
+    这个臂**只改值**,地址与指令条数全保住 ⇒ 对「请求路径」类改动是安全的定价方式。
+  - ⚠️ 恒等替换必须**保持返回结构**(本例是两元素列表)和调用点条数,否则连指令条数都变了就不是上界臂。
 - **★★ 铁律:subtractive/HALF 探针天花板、roofline 峰值率、纸面 op-count 分析给的都是「上界」,不是「可达值」。判负/判正前必须 edit→bench 真实现。** 反复踩证(dsv4 sparse-MLA,见 pitfalls/12):
   - HALF_PV 探针「−8.7% 假想天花板」→ 真 K=32-PV **净负 −11%**(2-tile 批打断 QK→softmax→PV 交织,批结构本身是杀手,非 k 维)。
   - SKIPST「store 占 wall 30-47%」→ 真 DMA / register-transpose / query-blocking **全净负**:store 是「跨-wave 数据共享 + register-prefetch 隐藏 HBM」的必需机制,不是可省浪费。

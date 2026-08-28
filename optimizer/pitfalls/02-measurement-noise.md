@@ -71,6 +71,43 @@
   注意 `bench.sh` 那种**每 rep 起新进程 + 清 cache** 的路径不受影响,所以"bench 说 0、探针说 0"里
   探针那半可能是假的。
 
+**★★ 地板的正确量法 = 在 sweep 里塞一支「按构造应当同二进制」的臂,别靠重复同一个臂名(2026-08-19 gpt-oss D64 fused bwd 实测,−1.05% 的假赢)**
+- 踩证:4 臂回文 sweep(每臂独立进程、min-of-40、3 轮)读出 `kreg3` 对 `B` **mean −1.05%,3 个读数全部低于 B 的 3 个读数**,
+  看上去是教科书级的"分布不重叠 ⇒ 真效应"。事后 ISA 对拍才发现该旋钮在这个 head dim 上**根本没接线**:
+  两臂三个循环的指令数、`s_nop` 等待周期、vgpr/lds **逐项相同** ⇒ 那 −1.05% 是**同一份代码**读出来的。
+- 为什么比"重复同一个臂"更管用:同臂重复会被自己当成同一次测量对待(常共用编译产物、也不占回文里的另一个位置),
+  **同二进制的异名臂**则完整走一遍"独立进程 + 独立 cache key + 回文中的另一个时隙",
+  测到的正是**真实判决所处的**噪声通道。代价只是多一个臂的机时。
+- ⇒ 口径:①每场 campaign 的 sweep **常驻一支同二进制对照臂**(取一个在本形状上确定失效的 kwarg);
+  ②任何 <1.5% 的结论,先看对照臂这一轮漂了多少,再看候选;
+  ③**候选与对照臂的 ISA 必须真的不同**——本轮同一批里另外两个臂(`g3at1`/`g3at4`)也是逐字节相同,
+  它们"看起来的收益"同样是这条通道。
+- 呼应本卡 §「两组样本不重叠不构成证据」:那里的机制是**单调漂移**,这里的机制是**随机通道**,
+  两者都能造出 3/3 不重叠。真效应的签名是**跨 session 配对同号**:本轮真正 KEPT 的那个改动是
+  **14 对回文、3 个 session、14/14 同号、mean −0.98%**,而假赢只在一个 session 里出现过一次。
+
+**★★ 别用「几个读数的 min」去否决配对 win-count(2026-08-19 gpt-oss D64 fused bwd 实测)**
+- 同一批 12 对回文:配对均值 B 5.6701 对 N 5.7174 = **−0.83%,11/12 同号,两个 session 各自独立同号**;
+  但两臂的 **min 分别是 5.6497 / 5.6504,只差 0.01%**。两个口径指向完全不同的结论。
+- 谁对:**配对 win-count**。每个读数**本身已经是 min-of-40**,所以这批样本的散布是**进程间**
+  (allocator / 时钟态)的位移,右偏且长尾;从 6 个右偏样本里再取一次 min,是个方差极大的统计量,
+  而配对差把两臂放在相邻时隙上、逐对相消掉进程间位移。
+- ⇒ 口径:**min 用来对抗进程内的偶发高读(min-of-40),不用来对抗进程间位移**;进程间位移只能靠
+  **回文配对 + 跨 session 同号**。看到「配对说赢、min 说平」时不要判平——那正是配对方法要解决的情形。
+- 反过来也成立:若 **min 说赢而配对不同号**,那才是应当判噪声的形态(见本节同二进制对照臂)。
+
+**★★ 「11.5% 摆动」可能不是长尾而是**双模**——24 进程才看得出来(2026-08-19 gptoss_swa 实测)**
+- 一个 0.57 ms 的 cell,goal 里记的是"3 个独立进程取 min 仍读出 0.6331 与 0.5677,11.5% 摆动"。
+  用**同一份二进制、24 个独立进程**重测:读数**不是**连续长尾,而是干净地分成两簇 ——
+  低模 **0.567~0.574**、高模 **0.634~0.642**,中间**一个读数都没有**,簇间距 +11.4%。
+- 判据价值:①双模 ⇒ **min-of-N 是对的估计量**(低模样本充足,N≥12 时几乎必然采到),而 mean/median
+  会按落进高模的比例线性偏移;②同一份二进制在两臂上分别取 min 得 0.5668 / 0.5680(差 0.2%)⇒
+  **这个 cell 的双模与代码无关**,任何"它回退了"的读数在 <12 进程时都不能当回退;
+  ③ guard 项 `min(base/cur, 1)` 落进高模时被压到 ~0.89,单独给总分打掉约 1.5% ——
+  **不计分的 guard 仍会用噪声扣分**,所以要 pin 的是"取 min 的进程数",不是"重复次数"。
+- ⇒ 遇到"某个小 cell 摆动特别大"时,先用 ≥12 进程画一次分布再决定用什么估计量;
+  **双模和长尾要用不同的处置**,而 3 个读数分不出这两者。
+
 **★ 每场 campaign 开工先量自己那支探针的地板(2026-08-07 gpt-oss E=32 wgrad 实测)**
 - `_an_wg_cfg.py` 的 palindrome 交错探针,同一配置(down `(2,6,1,1)`)在一个 session 内四次独立提交测得
   **2829.0 / 2841.7 / 2844.3 / 2848.3 TF**,极差 **0.68%** —— 这已经是"同进程交错、每轮清 flydsl cache"
@@ -124,6 +161,39 @@
 
 ### transient 掉频 → 假胜
 - 曾把 8w 瞬时掉频测成 4w 赢 **1.42×**，复测仅 **1.01×**。WHY: 那一测正好赶上 8w 侧 transient 掉频/被抢卡。可疑就 `rocm-smi` 看是否掉频/被抢卡并立即复测。
+
+### ★ campaign 指定的「对照组」就是最便宜的抢卡探测器（不用起 rocm-smi）
+- 凡是 harness 每跑都打印、而本轮**一行没碰**的那个 metric（mxfp4 joint quant+GEMM campaign 里 = `quant_ms`），
+  就是免费的 co-tenant 探针：它有稳定的历史带（本场 30+ 跑只在 **0.470~0.481** 摆），一旦跳出带就说明卡上多了别人。
+  r15 实测：另一租户以 `HIP_VISIBLE_DEVICES=2`（与本 campaign 同卡）跑 `pytest tests/pytorch/...` 20+ 分钟，
+  `quant_ms` 0.463 → **0.548**、`gemm_ms` 4.7 → 5.9~6.9、护栏 → 7~11 ms。**比 rocm-smi 更早、更确定**，
+  因为它和被测量的东西跑在同一条流上、同一把尺子里。
+- ⚠ **补充（r16）：对照组只在污染是「持续」时才灵，突发争用会漏报。** 同一租户的另一段窗口里
+  `quant_ms` 0.468（干净带内）而 `gemm_ms` 4.68 → **5.79（+23%）**——短 kernel 恰好挤进空档，长 kernel 被打满。
+  ⇒ **两条门一起用**：①对照组跳出历史带；②被测 metric 跳出历史带 >8%（`pitfalls/02` §回归判据）。任一触发就整段作废。
+- 处置：整段读数作废（**不要**拿它跟别的臂比），等窗口干净再复测；实在等不到就退回**同 session 回文配对**
+  ——r15 在被抢卡的窗口里仍用逐格 min/med 隔离 + 回文在 **11σ** 上分辨出 50 µs。
+- 查证：`ps -eo pid,etimes,pcpu,args --sort=-pcpu | grep -v defunct`，看有没有别人的 pytest/bench；
+  `<defunct>` 与长期 199% CPU 的老进程通常不占 GPU，别误杀（环境红线：不属于你的进程严禁 kill）。
+- ⚠ **别指望 kernel-trace 的 min-of-N 能「绕过」被抢卡（r16 实测证伪）。** 直觉是"取 min 就能挑到干净窗口"，
+  实测：8 臂回文 × 每臂 10 次派发，同一个 kernel 的 per-cell min 在臂间摆 **1084~2058 µs（±40%）**，
+  某一臂整体和 3515 µs 而其余 4650~5240 —— **是那一臂恰好赶上安静窗口，不是那一臂的代码更快**。
+  ⇒ 争用是**突发**的，min-of-N 只在 N 大到覆盖一个完整安静窗口时才收敛；N=10 远远不够。
+  被抢卡时**唯一**可信的还是同 session 回文配对（且要看配对差的符号是否 4/4 一致），不是换个 min 口径。
+
+### ★★ 逐字节指纹门（NDIFF=0）本身可能是不确定的 —— 先跑「自己 vs 自己」的对照
+- 场景：campaign 红线要求"动 GEMM 必须自带 24 格逐字节指纹对拍，NDIFF=0 才算通过"。r16 实测**这个门有假阳性**：
+  **同一份二进制、同一个 `torch.manual_seed(0)`、连跑 6 次，有 5~6 个格的指纹在变**
+  （`wgrad {balanced,moderate,heavy,extreme} down`、`wgrad moderate gate_up`，换一组 6 跑还会冒出 `dgrad heavy down`）。
+  其中 **`wgrad balanced down` 是计分格**。
+- 机制：指纹算的是 kernel 返回的**整个** output 张量，而 output 是 `torch.empty` 分配的；
+  skew 分布下有整组 `lens=0`／尾部 pad 区**根本没被写过** ⇒ 指纹把上一次分配残留的内存也算了进去。
+  （所以不确定的格集合**每次都不一样**，还会跨到没有 split-K 的 NT 格上——这正是"未初始化内存"而不是"原子累加"的签名。）
+- ⇒ **判据**：改动前先把 baseline 自己对拍 ≥4 次，得到「不稳定格集合」；
+  只有**稳定格**上的 diff 才算真 diff。r16 的改动 diff 落在 2 个格，二者都在不稳定集合里，
+  且 6 个 balanced（计分）格全部逐位一致 ⇒ 判通过。
+- ⇒ **修法**（下一轮该做）：指纹只覆盖 kernel 合约要写的区域（按 `offs[G]` 截断、按有效 N 截断），
+  或把 output 预先填成常量再调 kernel。**在修好之前，"NDIFF=0" 不能单跑一次就当证据。**
 
 ### 僵尸 GPU 进程压 ~10%（掩盖 3 次回退）
 - 测速前必须查杀僵尸 GPU 进程，否则带宽/时钟被压 **~10%**，结果严重偏低——曾把 **~2% 回退掩盖 3 次**。
@@ -271,6 +341,49 @@ M_g 直方图),再锁死;口径干净 ≠ 操作点对**。这条比本卡其它
 ❌ 别再试：靠 SNR 判断 race 是否存在。SNR=53-54 才暴露、正常 SNR 完全掩盖 1/30000 级 bit-flip，采样量不到 30000+ 次时假阴性。
 ❌ 别再试：`PT_RACE_VM=1` + 2 池 3buf 的跨 barrier G2S 写。m4096 实测 SNR 掉到 53-54，约 0.17% bit-flip，速度收益是以腐蚀输出为代价的。
 
+## ★★ PMC 取「最后 N 次 dispatch」会静默读到**错误的那个臂**（多臂 palindrome 探针 + 同名 kernel）
+
+2026-08-18 gpt_oss down fwd NT 实测，差点把一个真实的 **−48.9% 写请求**记成 0：
+
+- 多臂 A/B 探针为了共享时钟通常按 **palindrome** 发射（`names + names[::-1]`），于是**最后一次 dispatch
+  永远是 `ref`**；而两个臂编译出的 kernel **同名**（同一个 `@flyc.jit` 函数），所以按 kernel 名聚合、
+  再取「最后 N 次」的 PMC 汇总脚本会把整个窗口落在 ref 的最后一轮里。
+- **指纹**：待测臂与 ref 的**每一个** counter 都逐位相同（本例两臂都读 `TCP_TCC_WRITE_REQ = 2.359e7`）。
+  和本卡 §同进程 A/B 静默同二进制是同一个家族的错觉，但根因完全不同（这次两份二进制确实不同，
+  只是**没有一次 dispatch 属于待测臂**）。
+- **正确入口**：探针要提供「单臂背靠背 N 次」的模式（`PROBE_SUSTAIN=N`：200 次预热 + N 次计时，
+  且不进 palindrome），PMC 只在这个模式下采。换过去立刻读到 1.206e7。
+- 顺带一条：**store 侧的臂必须同时报 `TCP_TCC_WRITE_REQ`（请求路径 = 功耗墙上付钱的那个）与
+  `TA_BUFFER_WRITE_WAVEFRONTS`（发射条数）**。同一轮里 dwordx2 让 wavefronts 再砍半而 requests
+  一点不动 ⇒ 只看任何一个都会误判「还有一半可减」。**这两个计数分道扬镳的第二种形态**（2026-08-18
+  NN 行合并）是反过来的：**wavefronts 两臂完全相同 5.898e6，而 requests −48.9%** —— 存指令一条没减、
+  只是每条 store 的 64 lane 从「覆盖 4 行各 32 B」变成「覆盖 2 行各 64 B」。⇒ 报了两个数才能说清
+  「减的是请求还是指令」，而这决定了 ΔP 会不会跟着动（见 methodology/07 的 ΔF/ΔP 定价）。
+
+## ★★ 计分尺的 autograd API 口径决定它**能不能看见**成本：`autograd.grad` 对非连续梯度免费，`.backward()` 要 378 µs
+
+2026-08-17 gpt-oss-20b down-proj padN campaign 实测。bench 用 `torch.autograd.grad(out, [a,b], ...)`,
+它把 kernel 的输出张量**原样交回调用者**;真实训练用 `.backward()`,`AccumulateGrad` 必须把梯度落进
+`param.grad` 并满足参数自己的 layout 契约 —— **非连续梯度在这里被 clone,落在关键路径上**。
+
+同一份代码、同一进程、两个 API 交错 min-of-12(gpt-oss-20b down, G=32/M=131072/N=K=2880):
+
+| API | grad_b 是 [G,Np,Kp] 的 view | grad_b 原生连续 [G,N,K] |
+|---|---|---|
+| `.grad`(bench 用的) | padN 3.3438 ms | padN 3.3643 ms |
+| `.backward()`(真实训练) | padN **3.7218 ms** | padN 3.3775 ms |
+| 两 API 差 | **378 µs = 该步的 10.2%** | 13 µs |
+
+kernel-trace 双证:view 版 `.backward()` 15 次 dispatch/3832.9 µs,含一个 **376 µs 的
+`elementwise_kernel_manual_unroll`**;连续版 14 次/3456.9 µs,该核消失。
+
+- **判据**:「返回 strided view 省掉一次 `.contiguous()`」这类杠杆,**必须同时用 `.grad` 和
+  `.backward()` 两个口径 A/B**。只测 `.grad` 会把成本挪到尺看不见的地方,读数还很好看。
+- **同族陷阱**:`autograd.grad` 也不会触发 optimizer / allreduce 对连续性的要求。凡是把
+  "un-pad 拷贝"换成 view 的优化,真实收益都要按下游第一个**要求连续**的消费者来记账。
+- 反过来用:如果一个 campaign 的 bench 就是 `.grad`,那么让 kernel **原生吐连续输出**这件事在尺上
+  是噪声(本例 1.3254→1.3310),但在真实训练上是 **+11.5%**(1.1955→1.3327)。报告要把两个数都给。
+
 ---
 来源: remote-sync/SKILL.md, pr-merge-gate/SKILL.md, 08-deadends.md, optimize-handoff/SKILL.md, optimize-loop.md, flydsl-fp8-gemm-tuning/SKILL.md, flydsl-fp8-gemm-tuning/07-benchmarking.md, fp8-gemm-bench/SKILL.md, 04-ceiling-analysis.md, flydsl-fp8-gemm-results/SKILL.md, 07-benchmarking.md, 10-grouped-wgrad-4wave-3buf.md, gpu-fleet-tuning/SKILL.md, 14-fused-preshuffle-e2e.md, mxfp8-grouped-gg-devloop/SKILL.md, project_mxfp8_wholeloop_port.md, 05-dead-ends.md, project_mxfp4_epilogue_store.md, verify-accuracy/SKILL.md, project_wgrad_occ_feed_bound.md, gfx950-vmcnt-race-debug/SKILL.md
 
@@ -293,3 +406,62 @@ rocprofv3 --kernel-trace ...                                 # ③ GPU 内核真
 cProfile 里 `jit_function.py:_resolve_and_make_cache_key` 居首。**修法:`flyc.compile(fn, *args)` 拿到
 `CompiledFunction`,它只刷 data_ptr 不重解签名(全位置参数,含 stream),按标量签名缓存复用 → host 93→7 µs。**
 ⚠ 标量会被当 constexpr 烤进 artifact,**cache key 必须含每一个标量参数**,否则换 shape 会静默用错内核。
+
+## ★★ 背靠背孤立计时是**偏慢**的一侧,不是"干净"的一侧;而跨张量比每字节 TB/s 会造出整条假杠杆
+
+2026-08-17 gpt-oss-20b down-projection padN campaign,两条口径错误各让一条杠杆凭空存在了两轮。
+
+### ① 同一个 launch,换掉它前面那个核,wall 摆动 3%
+in-situ trace 读到 fwd NT 比对照臂慢 36 µs(4.2%),但孤立读数反而更快 ⇒ 曾据此写下"孤立没问题、
+in-situ 有问题"。用**同一个 fwd launch、只换前置核**定价(`_probe_r10_ctx.py`,events 只圈 fwd,min-of-8×4):
+
+| 前置 | fwd wall | vs 背靠背 |
+|---|---|---|
+| 背靠背(同一个核连发,每个孤立探针都这么测) | 854.7 µs | — |
+| 它的 B 操作数的 quant cast(277 MB store)紧挨在前 | **828.5 µs** | **−3.07%** |
+| 两个 quant cast(663 MB)都在前 = 真实链序 | 840.4 µs | −1.68% |
+| 一个 512 MB 无关 fill(纯驱逐,无共享数据) | 843.0 µs | −1.38% |
+
+两个结论:**(a) 生产者相邻值 ~14.5 µs**(`after_bq` 对 `after_flush`:producer 把操作数留在 256 MB MALL 里);
+**(b) MFMA 密集核背靠背连发是最慢的排法**(功耗/DVFS + 上一轮自己的输出把 MALL 占满),所以
+「孤立比 in-situ 快」**根本不能推出 in-situ 有病**——两者的差里至少有 1.4~3.1% 是排法本身。
+⇒ 判 context 效应要**显式换前置核**,别用背靠背当基线;判核本身则两臂都用同一种排法。
+
+### ② 两个核跑在**不同张量**上,它们的 TB/s 不可相减
+同一份 trace 里 `padn_row`(权重 808 MB)= 5.70 TB/s、`pad_row`(激活 1141 MB)= 6.38 TB/s,据此
+写下"padN 专属 quant 有 10.7% 每字节赤字、约 15 µs 可回收",挂在 goal 计划里两轮。
+正确口径是**同一个张量只翻那一个开关**:`w_padn` 200.3 µs/1277 MB/**6.68 TB/s** 对
+`w_padk` 195.9 µs/1271 MB/**6.80 TB/s** ⇒ 真实赤字 **1.8%**、专属净额 **4.4 µs**;
+而同一探针里**激活路径每字节比它还慢 3.89%**(6.42 TB/s)⇒ 原结论的**排序都是反的**。
+⇒ 每字节效率只能在**同形状同读写比**之间比;跨张量要比就先各自对自己的 padK/padN 变体做 A/B。
+
+---
+
+## ★★★ 逐次 synchronize 计时会把**主机时间**算进 GPU 窗口(2026-08-24,一次把 kernel 低估 2×)
+
+`record(); fn(); record(); synchronize()` 每轮都让 GPU 空转等 Python 入队,CUDA event 把这段**主机时间计进 GPU 时间线**。
+踩证:grouped bf16 的 wrapper 在查编译缓存**之前**无条件重建 launch,**主机 2.52 ms/call**(Triton 只要 0.058 ms),
+于是 fwd 读成 **650 TF/s,真值 ~1150**。据此还推出了一整套错误的 kernel 侧根因("比 wgrad 慢 2×""每 tile-iter 贵 5.13×"),
+排查了 barrier/LDS/占用/ILP 一整天,**量的全是 Python**。
+
+**必须**:一对 event 夹住 **R 次连续调用**,再单独用 `perf_counter` 量主机入队,断言 `t_host < t_gpu * 0.9`:
+```python
+e0.record()
+for _ in range(reps): fn()
+e1.record(); torch.cuda.synchronize()
+gpu = e0.elapsed_time(e1) / reps
+t0 = time.perf_counter()
+for _ in range(reps): fn()
+host = (time.perf_counter() - t0) / reps * 1e3
+assert host < gpu * 0.9, f"host {host:.3f}ms did not lead gpu {gpu:.3f}ms"
+```
+⚠ **只测自己不会发现**——Triton 的 wrapper 快 45×,所以它不暴露这个坑;**和一个快 wrapper 对照才看得出来**。
+
+## ★★ 噪声地板的量级是**每把尺子自己的属性**,别套用本卡上方的 4~5%
+
+本卡上方说 run-to-run ~5%。**实测(gptoss bf16 grouped,安静的 GPU,连续入队计时)**:
+计分 bench 三读 **1409.9 / 1410.4 / 1409.7 = 0.05%**;隔离 per-shape 尺子的同二进制对照臂 **0.007%**。
+差两个数量级。一轮若按 4~5% 判,当天所有真实效应(0.58% 的 band、0.90% 的 GROUP_M)都会被当噪声扔掉。
+
+⇒ 本卡的**方法**是对的且正是产出这些数字的原因(别用两次读数估地板、必带同二进制对照臂、回文次序);
+   **数值不是常数**。每场 campaign 开工先用同二进制对照臂把自己这把尺子的地板量出来,再拿它判增益。

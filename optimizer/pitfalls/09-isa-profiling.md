@@ -13,6 +13,11 @@
 - **MFMA-issue 高 + TFLOPS 低 ≠ scheduler 没问题**（经典陷阱）：动调度旋钮前先 cross-check ATT stall trace 分类，判据见 methodology/03-profiling-utilization.md。
 - **GLOBAL_/SCRATCH_ 别用 FLAT**：地址可证明只落在单一 aperture 时，emit `GLOBAL_*` / `SCRATCH_*` 而非通用 `FLAT_*`。FLAT 付 aperture-decode 税，**且同时 double-count VM_CNT 和 LGKM_CNT**，害了 s_waitcnt 调度。
 - ❌ 别再试 blanket `s_waitcnt 0`：只 fence 下一个 consumer 真正需要的那个 counter（vmcnt / lgkmcnt / expcnt），一把清零会白等其他 counter。
+- **⚠ `s_waitcnt` 的**条数**不是代价口径，别把"少等几条"当收益去优化**（2026-08-19 gpt-oss D64 fused bwd 实测）。热循环 332 条 `s_waitcnt`（其中仅 16 条 vmcnt，其余全 lgkmcnt）看着像个池子；把 GEMM2 的 dt 预取环从 depth 1 加深到 2，ISA 如预期**少了 26 条 `s_waitcnt`**，wall 却稳定 **+1.9%**（6/6 回文对全负，单对 +1.2~2.7%）。机制：等待被挪走的同时读突发变宽，顶开了 MFMA 发射。⇒ 该看的是**相邻两次等待之间的 MFMA 连跑长度**（issue 密度），不是等待计数；同一个 depth=2 在 D128 上是部署值，说明这是 per-shape 的，别跨 head-dim 搬。
+  - **⚠ 订正（2026-08-19 同一 kernel 复测）：上一行"看 MFMA 连跑长度"这个替代判据也不成立，正确的量是 `ds_read` 的发射→退休覆盖距离。** 实测：手搭 `sched_group_barrier` 流水 `"m2,t2,v4"` 把连跑长度从 1.56 抬到 **1.83**、gap 数 820→699、`s_nop` 499→415 cyc/trip、指令 −54、vgpr 同 granule ——**四个静态量全部变好，wall 仍 +0.80%**（6 轮位置均衡轮转，2/6 胜）。真正与 wall 单调对应的是**每条 LDS 读提前于它的 `s_waitcnt` 多少条指令**（按 lgkmcnt 语义模拟队列退休即可算，见 Primus-Turbo `_isa_run.py`）：部署 32.4 → `"m2,t2,v4"` 26.4 → `"r1,m2,t2,v4"` 19.7，wall 依次 0 / +0.80% / **+3.48%**（0/6，散布仅 0.6%），单价约 **0.2~0.3% 每条覆盖指令**。
+  - **推论（比上面更硬）：occ=1 时 `s_nop` 不是一个可加的池子。** `"r1,m2,t2,v4"` 抽掉 150 nop cyc = trip 的 2.7%，**一分钱没兑现**（反而 +3.48%）。因为一个 wave/SIMD 上 hazard nop 与它旁边的 lgkmcnt stall 在很大程度上**是同一次 stall**，静态分析把它数了两遍。所以"热循环有 N cyc 的 s_nop"不能当作 N cyc 的可回收量去立项。
+  - **在 `sched_group_barrier` 流水里点名一个指令类 = 把它钉住。** 想让读提前，不能写 `r1`（那会每组塞一条读、正好钉在消费点旁边，覆盖掉到 19.7、8 条内退休的比例 8%→29%），要写一个**大于区域读数的领头组**（`"r24,m32"`）。
+  - **同族对照：`iglp_opt` 与 `sched_group_barrier` 是同一个 LLVM mutation，换掉它本身就要付钱。** `"r24,m32"` 保住覆盖（32.8）且指令 −31，仍 +0.90%，因为 iglp_opt(2)(MFMAExpInterleave) 还在藏 78% 的 exp 链（恒等替换探针给该链定价 4.05%）。所以任何手搭流水的臂**起手就落后 0.9%**。另：策略 0 在本 body 顶穿寄存器（vgpr 476、nop 630 cyc），策略 1 在带 ds_write 的区域直接触发 `AMDGPUIGroupLP.cpp` 断言（不可达）。
 - **waves_per_eu 无法经 `gpu-module-to-binary opts=` 生效**（已知限制）：必须设成 LLVM function attribute，或经 `rocdl-attach-target`。autotune 的 `Config.num_warps` / `waves_per_eu` / `maxnreg` 属编译器级特殊选项。
 - **FP8/BF8 正确性依赖**：`SH_MEM_CONFIG` bit[8] 必须为 1（两代都要），否则 FP8/BF8 结果错。
 - **CVT_*_F32 up-convert 无 4-cycle forwarding**：两个 convert 写同一目标寄存器的不同 byte/half 之间，必须插一个 NOP 或不相关的 VGPR write，否则读到 stale bytes。
@@ -43,6 +48,20 @@
   reg-note `vgpr_count=246` → 该列报 **124**）。spill / 寄存器预算门禁**只认 ISA reg-note**
   （`vgpr_spill_count` / `private_segment_fixed_size`），别拿 PMC 那一列当门禁或写进报告。
 
+### ❌ 别再试：让 VALU 直接吃 AGPR 以消掉 epilogue 的 `v_accvgpr_read`（gfx950 编不出来）
+- 诱人的算术：把累加器钉在 AGPR 的核，epilogue 每个 f32 都要先 `v_accvgpr_read_b32` 搬进 VGPR 才能转换。
+  mxfp4 grouped NT 的 `cst_wide` 是 **4 条 read + 2 条 `v_cvt_pk_bf16_f32`** 出 2 个 dword ⇒
+  **每 tile 每 thread 256 条 accvgpr_read**，和 r15 刚删掉的 256 条 `accvgpr_write` 一样大（那笔值 +0.99%）。
+  若 VALU 能直接读 AGPR，这 256 条整块消失。
+- **实测（`llvm-mc -arch=amdgcn -mcpu=gfx950`）：VALU 一律不接受 AGPR 操作数。**
+  `v_cvt_pk_bf16_f32 v0, a1, a2` / `v_add_f32 v0, a1, v2` / `v_mov_b32 v0, a1` /
+  `v_pk_add_f32 v[0:1], a[2:3], v[4:5]` / `v_pack_b32_f16` **全部 `invalid operand for instruction`**。
+- ✅ **但访存指令可以直接吃 AGPR**（同一次 llvm-mc 全部通过）：
+  `buffer_store_dwordx4 a[0:3], v0, s[0:3], 0 offen`、`global_store_dwordx2 v[0:1], a[2:3], off`、`ds_write_b64 v0, a[2:3]`。
+- ⇒ **判据**：输出**不需要格式转换**（fp32 C、或直接落 LDS/global 的 split-K 工作区）时，
+  可以让 store 直接从 AGPR 发，省掉整块 `accvgpr_read`；**输出要 cvt（bf16/fp16/fp8）时这条路是死的**，
+  256 条 read 是该 ISA 上的结构下限，别再规划它。
+
 ### ❌ 别再试：只加 `-g` flag 想拿 ATT 源码映射
 - 光有 `gpu-module-to-binary` 的 `-g` flag 没用：`-g` 只保留 debug info 但**没东西可保留**——`loc()` 元数据在 MLIR→LLVM-IR 翻译时被**静默丢弃**。
 - 正解：先跑 `ensure-debug-info-scope-on-llvm-func{emission-kind=LineTablesOnly}` pass（位置在 `reconcile-unrealized-casts` 之后、`gpu-module-to-binary` 之前），把 MLIR `loc()` 转成 LLVM `DISubprogram`/`DICompileUnit`。配好后 PA decode kernel 达 **99.9% 覆盖（1109/1110 指令）**。
@@ -61,3 +80,20 @@
 
 ---
 来源: optimization-directions.md, gemm/overview.md, gfx950/kernel-implementation-notes.md, flydsl-kernel-authoring/SKILL.md, gfx942/kernel-implementation-notes.md, capture-kernel-trace/SKILL.md, kernel-trace-analysis/SKILL.md, programming-model.md
+
+---
+
+## ★★ rocprofv3 超时挂死:先去**远端**找 rocprofv3 孤儿,不要做 GPU reset
+
+踩证(2026-08-27,n02-29 / 容器 kyle_attn):rocprofv3 对任何树、任何 `HOME` 都 rc=137 挂死,
+一度被归因成"内核态 counter session 没释放,要 GPU reset"。**归因是错的。**
+容器内 `ps -eo pid,etime,args | grep rocprofv3` 查出两组挂死的实例:
+一组是某场 campaign r15 的探针(3h50m),另一组 `--pmc FETCH_SIZE WRITE_SIZE TCC_HIT` **挂了 33.8 小时**,
+比当时所有活着的 campaign 都早。`kill -9` 后**立即恢复**(两 counter 小 grid rc=0、CSV 有数据),
+未做任何 reset,顺带释放了一块 GPU 的 8.7 GB。
+
+⇒ 判据:**多 counter rocprofv3 挂死 ≠ 硬件/驱动状态坏了**,先按显式 PID 清远端孤儿。
+⚠ **清场必须两端都查**:campaign 的 agent 通过 `campaign_remote.py` 发起的 profiling,
+本地只剩一个 ssh 驱动进程,**真正的 rocprofv3 在容器里**。只枚举本地 PID 和本地 `/proc/*/cmdline`
+(哪怕按 campaign 目录名 grep)**看不到它们** —— 那批孤儿就是这样活了 33 小时,
+并在此期间占着 GPU、让后续所有 profiling 挂死、还让另一场 campaign 报 `all pool GPUs busy`。

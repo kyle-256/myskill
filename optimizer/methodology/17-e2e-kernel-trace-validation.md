@@ -276,5 +276,23 @@ wrapper(NOT git-add,均在容器 `/workspace/code/syncv4/`)= `_run_c4_smoke.sh`(
 `_run_c4_force_flydsl.sh`(强制诊断)、`_run_c4_step100_flydsl.sh`(step100 复现)。见
 [[project_gptoss_fp8_wgrad_skew_padk]]、[[project_gptoss_down_padk_native_campaign]]、[[feedback_no_unilateral_campaign_model_change]]。
 
+### ★★★08-27 复跑血泪:「冷缓存第一批 iter 慢」被我反复误判成「RCCL 死锁」,连 kill 五六次
+**症状**:8 卡全部 py-spy 冻在 `get_grad_norm_fp32 (clip_grads.py:133)`(该行=`total_norm.item()`,GPU 同步点,
+**不是** all_reduce——两个 all_reduce 在 127/130 已返回),GPU 功耗 12 秒连采 **336W 死平**、flydsl/inductor 缓存
+60s **零增长**。我据此判「GPU 空转=collective 死锁」→ kill → 重启 → 换容器,循环好几轮全在浪费时间。
+**真相**:**根本没死锁**。那个 `.item()` 在等 GPU 排空**整个 backward + grad-norm**;冷缓存下第一批 iter 要现付
+flydsl per-shape autotune + torch.compile,单 iter 极慢,`.item()` 长时间阻塞看着像冻住。让它**不动**跑满,
+**08:00:47 启动的 run 13.5 分钟后(08:14:17)自己扛到 step 100 写出了全 8 rank trace**。昨天(08-25)之所以
+「110 iter ~108s」快,是因为**先跑过 `_run_c4_smoke.sh`/`_run_c4_force_flydsl.sh` 把缓存焐热了**;冷跑第一次
+没有捷径,必须付这个 autotune 成本。
+**纪律**:(a) 判死锁**别只看功耗死平**——冷 autotune 也可以 100% util 但功耗平;**要看进程是否推进/最终产出**,
+不是看瞬时。(b) 冷缓存 e2e 训练**首跑给足 ~15min**,别中途 kill;想快就先跑 smoke 焐缓存。(c) `.item()` 卡住
+=在等 stream,**顺着看 stream 上最后是什么**,不要一看到 all_reduce 附近就喊 RCCL。(d) 反复 kill SIGKILL 会漏
+`/dev/shm/nccl-*` 残段(实测有一堆),清 shm / 重启容器是廉价保险,但**本例并非 shm 致死,是我自己太急**。
+**08-27 强制 FLYDSL 新鲜 census(rank0/step100,median/min/max µs,n=48)**:`nt_persistent` 1578.7/850.7/2950.4、
+`nn_persistent` 1509.7/853.6/2699.6、`tn_wgrad_4wave` 1789.5/816.4/16196(max=profiler 假 outlier,`>5ms` 丢)、
+`tn_wgrad_reduce` 60.6。量级与上表 avg 一致。见 [[project_gptoss_fwd_nt_slow_investigation]]、
+[[feedback_no_cpu_ep_poll_hang_judgement]]。
+
 ---
 来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss)+ 2026-08-08 Crusoe 177 pretrain-yaml 真跑取 grouped-gemm FLOPS + 2026-08-13 smci355/syncv4 官方 mlperf EP1 config 跑通(变体 C + 崩溃排障三层遮蔽)+ 2026-08-25 smci355/`kyle_train` 真 C4 EP1 down-padk 复现 huangwei 0824 trace(变体 D:强制 FLYDSL 破静默 Triton fallback + per-shape can_handle 混合判读);见 [[project_kpad_e2e_trace_validated]]、[[project_gptoss_e2e_trace_grouped_flops]]、[[project_syncv3_so_rebuild_4arg]]、[[project_gptoss_fp8_wgrad_skew_padk]]、connection/gpt_oss/02·03·04、connection/smci355/01、connection/crusoe/01、pitfalls/07(glob/tracer 坑)、pitfalls/08(重编 .so)

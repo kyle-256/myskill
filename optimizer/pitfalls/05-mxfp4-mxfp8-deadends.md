@@ -1199,3 +1199,23 @@ DeepSeek +5.8/+3.1%、Qwen +6.0/+0.7%);而 NT 的 deploy-only 非临时 store �
 +3.8~4.3%,DeepSeek 剩 +0.2~1.2%、Qwen −0.5~−1.3% —— 它的门 `mb >= num_xcds*xcd_span` 是按
 gpt-oss 的 tile 数调的,换 H/I 就落到另一侧(**没生效,不是有害**)。
 ⇒ 判据只要写成"某个绝对 token 数/tile 数",就只对调它的那个模型成立;要泛化就得写成**比值**。
+
+## ❌ 别再试：用 DPP/`v_perm` 把相邻两列**折进一个 dword** 来砍 epilogue store 发射数
+
+2026-08-17 gpt-oss-20b fp8 grouped(NN dgrad / TN wgrad)实测。动机看着很硬:ISA 普查显示 epilogue
+是 `buffer_store_short`(每 lane 2 B、160 条静态),跨 lane 已经完美合并(64 lane × 2 B = 一条 128 B 行),
+所以**是发射条数问题不是带宽问题**,比 `dwordx4` 多 8×。实装 `DPP quad_perm` 交换 + 两条 `v_perm_b32`
+打包,把相邻列对折成一个 dword(**store 发射直接砍半**),逐位相同 ——
+**NN −1.09%(occ=2)、wgrad −1.9%(occ=1)**,已整套回滚。
+
+- **根因**:每折一对要付 1 条 DPP(带 hazard)+ 2 条 VALU,而省下的只是 1 条 store 发射。
+  反过来给 store 发射定了价:砍掉一半发射(≈ X/2)打不过 ~2×64 条 VALU ⇒
+  **整核 store 发射成本量级只有 ~12 µs(1.5%)**,不是想象中的大头。
+- 与本卡 §折叠 store 的**赢**案例(`_BILV=4` ⇒ `buffer_store_dwordx2`,16 lane 铺满 128 B 行,
+  wgrad +2.1~2.4% / NT +0.88 gm)**不矛盾,但机制完全不同**:那边的相邻列**本来就在同一个 lane 里**
+  (累加器 layout 决定),折叠是**免费**的,赢面还来自少污染 L2;这边的相邻列在**相邻 lane**,
+  要折就必须跨 lane 搬,搬的代价超过省下的发射。
+- ⇒ **开口只剩一个**:让相邻列**天生落在同一 lane**(改 MFMA→累加器→列的映射,
+  或走 methodology/07 的 `permlane16_swap` 寄存器转置),即**不加 VALU 的宽 store**。
+  在此之前不要再用任何 shuffle 类原语去砍 store 发射数。
+  (LDS 中转的 `store_cshuffle` 在同一族核上是 **−21%**,更早已判负。)
