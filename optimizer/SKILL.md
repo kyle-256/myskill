@@ -51,6 +51,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | **flydsl 前端**(tracer/JIT/if-for)报错或静默错 | pitfalls/07 → methodology/09 |
 | **attention(dsv4)** 优化 | pitfalls/12(必读)→ 00-decision-index §D |
 | **autotune/dispatch/MoE 变长** | pitfalls/06 → methodology/13 |
+| 想把 **activation/SwiGLU 融进 GEMM**(fused epilogue)/ 融合核比 plain GEMM 慢想追 parity | **methodology/18**(融合口径 total-vs-total + gated 的 pitch-vs-real + 部署测量)|
 | 要**跑/盯/救一场 campaign**(起不来、卡住、要 resume、数对不上) | **methodology/16(整卡读)** |
 | 想在**真实 e2e 训练**里验证某 kernel 有没有真跑(别加 print) | **methodology/17**(开 profiler 看 trace)|
 | 要把 **grouped gemm trace 时长换成达成 TFLOP/s** / 算出的数字比 campaign 低一个数量级 | **methodology/17** §FLOPS 换算(★别把每层指派再除 L)|
@@ -79,7 +80,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [crusoe/01-access-spur-container](connection/crusoe/01-access-spur-container.md) — 登录(csh坑/host key轮询/node-ssh)+login红线(Guardian杀内存)+spur账号关联+**容器=节点dockerd+docker run**(spur --container-image是死路)+docker-exec引号helper+两venv build(clone pip-shebang污染/flydsl 0.2.2 egg坑/git safe.dir)+存储(/shared_nfs/kyle)+已验证dq 1100TF
 
 ### connection/smci355/ — smci355 SLURM+docker 节点连接卡（2026-07-20 迁移，chi 跳板挂掉后）
-- [smci355/01-node-setup](connection/smci355/01-node-setup.md) — 直连(.ssh_laptop key/IdentitiesOnly)+sbatch(--partition=Compute-DCPT)+起 kyle_dev(rocm/primus:v26.3)+FlyDSL pip 0.2.2(镜像自带 dev409 缺 expr.math)+meta-attn(FAST=0/FLYDSL_EXTRA_SOURCE_DIRS)+两套 turbo(mxfp4 /opt/venv、tensorwise /opt/venv-tw,CK 从 mxfp4 拷)+**★镜像 tar 与恢复:`/data/kyle_0814/docker_images/` 与 NFS `docker_images/` 各一份 19G,容器被重建时 `docker import` 秒回,别再手搭 5 个 venv**
+- [smci355/01-node-setup](connection/smci355/01-node-setup.md) — 直连(.ssh_laptop key/IdentitiesOnly)+sbatch(--partition=Compute-DCPT)+起 kyle_dev(rocm/primus:v26.3)+FlyDSL pip 0.2.2(镜像自带 dev409 缺 expr.math)+meta-attn(FAST=0/FLYDSL_EXTRA_SOURCE_DIRS)+两套 turbo(mxfp4 /opt/venv、tensorwise /opt/venv-tw,CK 从 mxfp4 拷)+**★镜像 tar 与恢复:`/data/kyle_0814/docker_images/` 与 NFS `docker_images/` 各一份 19G,容器被重建时 `docker import` 秒回,别再手搭 5 个 venv** + **★★2026-08-31 `kyle_sglang`(lmsysorg/sglang:v0.5.18-rocm720-mi35x):拉镜像前必 `docker logout`、aiter 装我们 fork 要清旧 `.so`、★fork 只能跑 flydsl 0.3.2(0.2.4 上 `buffer_ops` 的 `soffset=None` 直接崩)**
 
 > ⚠️ connection/ 是 env-specific 层:只放**你自己环境**的连接卡;相邻/别人的环境(名字相近的容器·盘)严禁在此混入或触碰,见上「环境红线」。
 
