@@ -100,9 +100,17 @@
 | ✅ pro cr0/cr128 interm(慢 triton ~20%) | ✅开口 | 研究 triton 小 topk tiling/少 launch | pitfalls/12 |
 | ✅ banded-SWA dKV 融合 / hybrid scatter | ✅开口 | 减 interm+gather 的 2× tensor HBM | pitfalls/12 |
 
+| ★★★ **动「减 MFMA」这条结构杠杆前,先算它还剩多少可减** | ✅先算再决定 | `issued_atoms ÷ causal-exact flops − 1` = 冗余率。gpt-oss D=64 bwd 实测**只多 3.1%**(残差=对角带在 64×64 粒度的半三角)⇒ 那个 body 上整条杠杆封顶 3.1%,不该再开结构轮。>15% 才按「优先级最高」打,<5% 直接跳 stall | methodology/15 §BWD 减 MFMA |
+| ★★★ **PMC 三元组的第二种读法:盯 `neither%`(stall)而不是 coexec,往往是更短的路** | ✅方法 | MFMA/VALU busy 是固定工作量 ⇒ `stall' = 1 − (M+V−C)/X`。同 body(44.0/36.4/8.5,stall 28.1%)要 1.155×:**只需 stall −48%,coexec 不动**;只走 coexec(8.5→17%)**仍要 stall −17%**。踩证:该核 r7–r13 八轮全押 coexec/调度族,合计只值 +0.4~4.0%,而 stall pool 从没被定价 | methodology/15 §coexec |
+| ★★ **fwd 和 bwd 可能用不同的 MFMA 形状,别假设统一** | ✅先 dump 事实 | 同一代码库:bwd 五个 GEMM 全 `16x16x32`(40 轮标准化的结果),**fwd 两个 GEMM 是 `32x32x16`**(`utils/attn_helper.py:736`)。bwd 侧实测把 GEMM2 换成 32x32x16 = **+12% 更慢**("gfx950 上该 atom 让 pipeline cycle 翻倍")⇒ fwd 侧大概率有肉。换形状**不改精度**(都 bf16/fp32),但是真移植:fragment 布局/`ds_read_tr16`/寄存器/softmax lane 映射全变 | methodology/15 §MFMA 形状 |
+
 ## D2. attention(Meta/gpt_oss hd64 DENSE flash bwd,确定性)—— 详见 pitfalls/13
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |
 |---|---|---|---|
+| ★★✅ **先量 `SQ_VALU_MFMA_COEXEC_CYCLES ÷ SQ_VALU_MFMA_BUSY_CYCLES` 再选杠杆**(occ-1 bwd 的第一诊断量) | ✅**6/6 臂**按 wall 正确排序,灵敏度是 wall 的 5× | gpt_oss d64 dkdv = **19.2%**;MFMA busy 44% + VALU busy 36% − coexec 8.5% = 71.9% busy-union、28.1% 两管线全闲 ⇒ 完全重叠 **1.39×**。同 body 上指令数/arch dword **双向实测为 0**。⚠跨 kernel 比之前先比 `SQ_WAVE_CYCLES÷SQ_BUSY_CYCLES`(fwd 31.5 vs dkdv 7.7 驻留 wave/CU) | methodology/15 §occ-1 第一诊断量 |
+| ❌ **把独立 MFMA 塞进 VALU 窗口(靠发射顺序)** | ❌ coexec 19.2%→15.9%,wall −3.0% | LLVM 把它 hoist 到发射区顶端;**放进窗口比放窗口外还差 0.8%**。要做必须配 `sched_barrier(0)` 钉调度区且**不新增 fence** | methodology/15 · pitfalls/09 |
+| ❌ **靠"挪消费者"降 softmax 的 P-live 压力** | ❌ −4.0% / −0.9% / −6.3% | softmax 块**就是**寄存器峰值;拆 dP per-tile、把半区 dS/pack 推迟进下一半 GEMM1a、把 dV MFMA 塞进 softmax nt 循环,三向全负(第三向 spill 0→5)。要动先**缩短 softmax 自己持有的位宽/条数** | pitfalls/13 |
+| ⚠ **tied `"=a,0"` 把 MFMA operand 钉进 AGPR** | ⚠只在 kv-block-invariant 处 ✅(+0.79/+0.53%) | 摊薄点决定符号:per-head-step 的同类操作数是 **−3.4% / −2.6%** 且更胖。⚠未绑定的 `"=a,v"` 会**静默删掉操作数**并伪造 +4.5%;asm-MFMA 累加器在 NT=2 上错 −0.9dB | methodology/06 §tied-operand |
 | ★✅ **XCD-major block_id 解码**(`xcd=bid%8`,每 XCD 一整块 (batch,kv_head)) | ✅dkdv+2.81% / dq+0.54% | per-XCD 私有 L2,让共读同份 K/V 的 GQA WG 相邻(dq L2 hit 86.5→94.8%)。**内层轴 dq 要 kv-head 相邻、dkdv 要 q 相邻,选反=−2.5% vs +2.4%**。⚠推翻旧记的"XCD remap GPU-fault 判负"(那是实现炸了) | pitfalls/13 · methodology/05 |
 | ★✅ **dq 派发降序 q_tile(LPT)** | ✅+2.50% | 因果工作量单调递增且**派发序=list-schedule 序**→长任务优先。⚠**别假设 in-order 最优**:dkdv 恰好已是 LPT 但 dq 是反的 | pitfalls/13 · methodology/05 |
 | ★✅ **冒险锚点减量 per-slot→per-v4** | ✅dq+1.76% / dkdv+0.77% | clamp 是 MFMA→trans 冒险载体(非数值保护),但只需每 v4 一个;其余 slot 靠 inline-asm dead operand 钉序。`v_min` 72→3 / 256→64 | pitfalls/13 |
@@ -266,6 +274,14 @@
 | 用**代换探针**给一条指令定单价 | ❌方法错 | 差额会被重叠吃掉:exp 代换读出"全速率",PMC 直接分解是 half-rate(8.14 拍),差 1.6× | connection/common/05 · pitfalls/13 |
 | 在 e2e 训练里**加 python print** 验证某 kernel 有没有真跑 | ❌方法错 | 派发路径可能不是你以为的那条(MoE 走 ragged,不经 PrimusTurboGroupedLinear/公共 grouped_gemm_fp8)→ print 在死路全为 0,误判"没触发"。**开 torch profiler 看 trace kernel 名才是 ground truth**(pad-quant kernel = K-pad 铁证) | methodology/17 · [[project_kpad_e2e_trace_validated]] |
 
+| ★★★ **campaign 连续多轮「no new best」时,先怀疑尺子,别怀疑想法** | ✅三条命令诊断 | 一场 17 轮里十三轮空转,停场后复测发现 r9–r12 **每轮都有 0.2–1.4% 的真实增益**。三条税叠加把判定线推到 ≥1.5%:①banked best 在**它自己的 commit** 上复现不出(−0.5% 幽灵)②硬 cap guard 是单边噪声税(**逐位相同**的代码跨 8 次跑离散 3.2%,`min(r,1.0)` 只能减)③3-rep max 比 high-water。诊断:回到 banked commit 重测 / 同码连跑看 guard 离散 / `--calibrate` 量 spread | methodology/16 §尺子会撒谎 |
+| ★★ **`--repeat` 和「要不要 BUNDLE」应由实测 spread 决定,不是照抄** | ⚠️同 kernel 的 fwd/bwd 差 2–4 倍 | D=64 **bwd** spread ~1.0% ⇒ 最小可测增益 ~1.5% ⇒ 必须 BUNDLE;同 kernel **fwd** spread **0.3–0.8%** ⇒ 0.3% 就能独立计分。**把 BUNDLE 搬到干净尺子上是浪费**(糊成一坨、无法二分)。起场前先 `--calibrate` | methodology/16 §先量尺子 |
+| ★★ **guard 的 cap 要留容差,`min(ratio,1.0)` 是单边税** | ⚠️修正旧条目 | 容差要 ≥ 该 guard 腿实测离散的上界。改成 `1.0 if r>=0.98 else r/0.98` 之后,guard 腿**每轮都是 1.0**,而旧口径同样读数会有若干 0.99x 白扣分;它仍抓得住真回退。17 轮里硬 cap **一次真回退都没抓到** | methodology/16 §兄弟盲区 |
+| ★★ **共用文件 ≠ 共享收益:给每个不计分的变体测 before/after** | ❌踩证 40 轮零转化 | D=64 与 D=128 bwd 是同一个 `.py`。D=128 打了 40 轮 +19.30%,同尺子测 D=64:**997.2 → 990.0 TF/s**(零转化还微负)。根因是四道 `D == 128` 门 + 计分脚本抬头写着 "LLAMA ONLY … out of the score and out of the guards"。开门那一轮单轮 **+6.36%** | methodology/16 §形态 A |
+| ★★ **上下游共用中间量时,加「端到端门」** | ✅代价≈0 | fwd/bwd 共用 **LSE**。改 LSE 布局去加速 fwd ⇒ fwd 自己的 SNR 满分、bwd 静默崩。做法:用**被优化那一侧的真实输出**驱动下游再查 SNR(`o,lse=forward(); dq,dk,dv=backward(...,o,lse)`)。部署实测 fwd 51.7 dB / e2e 49.3-49.0 dB,门设 45 | methodology/16 §形态 B |
+| ★ **别用 score 反推 TF/s**(score 含 guard 因子) | ⚠️系统性偏高 ~1.5% | 反推 1057 vs 真值 1033–1043。**在 bench 里就把 `tflops` 算好写进 JSON**,监控端直接读 | methodology/16 §运维坑 |
+| ★★ **列 campaign 进程树用 `pgrep -P`,不要 `ps -eo ... --ppid`** | ⚠️`-e` 覆盖过滤 | 容器 PID1 是 `sleep infinity` 不 wait ⇒ 几万个 `<defunct>` 刷爆屏幕,真正要杀的 PID 反而看不见。另:兜孤儿必须兜到远端容器里的 `rocprofv3` —— 停机时兜出过一个挂 **15.7 小时**、一直占卡的 `--kernel-trace` | methodology/16 §运维坑 |
+
 ## H. 环境 / 同步 / 构建(违反=破坏别人环境)
 | 你想试的动作 | 判定 | 一句根因 | 详卡 |
 |---|---|---|---|
@@ -284,6 +300,16 @@
 | kernel 与 torch 同模块 | ❌RecursionError | JIT 依赖收集爆栈;kernel 放独立纯模块 | pitfalls/05,07 |
 | CDNA 旋钮导 RDNA / TF32 导 gfx950 / transpose-load 导 gfx942 / 硬编码 `gfx*` | ❌DEAD | 编码/调度跨代不通;判据用 `is_rdna_arch()` | pitfalls/11 |
 
+## J. 算子融合(把 activation/SwiGLU 折进 grouped GEMM 的 epilogue)—— 详见 methodology/18
+| 你想试的动作 | 判定 | 一句根因 | 详卡 |
+|---|---|---|---|
+| 拿融合核的 **per-op TF/s** 去比零 epilogue 的 **plain GEMM**、追 parity | ❌**伪目标** | 融合核把 activation 的活也扛了,是"多干活的核"比"没干那活的核";正确口径永远是 **融合-total(fc1+act+fc2)vs 非融合-total**。融合 glu −14%/dglu −28% 的 gap 是结构性的(dglu 强制 2× HBM、glu 第三条 act 流串行写、occ 已顶),**total 折进来是净赚** | methodology/18 §2,§9 |
+| 融合 **gated activation** 时把 per-half 维 pad 到 Ip,靠**纯零传播**(只按权重形状推 I=Ip) | ❌**grad_w1 会死** | fwd/dgrad 对,但 w1 梯度真实内容在 `[0,I)∪[Ip,Ip+I)` 夹 pad 行,`m_real` 截前 2I 行截出"整段 padded gate + 半段 up",对不上 tight。**正解=glu/dglu 核内按 pitch(Ip)算、按 real(I)存**(`glu_i` 劈 pitch/real,up-offset 用 pitch、列掩码用 real、pad 段写零) | methodology/18 §4 |
+| 用 campaign 的**两核平均**分数评"只动了单核"的改动 | ⚠️**会掩盖真增益** | 单核 `+0.55%`(5 读数无重叠)被另一核 run 的噪声淹掉,平均门 60 轮不动;**只动单核就看那核自己的 ratio/ms,不看聚合 spd_fuse** | methodology/18 §3 · methodology/16 |
+| 报融合 MLP 绝对数时传 **bf16 权重** | ❌**部署假象** | bf16 权重每次调用**重量化**(~15% fwd),部署一次性预量化缓存不吃这块;**部署代表数要传 `QuantizedTensor`**(x 仍 bf16=动态 fp8 固有)。bwd 复用 fwd 存的 fp8 权重、从不重量化 ⇒ 预量化只动 fwd | methodology/18 §7 |
+| in-GEMM fold(dQ partial / deep-K split partial 折进主 pass)不看**闸门归属** | ⚠️**生产者/消费者自旋** | 恰好一个组/tile 越切分闸门即另一半空转,**结果正确但慢 10–2000× 且抖动**,SNR/det 门抓不到;落地前确认所有组同闸门侧(`k≥2 组越闸`才干净),上线盯尾延迟 | methodology/18 §3.5 |
+| 融合 epilogue 的累加器放 AGPR / 融合核追 plain GEMM 的写侧优化 | ✅**可白赚** | 累加器留 VGPR(mma mode 3)省 `v_accvgpr_read`(NT 喂料 S2RLoader、reg 预算不变);plain 的成对列 store 移植进 glu-fwd **+3.7%**(比普通 NT 更肥=三流写压),col_safe 靠 I 偶+pair 落偶列掩码 | methodology/18 §5,§8 · methodology/07 |
+
 ---
 维护:新判负的杠杆先进对应详卡(带根因+实测数字),再在本表加一行入口。本表只放**高频被重试**的,长尾留详卡。
-来源:全库 pitfalls/01-12 的 ❌ 汇总 + memory dsv4/mxfp4 系列。
+来源:全库 pitfalls/01-12 的 ❌ 汇总 + memory dsv4/mxfp4/fused-mlp 系列。

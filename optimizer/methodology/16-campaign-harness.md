@@ -559,3 +559,137 @@ fwd 场 r15 单轮 +9.17%,量级与此前所有轮次不同 ⇒ 用另一套 ben
 `.rsync-exclude` 明确保留 `.git`,不能全局排除;远端还可能有本地没有的 object/pack ⇒ **删了就丢历史**。
 解法:host 侧以自己身份 `cp -a --no-preserve=ownership .git .git_reown` 再换名(核对条目数一致、nobody 归零)。
 ⚠ **只 chmod 不够** —— `rsync -a` 还要 set permissions,那需要属主身份。
+
+---
+
+## ★★★ 尺子会撒谎:一场 17 轮里十三轮「no new best」的完整解剖
+*(2026-08-29/30,gpt-oss D=64 attention bwd,两场连续;结论对任何 campaign 通用)*
+
+**症状**:r2 +6.36% / r4 +0.70% 两个 keep 之后,**连续十三轮报「no new best」**,而每一轮的
+候选 TF/s 其实都在慢慢往上爬。停场后逐条复测,发现 r9–r12 每轮都产生了 **0.2–1.4% 的真实、
+可复现的增益**,一个都没进账。**失败的不是想法,是尺子。**
+
+### 三条税,全部量化过
+
+| # | 税 | 实测 |
+|---|---|---|
+| 1 | **banked high-water 在它自己的代码上复现不出来** | `49ee57a0` banked 1.07433;同一 commit 重测 **1.06795**(replan 测)/ **1.06989**(我 ABBA 4 样本/臂复测)。**−0.5% 幽灵**,每个后续候选都要先跨过它 |
+| 2 | **硬 cap 的 guard 是单边随机税** | 在**逐位相同**的 D=128 代码上跑 8 次,`l70b` 跨度 **2.6087–2.6917 = 3.2%**。`min(ratio, 1.0)` 让这 3.2% **只能减分**。17 轮里它**一次真回退都没抓到** |
+| 3 | **orchestrator 拿 3-rep 的 max 去比 high-water** | r12 的 +0.30%、r11 的 +0.12% 都被判 "no new best" |
+
+⇒ **三者叠加,候选要 ≥1.5% 的真实可复现改进才能稳定读成 new best。** 而真实 win 是 0.2–1.4%。
+
+### 诊断配方(起场前 / 卡壳时,各跑一次,半小时)
+
+```bash
+# ① high-water 是不是幽灵:回到 banked 那个 commit,用同一把 bench 重测
+git checkout -q <banked_commit> && bash remote.sh "python3 -u <bench>.py" ; git checkout -q <branch>
+#    读数比 banked 低 >0.3% ⇒ 你的 best 是一次幸运采样,后面全在追一个不存在的门槛
+
+# ② guard 的噪声有多大:同一份代码连跑 5-8 次,只看 guard 腿
+#    离散 >1% 而你用的是 min(...,1.0) ⇒ 你在给每个候选上单边税
+
+# ③ 尺子地板:5 次/cell 丢首取中位数,记下 spread
+bash remote.sh "python3 -u <bench>.py --calibrate"
+```
+
+### 解法组合(下一场直接照抄)
+
+1. **base 前移 + 重新校准**,别继承旧 best。让 `1.0` 等于今天的真实水平,分辨率全花在增量上,
+   不用先跨越历史累积的那一大截。
+2. **guard 用容差带,不用硬 cap**:
+   ```python
+   GUARD_TOL = 0.98            # 退 2% 以内不扣分,超了才按比例罚
+   r = BASE[g] / cur[g]
+   grd.append(1.0 if r >= GUARD_TOL else r / GUARD_TOL)
+   ```
+   实测效果:改完之后 guard 腿**每一轮都是 1.0**,而旧口径下同样的读数会有若干 0.99x 在白扣分。
+   它仍然抓得住真回退 —— 只是不再把噪声当回退。
+3. **`--repeat` 3 → 5**,并且校准时**丢掉第一次跨进程读数**(JIT + 冷 GPU context)。
+   ⚠ 诚实的负面结果:JIT 缓存已热时,丢首次**并不能**缩小离散(实测 spread 从 0.92% 只到 0.92%)。
+   丢首次防的是冷缓存那一次,不是万灵药 —— **该多采样还是要多采样**。
+4. **`--revert-patience` 调大到实际不 revert**(见下一节)。
+5. **BUNDLE**:尺子确实糙(≥1%)时,禁止单独 bench <1% 的项,一轮 ship 整个累积栈。
+   ⚠ **但这是补丁不是普适规则** —— 见下面「先量尺子」。
+
+### ★ 起场前先量尺子,策略跟着尺子走
+
+同一个 kernel 的 fwd 和 bwd,尺子差 **2–4 倍**:
+
+| | 校准 spread | 可测的最小增益 | 策略 |
+|---|---|---|---|
+| D=64 **bwd** | ~1.0%(0.92/0.94/1.30/0.95) | ~1.5% | 必须 BUNDLE |
+| D=64 **fwd** | **0.3–0.8%**(0.78/0.53/0.51/0.32) | **~0.3%** | 单项即可计分 |
+
+**把 BUNDLE 无差别地搬到干净尺子上是浪费**:它会把本来能独立计分、独立归因的项糊成一坨,
+出问题时无法二分。**先 `--calibrate` 量出 spread,再决定这一场的最小增量单位。**
+
+---
+
+## ★★ harness 的 revert 会静默丢掉多轮工作
+
+`--revert-patience N`:连续 N 轮没破 best 就把工作副本回退到 banked best。
+**踩证**:D=64 bwd 第一场 `revert-patience 8`,r5–r12 的累积改动被回退掉,**九轮工作凭空消失**;
+是 r14 的 replan agent 偶然发现「这些 diff 还在 `rounds/` 里」才一条命令捞回来,
+捞回来实测值 **+0.81%**。没那次偶然就永久丢了。
+
+* **`--revert-patience` 设成实际不会触发的值**(20 起步)。工作副本一直往上叠,best 只是记账。
+* **让 agent 每轮自己存一份累积 diff**,写进 goal 的硬规则:
+  `git diff > rounds/round-NN/agent_diff.txt` —— 不要依赖 harness 的副本。
+* 停机时 `git diff > <dir>/WT_at_stop_rNN.patch` 是**第一步**,先于任何 kill。
+
+---
+
+## ★★ 兄弟盲区的第二种形态:同一个文件里的两个变体
+*(补前文「只给一个算子打分时,把兄弟算子设成护栏」)*
+
+前文讲的是**不同算子共用 helper**。还有两种更隐蔽的形态,这几场都吃过:
+
+### 形态 A — 共用文件,但被条件门隔开 ⇒ 优化「零转化」
+
+D=64 和 D=128 的 attention bwd 是**同一个 `flash_attn_bwd.py`**。D=128 打了 **40 轮、$841、
++19.30%**。同一把尺子实测 D=64:campaign 开始前 **997.2 TF/s**,四十轮之后 **990.0** ——
+**零转化,还微负**。根因是四道 `D == 128` 门(最大那道把整个 a16 方案挡在外面),
+而计分脚本自己的抬头就写着 *"LLAMA ONLY. gpt-oss and every D=64 shape are out of the score
+and out of the guards"*。
+
+> **共用文件 ≠ 共享收益。** 起场前对**每一个不计分的变体**测一遍 before/after;
+> 收官时也测一遍。差值是 0 就要去查有没有条件门 —— 那往往是下一场最肥的 P0
+> (这里:开门那一轮单轮 +6.36%)。
+
+### 形态 B — 共用中间量 ⇒ 需要「端到端门」
+
+fwd 和 bwd **共用 LSE**:bwd 吃 fwd 产出的 `O` 和 `LSE`。一个为了加速 fwd 而改动 LSE 布局/语义
+的编辑,**fwd 自己的 SNR 照样满分,bwd 静默崩掉**。纯 fwd 的门物理上看不见这件事。
+
+做法:计分脚本里加第二道门,**拿被优化那一侧的真实输出去驱动下游**:
+```python
+o, lse = forward(...)                      # 被优化的这一侧
+dq, dk, dv = backward(do, ..., o, lse)     # ★ 用它自己的 o/lse,不是参考值
+snr_e2e = [snr(ref_grad, got) for ...]     # 下游的 SNR 才是真验收
+```
+部署实测:`snr_fwd` 51.7 dB,`snr_e2e` 49.3/48.8/49.0 dB —— 门设 45 dB,正常波动不碰,
+LSE 被改坏会暴跌。**代价接近零,挡住的是最难查的一类错误。**
+
+### ★ 修正前文:护栏的 cap 要留容差,别用硬 1.0
+前文那条「低于冻结下限就 `ok:false`」在**噪声 <1%** 的场景成立(那场是 GEMM,留了 2-3% 余量)。
+attention 场的 guard 腿噪声 3.2%,硬 cap 就变成单边税了 —— 见本节开头的第 2 条税。
+**规则:cap 的容差要 ≥ 该 guard 腿实测离散的上界。**
+
+---
+
+## ★ 这几场新踩的运维坑
+
+* **★ 别用 score 反推 TF/s。** score 里含 guard 因子,反推会系统性偏高(实测偏 ~1.5%:
+  反推 1057 vs 真值 1033–1043)。**直接从 bench 的 JSON 读 `tflops` 字段** ——
+  在 bench 里就把它算好输出,别让监控端去凑。
+* **★★ 列进程树用 `pgrep -P <pid>` 逐层,不要 `ps -eo ... --ppid <pid>`。**
+  `-e` 会覆盖 `--ppid` 过滤 ⇒ 输出变成全表,而容器 PID1 是 `sleep infinity` 不 wait 子进程,
+  **几万个 `<defunct>` 会把屏幕刷爆**(见 connection 卡的僵尸条目),真正要杀的 PID 反而看不见。
+* **★★ 兜孤儿一定要兜到远端容器里的 `rocprofv3`。** 停机时兜出过一个挂了 **15.7 小时**的
+  `rocprofv3 --kernel-trace`(PPID=1,某轮 agent 留下),**它会一直占着卡**。
+  `docker exec <ct> bash -lc "ps -eo pid,etimes,cmd | grep -E 'rocprofv3|_probe|pytest'"`。
+* **主控被 TERM 后 `ps` 显示 `Z` 是正常的** —— 容器 PID1 不 wait,僵尸不占 CPU/内存/GPU,
+  别再去 kill -9 一遍。
+* **一个 campaign 目录一把梭的精确匹配**:`ps -eo pid,cmd | grep "<campaign_dir_timestamp>"`
+  —— 同机常有别人四五个 campaign,按 `--tag` 或目录名匹配,**绝不能按 `flydsl_campaign.py` 模式杀**。

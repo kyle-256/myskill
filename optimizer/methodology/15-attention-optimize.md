@@ -68,7 +68,58 @@
 
 ★ 判这层改动看 **`SQ_WAIT_ANY` / `SQ_VALU_MFMA_COEXEC_CYCLES`,不要看 TCC hit%** —— hit 率大涨可以值 0 wall。
 
-## BWD 专属杠杆:减 MFMA(唯一够大的结构杠杆,优先级最高)
+### ★★ occ-1 attention 的第一诊断量 = `SQ_VALU_MFMA_COEXEC_CYCLES / SQ_VALU_MFMA_BUSY_CYCLES`(2026-08-29 gfx950 实测)
+上面那条只把 coexec 当"内存类改动的判据"。实测它是 **occ-1 attention bwd 的主坐标**:
+- gpt_oss d64 bwd `dkdv`(occ 1,4 wave/WG):MFMA-pipe busy **44.0%**、VALU busy 36.4%,两者相加 80.4%
+  ⇒ 两条流水**几乎串行**;coexec/MFMA_busy 只有 **19.2%**,即 MFMA 忙的 8 成时间向量管线闲着。
+  同一 trace 里同机同 shape 的 **fwd `flash_attn_dualwave_swp_gfx950` = 48.1%**,2.5×。
+  ⚠ **别把这个 48.1% 当 occ-1 body 的目标**:同一次 PMC 里 `SQ_WAVE_CYCLES ÷ SQ_BUSY_CYCLES`
+  = fwd **31.5** vs dkdv **7.7** 驻留 wave/CU,fwd 的重叠大部分来自**兄弟 wave**,不是 intra-wave ILP。
+  跨 kernel 比 coexec 前先比这个驻留比;**可达值要从管线算术推**(下一条),不是从别的 kernel 抄。
+- **它是唯一能把三个 `iglp_opt` strategy id 按 wall 正确排序的计数器**(MFMA busy 三臂**逐位相同**,
+  WAVE_CYCLES 与 coexec 单调同向):id3 coexec 19.2% / wave 1.483e10;id2 15.6% / 1.556e10;
+  id0 14.6% / 1.553e10。⇒ 调 region-scheduling / 软流水时,**用 coexec 当方向盘,别用指令数或寄存器数**
+  (同一 kernel 上 −351 指令 = 0.0%,而零指令的 iglp id 改动 = +0.85%)。
+- 换算(**推荐口径**):把时间线拆成 `busy_union = MFMA% + VALU% − coexec%` 与 `neither%`。
+  该 body:44.0 + 36.4 − 8.5 = 71.9% busy-union,**28.1% 两条管线都闲**(等待)。完全重叠后
+  busy-union 收缩到 44%,等待不变 ⇒ 时间线 72.1%,即 **1.39×**;等待也随依赖链缩短则更多。
+  ⇒ 报"重叠头room"时给这个**保守 1.39×**,别给 `max/sum` 的 1.5×(它默认等待为零)。
+- ★★ **"往 VALU 窗口里塞独立 MFMA"不会自动兑现:LLVM 会把它 hoist 出去。** 同 body 实测——
+  把 GEMM3 拆成每 q-half 一趟(16 条独立 MFMA 正对着 softmax 窗口)= **coexec 19.2% → 15.9%,
+  wall −3.0%**;把同一趟放到 GEMM1 之前 = 16.1% / −2.2%(**放进窗口反而比不放差 0.8%**)。
+  两个混杂项已知(每半区多一个 barrier、+8 dword),但方向是清楚的:**软流水必须配
+  `sched_barrier(0)` 把调度区钉死**(见 pitfalls/09 §sched_barrier 是 load-bearing 且 ordering-only,
+  且必须放在拥有那次 LDS write 的 `gpu.barrier()` 之后、constexpr loop 之外),**并且不能新增 fence**。
+  ★ 注意 `SQ_VALU_MFMA_BUSY/COEXEC` 是 4 个 SIMD 的和,`SQ_ACTIVE_INST_VALU`/`SQ_WAVE_CYCLES` 不是;
+  比值(coexec ÷ MFMA_busy)无量纲、可直接比,绝对占比要先 ÷4。
+- ★★★ **同一组 PMC 还有第二种读法,而且往往是更短的那条路:盯 `neither%`(stall),不是 coexec。**
+  MFMA busy 与 VALU busy 是**固定工作量**,目标时间线 T' = T/加速比,于是:
+  ```
+  想要 X× 加速  ⇒  stall' = 1 − (MFMA% + VALU% − coexec%) / X      # coexec 保持原值
+  ```
+  同一 body(44.0 / 36.4 / 8.5,neither 28.1%)要 1.155×(D=64 bwd 1054→1200 TF/s):
+  **只需把 stall 从 28.1% 砍到 14.7%(−48%),coexec 一动不动即可达成**;
+  反过来只走 coexec 路线(8.5%→17.0% 翻倍)**仍然要 stall 降 17%**。
+  ⇒ **每条路都要穿过 stall,只有一条还额外要求 coexec 动。** 先给 stall pool 定价
+  (barrier / waitcnt / LDS-return / prologue-epilogue 各占多少),再决定要不要碰调度。
+  踩证:该 kernel 的 r7–r13 八轮全押在 coexec/调度族(iglp、sched_group、region-mutation、
+  chain-split),合计只值 **+0.4% ~ +4.0%**;而 stall pool **从头到尾没被定价过**。
+
+## BWD 专属杠杆:减 MFMA —— ★但先算它还剩多少可减(2026-08-30 修正)
+
+★★★ **先做这道算术,再决定这条杠杆的优先级。** 下面三项在「还有冗余 MFMA 可丢」时量级很大
+(dq drop-B-GEMM +9.8% 是实测),但一旦 body 已经因果裁剪干净,**整条杠杆就封顶在冗余率上**。
+
+```
+每 tile 的 atom 数 = 5 个 GEMM × (BLOCK_KV × BLOCK_Q × D) MAC ÷ 8192 MAC/atom
+因果裁剪后的 tile 数 = Σ_b (S − BLOCK_KV·b) / BLOCK_Q          # b 遍历 kv band
+issued_flops = batch × kv_head × q_head × tiles × atoms × 16384
+冗余率 = issued_flops / (计分口径的 causal-exact flops) − 1
+```
+gpt-oss D=64 bwd 实测:5.669e12 vs 5.4976e12 ⇒ **只多 3.1%**(残差是对角带在 64×64 粒度上的
+半三角)。⇒ **那个 body 上「减 MFMA」最多值 3.1%,不该再为它开结构轮。**
+先花十分钟算这个数;>15% 才按「优先级最高」打,<5% 直接跳到步骤 2/stall。
+
 1. **审计可丢弃的 GEMM / 全局修正项**:第二 GEMM、rho/R 全局 renorm(精度代价常 ~0.2dB 非破门)。dq drop-B-GEMM 实测 **+9.8%**。**永远先做**,纯减法量级大。
 2. **融掉全串行辅助核**:`delta=rowsum(O·dO)`(odo)、interm restage 等串行且随 Sq 放大 → 融进主核。odo delta 融合 **+5.3%**(长 Sq 最大)。★坑:融合核直读 O/dO,wrapper 必须 `out/dout.to(q.dtype)` cast,否则喂 fp32 O → 崩/NaN(见 02)。
 3. **核间共享重算 GEMM1**(dq+dkdv 共用 S=K@Q^T,理论 -25% MFMA):**三重陷阱常吃光收益,先 spike 再建**:①确定性陷阱(q-outer dK/dV q-归约不用 atomics 无法有界+确定→必 KV-outer);②register 墙(两套累加器共驻 spill→常被迫 BLOCK 减半);③workspace 流量(~GB split-K + 减半 tile per-tile 惩罚)。hd64 实测融合核 **1.95-2.55× 慢**→短收缩维判死。设硬 abort 门。
@@ -120,3 +171,37 @@ hd64 fwd 收官时踩到:GQA sharer merge 在 full-causal 上 +1.8%,在同形状
 window_left < 0` 把 causal band-trim 只留给 full-causal,SWA 下每 kv-band 把全 causal q-loop 算完再全掩=纯浪费,
 使我们的 SWA wall dividend 只有 7.3×(GB300 9.54×)。加 window-aware q-loop 上界(裹 `const_expr(window_left>=0)`
 保 full 字节不变)把 SWA 216→298 eff-TF、dividend 拉到 10.1×(反超 GB300)。见 pitfalls/13 §2026-08-09 GB300 对标。
+
+---
+
+## ★★ MFMA 形状:fwd 和 bwd 在同一份代码库里用的可能不是同一个 atom(2026-08-31)
+
+gpt-oss / llama 这套 FlyDSL attention,**两条路径的 atom 不一样,而且是历史沉淀不是设计**:
+
+| | atom | 出处 |
+|---|---|---|
+| **bwd**(全部五个 GEMM) | `v_mfma_f32_16x16x32_bf16` | 40 轮 campaign 标准化的结果 |
+| **fwd**(S=QK^T 和 O=PV) | **`v_mfma_f32_32x32x16_bf16`** | `utils/attn_helper.py:736` |
+| fwd 的 row-sum(可选) | `16x16x32` | 同文件 :738,`DUALWAVE_SWP_MFMA_ROWSUM` |
+
+**bwd 侧有一次直接实测**:把 GEMM2 从 16x16x32 换成 32x32x16(`g2_w32`)= **+12% 更慢**,
+注释原话 *"on gfx950 that atom doubles GEMM2's pipeline cycles"*。fwd 用的正是它。
+
+⇒ **审 attention 时把「两条路径各自发的 atom」当成第一批要 dump 的事实**,别假设统一。
+换形状**不改精度**(都是 bf16 in / fp32 acc),所以不在「禁量化」红线里 —— 但它**是真移植**:
+per-lane fragment 布局、`ds_read_tr16_b64` 的读法、寄存器足迹、softmax 的 lane 映射全都跟着变。
+先出 ISA delta(`v_mfma` 计数 / vgpr / agpr / spill / `ds_read` 构成)再上 bench。
+
+## ★★ a16:非确定性原子 dQ —— 什么时候值得,什么时候不值得
+
+`buffer_atomic_pk_add_bf16` 把 dQ 直接累加进一张 band-less 的 bf16 image,**删掉整个 split-K
+workspace 和 fold**。代价是 dq 不再逐位可复现(dK/dV 仍然是),精度代价实测 **~1.1 dB**。
+
+* **D=128 上它是整场的立身之本**:r16 落地 +2.11%,并且解锁了后续 r20 的 tied-operand MFMA
+  (+12.29%)——**a16 的价值有一大半是"它让别的东西成为可能"**,单看自己那 2% 会低估它。
+* **关键是地址模式,不是指令**:一条指令的 64 lane 必须覆盖连续 256 B(4 条 cache line)。
+  照 store 的地址布局直接发原子 = 覆盖 16 条 line,**慢 8.6×**(13.3 ms vs 1.5)。
+* ⚠ **它对下游是"传染"的**:D=64 base 原本 dq 逐位确定,打开 a16 之后就不是了。
+  这属于**行为变更**,要先跟用户确认 —— 别当成纯性能改动偷偷 ship。
+* **判它之前先量 fold 的暴露成本**:D=128 上 fold 是 0.414 ms/12.9%,值得换;
+  如果 fold 已经 99% 被藏住(partial store 是幂等的、可被 overlap),换过去就是纯亏。
