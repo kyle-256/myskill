@@ -18,6 +18,25 @@ ISA 里是 `v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[..], v[..], a[0:3]`、`.
 spill 0、SNR 逐位不变。在 mx8tw 的 NT 核上它把 **arch VGPR 246 → 184、空闲 arch 寄存器 10 → 72**,
 正好是此前四轮跨 tile/persistent 改动一直差的那 23–25 个。
 ⇒ **动手前先花 60 秒编译一个探针,别按下面的旧记录直接放弃 AGPR。**
+
+★★ **2026-08-29 追加三条 scope/correctness 条款(gpt_oss d64 attention bwd,20+ 臂实测)**:
+1. **判据不是 `accum_offset`,是 shuttle 流量。** 有人按"钉了 accumulator 后 `accum_offset` 仍是 256"
+   得出"arch 里没有 accumulator 可赶"的结论——**是错的**:该 body 的 MFMA operand 普查显示
+   **C 在 2352 条 MFMA 中有 2351 条是 arch VGPR**,arch 一直在 cap 上只是因为**分配器立刻用别的值填回**
+   腾出的位置。正确判据是 `v_accvgpr_read/write/mov` 计数(该 body 865 → 398)与 wall。
+2. **钉 operand 比钉 accumulator 更值,但只在"每个 kv BLOCK 只写一次"的摊薄点上值。**
+   同一 body:kv-block-invariant 的两组 MFMA operand(GEMM1a 的 native `[K|K]` B、dP 的 bf16 V B)
+   tied `"=a,0"` 钉入 AGPR = **+0.79% / +0.53%**,−21 dword、−454 shuttle;而 per-head-step 的
+   两组(GEMM2a 的 P pack、dO ring A)= **−3.4% / −2.6%**,还各胖 12 dword(钉的副本与 VGPR 原件共存)。
+   **只钉 MFMA 直接消费的值**——VALU 与 `ds_read` 不能 source AGPR,钉地址/softmax 侧的 pack 反而
+   每次使用多一条 `v_accvgpr_read`。
+3. ⚠⚠ **空 asm 的 pin 必须 TIED,且 asm-MFMA 必须自带 hazard 保护。** 未绑定的 `"=a,v"` 能编译、能跑、
+   ISA 好看(spill 36→0)、快 4.5%——因为它**不生成任何拷贝**,输出 AGPR 未初始化,等于**悄悄删掉了操作数**;
+   只有 SNR gate 抓得到(NaN / det false)。另:tied `"=a,v,v,0,v,v"` 的 scaled asm-MFMA 在 NT=4 上
+   **逐位正确且 +0.42%**,在 NT=2 上 **dk 稳定错 −0.9~−1.4 dB**——不透明 asm 把累加器 def-use 藏过了
+   hazard recognizer,只有四条独立累加器链才有足够距离。⇒ **一个 tile 几何上的 bit-identical checksum
+   不是寄存器类改动的正确性证明**;换寄存器类必须在最小 NT 上过 SNR。
+
 下面的 raw-asm 路线是更早工具链才需要的兜底:
 
 - **(旧工具链)问题**:gfx950 scaled MFMA(`mfma_scale`)LLVM 不肯给 AGPR 分累加器 —— `=a` 约束被拒,AccumVGPR 恒 0。  (agpr_rawasm_progress)

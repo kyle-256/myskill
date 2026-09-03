@@ -54,6 +54,9 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | 想把 **activation/SwiGLU 融进 GEMM**(fused epilogue)/ 融合核比 plain GEMM 慢想追 parity | **methodology/18**(融合口径 total-vs-total + gated 的 pitch-vs-real + 部署测量)|
 | 要**跑/盯/救一场 campaign**(起不来、卡住、要 resume、数对不上) | **methodology/16(整卡读)** |
 | 想在**真实 e2e 训练**里验证某 kernel 有没有真跑(别加 print) | **methodology/17**(开 profiler 看 trace)|
+| e2e 跑不起来 / 报 `primus_turbo is not importable` / 卡住不动分不清是编译还是死锁 / 找不到某开关 | **methodology/17 §变体 E** —— 开关可能在**未合入分支**(`git log --all -S`);「不可导入」真因常是 **flydsl 版本**(0.1.1.dev409 无 `expr.typing.Vector`);★★★**编译 vs 死锁判据 = JIT 缓存 2min 新增数 + 8 个 rank 栈顶是否各不相同**,别看 GPU util |
+| 要拿**真实推理部署的一步**(sglang decode step)当分数 / 微基准赢了但真机变慢 / 同 commit 读数跨度 20%+ | **★★★methodology/19**(热尺子 30.7us vs 冷 45.1us 且排序翻转;多次**取最小**不取中位;`<rest>` 是减法行) |
+| 要在远端跑一个本地分支 / 远端那棵树是 dirty 的、怕覆盖 | **本地是唯一权威,远端全是临时的**:rsync/bundle 覆盖那棵共享树,**绝不在远端另建 `/tmp` 副本**(踩过三次,见 methodology/16 §local-first) |
 | 要把 **grouped gemm trace 时长换成达成 TFLOP/s** / 算出的数字比 campaign 低一个数量级 | **methodology/17** §FLOPS 换算(★别把每层指派再除 L)|
 | Primus e2e 报 `quantize_fp8_tensorwise expected at most 3 argument(s)` | pitfalls/08 §stale-quant-so(重编 .so)|
 
@@ -104,6 +107,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [13-autotune-fleet](methodology/13-autotune-fleet.md) — Autotune 五原则/生产四轴 never-regress/N-GPU N-agent 调度
 - [16-campaign-harness](methodology/16-campaign-harness.md) — **跑自动优化 campaign 必读**:起(launcher 模板/环境红线)、bench 契约(★必须 mirror 部署配置)、盯盘(★轮内唯一活信号=kernel 文件 mtime)、停/续(工作区必须干净)、★坑清单(pgrep 自杀·孤儿 agent 改文件·effort=max 反而超时零产出·换机必重测 base/best·收官 squash 挑错 base+commit 游离·并发 pool 重叠致分数腰斩)、验收(不打扰在跑 campaign 的隔离复测法)
 - [17-e2e-kernel-trace-validation](methodology/17-e2e-kernel-trace-validation.md) — **e2e 训练里验证某 kernel 有没有真跑 = 开 torch profiler 看 trace,别加 print**(print 探针可能在死路);Primus mock 冒烟 + profiler 步骤、trace 落地目录(被 patch 改写)、gzip+json 解析(glob `rank[0]` 字符类坑)、kernel 名→后端对照表、K-pad 铁证(pad-quant kernel 只可能来自 syncv3);MoE 走 ragged 派发不经 PrimusTurboGroupedLinear/公共 grouped_gemm_fp8
+- [19-deployment-step-scoring](methodology/19-deployment-step-scoring.md) — **★★★拿真实部署的一步当分数**:热/冷尺子(同 kernel 30.7us vs 45.1us,排序翻转)、部署权重(56 形状均摊 +10% 而加权 −1%)、被抢时**取最小**(2 次取中位曾把基线记高 15%)、GLM-5.2 四个 decode GEMM 形状与调用数、`trace_step` vs `profile_decode` 的区别、四个运行期坑(spawn 孤儿/`/dev/shm` 攒死/别的容器孤儿/自杀式 pkill)；★★★**尺子必须走部署真正走的那条 kernel**——一个没传的 `num_cu` 让 20 轮 campaign 每一轮的「赢」在真路径上都是「输」(bench −5.2% vs 真训练 −0.84%)；拿真训练当 bench 的四个实现坑(步时间只能从 profiler trace 拿/冷缓存 autotune 落进 profile 窗口给出 2423ms 假值/loss 抖 3.2% 不能当紧门/ProfilerStep 每步发两次)
 - [99-misc](methodology/99-misc.md) — 其它零散事实
 
 ---
@@ -111,7 +115,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 ## pitfalls/ — 踩过的坑（最重要，动手前先查）
 
 - [01-tile-occupancy-register](pitfalls/01-tile-occupancy-register.md) — **256×256 唯一可行 tile**、512 合并寄存器池、量子边界、maxnreg/预取 spill 死路
-- [02-measurement-noise](pitfalls/02-measurement-noise.md) — 噪声地板/DVFS/掉频/并行口径/host 开销/虚高 TF/SNR 掩盖 race
+- [02-measurement-noise](pitfalls/02-measurement-noise.md) — 噪声地板/DVFS/掉频/并行口径/host 开销/虚高 TF/SNR 掩盖 race；★★★**同名多形状必须求和不能取中位数**(nt 名下挂 fc1+fc2 两形状,中位口径让同一改动的 Δ 跨轮极差 41-68us 且归因翻转,求和后降到 15-22us)
 - [03-lds-l2-datapath](pitfalls/03-lds-l2-datapath.md) — LDS 容量/bank/带宽封顶、A/B 直读掉 2.5×、prefetch 何时有害、torch copy_ 假天花板
 - [04-race-vmcnt-correctness](pitfalls/04-race-vmcnt-correctness.md) — partial-drain/spill race、SRD 寻址、HW-walled 死路、SNR gate、attention 中性值
 - [05-mxfp4-mxfp8-deadends](pitfalls/05-mxfp4-mxfp8-deadends.md) — occ 天花板、epilogue store 暴露、wgrad feed-bound、mxfp8 scale 投递税/WL 死路

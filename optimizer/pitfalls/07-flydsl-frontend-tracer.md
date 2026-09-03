@@ -64,6 +64,19 @@
 ### 前端 if/for 语义限制（纯 Python 合法但和 MLIR 构造冲突）
 - 分支局部定义：值只在某个 `if`/`else` arm 内定义、arm 外使用 → **静默破坏 MLIR result typing**。必须把定义提到分支上方，或 yield 单一 merged 值。
 - 前端会把 if 分支体抽成 `__then_*`/`__else_*` 函数；分支内引用的名字若定义在外层可能触发 **NameError**。标量/向量类型不匹配、Python int 出现在需 DSL 值处也是常见 wizard 报错。
+- ★★ **上一条的确切机制与规避法（2026-09-01 attention fwd 实测，源码级定位）**：`ast_rewriter._collect_assigned_vars`
+  的 `RegionAnalyzer.visit_Call` 会把分支体里每个**被调用者的基名**（`ctx.foo(...)` 的 `ctx`、`my_fn(...)` 的 `my_fn`）
+  塞进 `invoked_args` 当成分支的 result/state 名——**唯独 `self` 被硬编码豁免**（`base_name != "self"`）。
+  该名字随后由 `__check_local_var(name, locals())` 取值：它不是本函数局部就只 warn 并返回 **None**，
+  于是 `__then_*` 里那个名字既不是 freevar 也不是 global ⇒ 运行到就 `NameError: name 'ctx' is not defined`。
+  - 触发条件是**外层函数自己也被重写过**（`@flyc.kernel`/`@flyc.jit`），此时外层名字在 rewriter 的 active-symbol
+    表里；把同一个 `@flyc.jit` 函数单独重写则 `co_freevars` 完好（两个最小复现都验过）。
+  - ⇒ 规则：**含运行期 `if` 的 `@flyc.jit` helper 要定义在没被重写的作用域**——模块级工厂函数或类方法——
+    并把 `ctx` / 回调**当参数传进工厂**，让它们以 freevar 身份进分支；写在 kernel 体内的嵌套 def 里就会中招。
+    `attn_helper.py` 的 `causal_mask_prologue_if_needed`(方法内 `self.`) 与 `_softmax_half_if_alive`(模块级工厂)
+    是两个可抄的范式。
+  - ⚠ 排错提示：报的是 *global* 形态的 NameError（不是 "free variable ... not associated with a value"），
+    很容易误判成 import 漏了。
 - ★ **同一机制的 `scf.for` 版（2026-07-29 实测）**：嵌套 `def` 里若含**运行期** `for _c in range(<runtime>)`，
   前端抽取循环体时只捕获**循环自身引用到的**外层名字；**只在循环之后**才用到的外层名字会掉出闭包，
   变成该 `def` 的局部名 → 运行到那行报 `UnboundLocalError: cannot access local variable 'X'`

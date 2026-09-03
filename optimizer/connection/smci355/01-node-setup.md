@@ -162,10 +162,22 @@ chi2878 是唯二还能登的,但两台 8 卡 VRAM 全被别人的 CI 占满(280
   --entrypoint sleep tasimage/primus:v26.4_turbo_perf infinity`(该镜像有 ENTRYPOINT,必须显式覆盖)。
 - **测量质量**:15 次 scored bench 单次 ~16s(含清 flydsl cache),gm 分散 **0.16**,比原节点(0.6~0.7)干净;
   换节点后**绝对 TF 与 ratio 基线都要重测**,只有同节点 A/B 才可比。
-- ❌ `rocprofv3` 在这个镜像的容器里**挂死**(`--kernel-trace` 10 分钟不产出 csv、进程要 `pkill -9`),
-  归因类 profiling 得换镜像或换节点做,别在这里赌轮次预算。**但 ISA dump 照常可用**:
-  `FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=<dir>` → `<dir>/<launcher>/21_final_isa.s`(是编译器 dump,不走
-  profiler),寄存器数/spill/新增指令都能在这里判,别因为 rocprofv3 挂死就以为无法做归因。
+- ~~❌ `rocprofv3` 在这个镜像的容器里**挂死**~~ ⚠ **2026-09-01 实测此归因为 FALSE,`rocprofv3` 能用。**
+  真因:它启动时要在 **cwd** 建 `.rocprofv3/`,而 cwd 是**只读挂载的仓库**时先报
+  `Permission denied: '<repo>/.rocprofv3'`,然后**死在自己的信号处理器里**——那就是被记成
+  "10 分钟不产出 csv / 挂死占卡 15.7 小时"的东西。**修法就一句:`cd /tmp/<自己的目录>` 再跑。**
+  可用配方(8 个 pass 各约 20 s,全部 exit 0):
+  ```
+  cd /tmp/<own-dir> && <先跑一次真 shape 把 JIT 预热>
+  setsid timeout -s KILL 240 rocprofv3 --pmc <=4个counter> --output-format csv \
+     -d <dir> -o r -- env <...> python -u <driver>.py
+  ```
+  ⚠ `--output-format csv` **必须加**——默认吐 SQLite `.db`,汇总器读到空表,看起来像 kernel 过滤没命中。
+  ⚠ **每 pass ≤4 个 counter**(每 pass 都会重新触发 JIT)。⚠ `/tmp` 是**多租户共享**的,
+  别人 uid 的同名文件会挡住你写,所以用 `/tmp/<自己的名字>/`。
+  **ISA dump 当然也照常可用**:`FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=<dir>` →
+  `<dir>/<launcher>/21_final_isa.s`(编译器 dump,不走 profiler),寄存器数/spill/新增指令在这里判;
+  ⚠ 但 `FLYDSL_DUMP_IR=1` 的跑法比真基线慢约 5% 且绕过 JIT 缓存,**绝不能拿它计时**。
 - **两个 campaign 同时落在本节点时,各起自己的容器**:sibling 用 `kyle_dev`(挂 `/tmp/kyle_syncv4`,GPU 0),
   我这场 syncv3 用 `kyle_dev_v3`(挂 `/tmp/kyle_syncv3`,GPU 5)。同名容器共用 `/root/.flydsl/cache`,
   而每轮 bench 都要 `rm -rf` 它 —— **共用容器 = 互相清对方的 JIT 缓存 + 抢同一张卡**,分容器分卡才安全
@@ -363,18 +375,27 @@ cat /workspace/code/.ssh_docker/id_ed25519 | <wrapper> 'docker exec -i kyle_dev 
 有包就不用再走一遍。chi 那份 `mlperf_gptoss-20260811-flat.tar.zst` 在 `/mnt/vast/kyle/code2/docker_images/`,
 但 **chi 集群 08-11 整体失钥后不可达**,且 smci355 上的 `/mnt/vast` 只是根盘上的空目录、没挂 vast。
 
-**包在哪(两份,内容 md5 相同 `d11145082e441cc00e6d1815010e1e33`)**
+**★ 2026-08-28 更新为新包(从 `kyle_attn` 容器重打;老 20260820 tar 已删)**
+现役包**只剩 NFS 一份**(n02-29 上 `/data/kyle_0814/...` 节点本地那份不存在——那是 n01-25 的本地盘):
 | 位置 | 用途 |
 |---|---|
-| `/data/kyle_0814/docker_images/kyle_dev-20260820-flat.tar.zst` | 节点本地(`/dev/md0` 49T),恢复最快;节点重装即失 |
-| `/home/xianzhao/code_from_juicefs_20260623_0233/docker_images/kyle_dev-20260820-flat.tar.zst` | NFS,跨节点灾备;**= agent 侧 `/workspace/code/docker_images/`**(同一份挂载) |
+| `/home/xianzhao/code_from_juicefs_20260623_0233/docker_images/kyle_dev-20260828-flat.tar.zst` | NFS,md5 `235b7d5bfa05c1b73ea0d240862fa6fd`,**28G 压缩**;= agent 侧 `/workspace/code/docker_images/`(同一份挂载) |
+- 源容器=`kyle_attn`(08-23 起用,比 08-20 版多累积几天产物,故 19G→28G);`docker commit` 出 `kyle_dev:saved-20260828`(150GB)留本地 docker。
+- 含**全部 5 个 venv**(`venv_count=5` 已验):`/opt/venv`(mxfp4) + `/opt/venv-tw` + `/opt/venv-syncv3` + `/opt/venv-syncv4` + `venv-mxfp4`。
+- 恢复命令里的路径/tag 相应换成 `kyle_dev-20260828-flat.tar.zst` → `kyle_dev:saved-20260828`。
+
+<details><summary>历史:2026-08-20 首份包(两份,md5 `d11145082e441cc00e6d1815010e1e33`,已被 08-28 版取代/删除)</summary>
+
+| 位置 | 用途 |
+|---|---|
+| `/data/kyle_0814/docker_images/kyle_dev-20260820-flat.tar.zst` | 节点本地(`/dev/md0` 49T),恢复最快;节点重装即失(**n02-29 上不存在**) |
+| `/home/xianzhao/code_from_juicefs_20260623_0233/docker_images/kyle_dev-20260820-flat.tar.zst` | NFS,跨节点灾备(**08-28 已删**) |
+
+19G 压缩 / 93.8G 解压;`docker commit` 出 `kyle_dev:saved-20260820`(113GB)。
+</details>
 
 ⚠ **`/data` 根下的惯例是每人一个用户名目录**(`kgoginen` / `zhuang12` / 我们的 `kyle_0814`)。
 别在根下另起目录(第一次建了 `/data/kyle_images`,是错的,已删)—— 自己的东西一律放 `kyle_0814/` 下。
-
-- 19G 压缩 / 93.8G 解压;`docker commit` 出的镜像 `kyle_dev:saved-20260820` (113GB) 也留在本地 docker 里。
-- 含**全部 5 个 venv**:`/opt/venv`(mxfp4) + `/opt/venv-tw` + `/opt/venv-syncv3` + `/opt/venv-syncv4` + `venv-mxfp4`,
-  已逐个 `tar -tf` 验过 `bin/python3.12` 在包内。
 
 **打包步骤(实操,~2min export + ~30s 校验)**
 ```bash
@@ -401,3 +422,142 @@ zstd -dc /data/kyle_0814/docker_images/kyle_dev-20260820-flat.tar.zst | docker i
 
 **边界**:`docker export` 自动排除 bind mount,所以 `/workspace/code` 下的源码/build 产物**不进包** ——
 这正是想要的(源码走 git,镜像只固化 rootfs:pip 包、apt 包、venv、editable 指针)。
+
+---
+
+## ★★ 2026-08-31 sglang 镜像环境 `kyle_sglang`(用户指定在这套镜像里搞 aiter)
+
+**用途**:在 lmsys 的 sglang ROCm 镜像里跑我们改过的 aiter,和 `kyle_attn` 完全隔离,互不影响。
+
+★ **本地代码全部收在 `sync/inference/`**(2026-09-02 起,别再散在 `sync/` 根下):`aiter`(origin=ROCm,
+`xbc`=xiaobochen-amd,交付分支在这)、`sglang`、`InferenceX`、`Infera`、`SIKL`。目录说明见
+`sync/inference/README.md`。★★**AgentX 跑分的 aiperf 命令是 `InferenceX/benchmarks/benchmark_lib.sh`
+拼出来的**(`--scenario inferencex-agentx-mvp` 在 L1998 附近),要复现别人给的那条命令就读那里。
+
+### 0. 镜像:拉之前先 `docker logout`
+```bash
+docker pull lmsysorg/sglang:v0.5.18-rocm720-mi35x   # ~80GB
+```
+⚠ **host 的 `~/.docker/config.json` 里存着一份 `rocmshared` 的 PAT,直接拉会被拒**:
+`toomanyrequests: too many failed login attempts for username or IP address`。
+`docker logout` 清掉改走匿名拉取即可。原凭据(留底,别人可能还在用):
+`{"auths":{"https://index.docker.io/v1/":{"auth":"cm9jbXNoYXJlZDpkY2tyX3BhdF9qMUtSZVdTcGxuZWtnQzU2U3VjcUt1a3FiVXc="}}}`
+盘位:`/` 3.5T,当时余 1.2T;`docker system df` 里镜像已占 1.38TB(53% 可回收)。
+
+### 1. 起容器(照抄 kyle_attn 的 flag,多加 `--init`)
+```bash
+docker run -d --init --name kyle_sglang \
+  --device /dev/kfd --device /dev/dri --group-add video \
+  --ipc host --network host --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+  --shm-size 64g -v /home/xianzhao/smci_repos:/workspace/code \
+  lmsysorg/sglang:v0.5.18-rocm720-mi35x sleep infinity
+```
+`--init` 是为了 PID1 用 docker-init 而不是裸 `sleep infinity`,免得堆僵尸(见 memory
+`reference_container_pid1_sleep_zombie_reaping`)。挂载和 `kyle_attn` 一致,`/workspace/code`
+仍是 root-squash **只读**。
+
+### 2. 镜像自带什么
+Python **3.10.12** / torch **2.9.1+rocm7.2.0** / ROCm **7.2.26015** / triton 3.7.0 / sglang 0.5.18。
+自带 aiter = `amd-aiter 0.1.20.dev12+gd9e5ef7ce`,editable 在 `/sgl-workspace/aiter`,**flydsl 0.2.4**。
+
+### 3. ★★ 装我们的 aiter:与镜像自带那份是**两条分叉的线**
+`xiaobochen-amd/aiter` 的 base `b02ab811e` **不是**镜像那份 `d9e5ef7ce` 的祖先
+(`git merge-base --is-ancestor` 判 NO),所以是换线不是叠加。
+```bash
+# NFS 只读 ⇒ 工作副本放容器本地;先把分支 fetch 进 NFS 副本(host 侧,两个 export 同机可见)
+cd /home/xianzhao/smci_repos/aiter && git fetch \
+  /home/xianzhao/code_from_juicefs_20260623_0233/gpt_oss_docker/sync/inference/aiter <branch>:<branch>
+# 容器内
+git clone -q --branch <branch> --single-branch /workspace/code/aiter /sgl-workspace/aiter_kyle
+cd /sgl-workspace/aiter_kyle
+cp -a /sgl-workspace/aiter/3rdparty/composable_kernel/. 3rdparty/composable_kernel/  # CK 从自带那份拷
+rm -f aiter/jit/*.so && rm -rf aiter/jit/build                                       # ★必做,见下
+pip uninstall -y amd-aiter
+AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx950 pip install -e . --no-build-isolation
+```
+- ⚠ **必须先删克隆带进来的旧 `.so`**:它们被 gitignore,`git status` 看不见,不删则
+  `import aiter` 报 `module 'aiter.jit.module_aiter_core' has no attribute 'MlaVersion'`。
+- `--single-branch` 浅克隆没带 tag ⇒ setuptools_scm 算出的版本号变成 `0.1.1.dev2931+g<sha>`,
+  只是难看,不影响功能;要正常号就 fetch tag 后重装。
+- 这个镜像的 site-packages 在 `/opt/venv/lib/python3.10`,不用另建 venv。
+
+### 4. ★★★ flydsl:fork 这条线**只能用 0.3.2**,0.2.4 跑不了
+| | 镜像自带 aiter (`d9e5ef7ce`) | xiaobochen fork (`b02ab811e`+) |
+|---|---|---|
+| `setup.py` FLYDSL_VERSION | `flydsl==0.2.4` | `flydsl==0.3.2` |
+
+装我们那份时 setup.py 会自己 `pip install flydsl==0.3.2` 顶掉镜像的 0.2.4。**降回 0.2.4 会崩**:
+```
+rocdl.RawPtrBufferStoreOp(data, rsrc, offset, soffset, aux=aux_attr)
+ValueError: Operand 4 of operation "rocdl.raw.ptr.buffer.store" must be a Value (contained a None item)
+```
+0.2.4 的 `soffset` 不接受 None。**挂的是 fork 自带的 `aiter/ops/flydsl/kernels/buffer_ops.py`,不是我们改的文件**
+—— 整条 fork 线都迁到 0.3.2 API 了,不是某个 commit 的问题。
+⚠ 副作用:镜像里的 **sglang 本来配的是 0.2.4**,顶到 0.3.2 后要跑 sglang e2e 得先自己验一遍;
+要还原就 `pip install flydsl==0.2.4` 并把 `/sgl-workspace/aiter` 装回去(那份一直留着没删)。
+
+### 5. 同机四套环境别搞混
+| 容器 | 镜像 | 用途 |
+|---|---|---|
+| `kyle_attn` | `kyle_dev:saved-20260820` | **只保留四套**:`venv-mxfp4` / `venv-tw`(tensorwise) / `venv-syncv3` / `venv-syncv4`,campaign 在这跑。★2026-09-01 删掉了临时的 `/opt/venv-aiter` —— aiter 那条线整体搬到 `kyle_sglang` 的新镜像了 |
+| `kyle_sglang` | `lmsysorg/sglang:v0.5.18-rocm720-mi35x` | 本卡,aiter + sglang |
+| `kyle_train` / `kyle_dev_0814` | 旧镜像 | 历史遗留 |
+| `sikl-ab` 等 | — | **别人的,别碰** |
+
+⚠ **两个容器挂的是同一个宿主目录**:`kyle_attn` 和 `kyle_sglang` 都把 `/home/xianzhao/smci_repos`
+挂成 `/workspace/code`。所以 `/workspace/code/aiter` **在两边是同一份**(kyle_sglang 的工作副本)——
+在 kyle_attn 里"清理 aiter"只能删容器本地的 `/opt/venv-*`,**碰 `/workspace/code/aiter` 等于删交付**。
+
+### 5b. ★★★ GPU 分配表(n02-29,2026-09-02 用户划定 —— 这是唯一真相,别信别处的卡号)
+
+| GPU | 归属 | 容器 / venv / 仓库 |
+|---|---|---|
+| **0,1,4,5** | **AgentX / GLM-5.2 serving**(TP4) | `kyle_sglang`,`/sgl-workspace/aiter_kyle` |
+| **2** | gptoss 整步融合 campaign | `kyle_attn` / `venv-syncv4` / `syncv4/Primus-Turbo` |
+| **3** | dense per-tensor fp8 GEMM campaign | `kyle_attn` / `venv-syncv3` / `syncv3/Primus-Turbo` |
+| **6** | D=64 attn fwd campaign | `kyle_attn` / `venv-tw` / `tensorwise/Primus-Turbo` |
+| **7** | **mxfp4** | `kyle_attn` / `venv-mxfp4` / `mxfp4/Primus-Turbo` |
+
+★★**以下旧记录已作废,别再用**:
+- ❌「mxfp4 用 **GPU5**」→ 2026-09-02 用户改到 **GPU7**
+- ❌「手动实验默认 **GPU6**」→ 那是 chi2811 的规矩,且此处 GPU6 是 campaign 的卡
+- ❌「syncv4 = **GPU4**」→ syncv4 那条线现在在 **GPU2**
+
+★ **n02-29 上 HIP 索引 == rocm-smi 编号**(2026-09-02 实测:`HIP_VISIBLE_DEVICES=0,1,4,5` 拿到的
+PCI bus 是 `0x05/0x15/0x85/0x95`,与 `rocm-smi --showbus` 的 GPU0/1/4/5 逐一对上)。
+**别把 chi2835 那条「HIP 索引 ≠ smi 编号」搬过来** —— 那是另一台机。
+
+★ 查某个进程实际落在哪张卡:`rocm-smi --showpidgpus` 给的是 **DRM device 号**;
+`cat /proc/<pid>/cgroup` 找容器,`/proc/<pid>/cmdline` 认工作线。
+
+### 6. ★★ GLM-5.2 decode 计分环境(2026-09-01 收官,交接给下一个人看这段)
+
+**跑分脚本在 SIKL,不在 aiter**:容器内 `/sgl-workspace/SIKL/sikl/benchmarks/models/glm52/`
+(host 侧源 `sync/inference/SIKL/`)。模型 `/perf_apps/xiaobo/models/GLM-5.2-MXFP4`。
+两个脚本量的不是一个东西、固定参数、以及全部尺子纪律 → **`methodology/19` 整卡读**,这里只记环境。
+
+```bash
+# 计分(整步一张 graph);bench 自己会把 HIP_VISIBLE_DEVICES 覆盖成 0-7,TP8 必须八张卡
+docker exec kyle_sglang bash -lc '
+  cd /workspace/code/aiter && export PATH=/opt/venv/bin:$PATH && python -u _bench_glm52_step.py'
+```
+
+- `_bench_glm52_step.py` 在 aiter 仓库根(campaign 的 harness 文件,**交付 squash 时要剥掉**)。
+  跑 4 次**取最小**,输出末行是 `{"ok":..,"inv_step":..,"step_ms":..,"spread_pct":..}`。
+- 想跑**别的 commit** 而不动工作副本:`cp -a /workspace/code/aiter /tmp/aiter_X`,
+  在副本里 `git checkout`,然后 `PYTHONPATH=/tmp/aiter_X` + **从 `/tmp` 之类别的目录启动**
+  (从 `/workspace/code/aiter` 里跑,cwd 会盖过 `PYTHONPATH`)。`AITER_JIT_DIR=/root/.aiter_jit_xbc` 复用已编译的 `.so`。
+- 每次跑之前:`find /dev/shm -maxdepth 1 -type f ! -name 'rocm_smi_*' -delete`,
+  并确认 `rocm-smi --showpids` 是 0 个(**别的容器的孤儿也会让你卡死在 NCCL,细节见 methodology/19**)。
+
+**这条线的交付状态(2026-09-01)**:分支 **`kyle/dev_glm52` @ `9cbed8ac8`**,已 push 到
+**`git@github.com:xiaobochen-amd/aiter.git`**(SSH URL,`xbc` remote 配的是 https 推不动;
+key = `/workspace/code/.ssh_docker/id_ed25519`)。**ROCm/aiter 千万别推**(用户硬令,踩过一次)。
+干净空节点同尺子实测:decode step **22.631 → 21.116 ms(−6.7%)**、2828 → 3033 tok/s;
+56 个 skinny 形状冷读总时间 877.4 → 815.2 us、赢 hipBLASLt 37/56 → 43/56。
+PR 描述草稿 `/workspace/code/gpt_oss_docker/PR_aiter_dev_glm52.md`。
+本地保险 ref:`_campaign_tip_backup`(带全部 harness 的原 tip)、`_pre_final_squash`、
+`_pre_rebase_dev_glm52`、`_dev_glm52_old_local`。
+
+⚠ **`xbc/main` 就是 `b02ab811e`**,和分支 base 同一个 commit;`origin/main`(ROCm)领先 27 个,
+**别 rebase 到 ROCm main** —— 会把 xiaobochen 自己 PR #10 的 6 个 topk commit 一起重放进我们的 PR。

@@ -294,5 +294,91 @@ flydsl per-shape autotune + torch.compile,单 iter 极慢,`.item()` 长时间阻
 `tn_wgrad_reduce` 60.6。量级与上表 avg 一致。见 [[project_gptoss_fwd_nt_slow_investigation]]、
 [[feedback_no_cpu_ep_poll_hang_judgement]]。
 
+## ★★ 变体 E — 跑 turbo 的**融合 MLP**(`grouped_mlp_fp8`)做 A/B(2026-09-02, smci355 n02-29 / `kyle_train`)
+
+优化了 `grouped_mlp_fp8`(融合 MoE MLP)想在真训练里 A/B,结果在**接入**上卡了整整一轮。踩到的五件事,
+每一件都足以让人误判成"我的 kernel 有问题":
+
+### ★★★ 1. 那个开关不在 main 上 —— `turbo_fused_grouped_gemm`
+
+`grouped_mlp_fp8` 在 **Primus main 和 Primus-Turbo main 里都没有任何调用方**(`PrimusGroupedMLP`
+走的是分开的 fc1/fc2 `PrimusTurboColumnParallel/RowParallelGroupedLinear`)。但 huangwei 的 trace 里
+`FP8GroupedMLPTensorFunc` 明明在跑 —— 因为开关在**未合入的分支**上:
+
+```
+origin/feat/fp8-fused-grouped-mlp-main   # RuibinCheung, 69a53c42 + f32da485
+  yaml:  turbo_fused_grouped_gemm: true
+  code:  experts.py 加一条分支 -> from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
+```
+⚠ 它落在 **`examples/mlperf/gpt_oss_20b/configs/MI355/`**(mlperf 那套),不是
+`examples/megatron/configs/MI355X/`。分支基点比 main 落后 34 个提交,cherry-pick 那 2 笔到最新 main 即可。
+
+★ **教训:代码里 grep 不到调用方 ≠ 部署没用它。先用 `git log --all -S"<符号>"` 扫所有分支。**
+
+### ★★★ 2. `primus_turbo is not importable` 的真因是 flydsl 版本,不是 PYTHONPATH
+
+Primus 报 `PrimusTurbo <feature> was requested, but primus_turbo is not importable` 时,**真异常被
+try/except 吞掉了**。手动带 traceback 导一次才看得见:
+```
+/opt/venv 的 flydsl 是 0.1.1.dev409 -> flydsl.expr.typing 里没有 Vector
+-> flash_attn_bwd.py 导入失败 -> 整个 primus_turbo.pytorch 链断掉
+```
+**必须用装了 flydsl 0.2.2 的 venv(本机 `/opt/venv-syncv4`)**。⚠ C++ 扩展是对着 `/opt/venv` 的 torch
+头编的,但 venv-syncv4 的 torch 同版本,可以混用。
+★ 排查手法:`PYTHONPATH=<repo> <venv>/bin/python -c "import traceback;
+try: import primus_turbo.pytorch
+except: traceback.print_exc()"`。
+
+### ★★ 3. 三个 env/yaml 拦路虎(都不用改 Primus 逻辑)
+
+| 报错 | 解法 |
+|---|---|
+| `Stage 'mlperf_pretrain' requires 'primus_mllog'` | 私有包 pip 装不到;`stage: ${PRIMUS_STAGE:mlperf_pretrain}` 是插值 → `PRIMUS_STAGE=pretrain` |
+| tokenizer 401 gated repo | `tokenizer_model: ${MODEL:meta-llama/Llama-3.1-8B}` → `MODEL=/model`(容器已挂) |
+| `/data` 只读写不了 index cache | `mock_data` 改成 `${PRIMUS_MOCK_DATA:false}`(唯一需要的 yaml 改动)+ `PRIMUS_MOCK_DATA=true` |
+
+### ★★★ 4. 后端默认是 **triton 不是 FLYDSL**,两个都要改
+
+`config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh` 里:
+```sh
+export PRIMUS_TURBO_GROUPED_GEMM_BACKEND="${...:-triton}"   # grouped
+export PRIMUS_TURBO_GEMM_BACKEND=triton                      # dense
+```
+不改就**完全走不到 FlyDSL kernel**,A/B 会得出"我的优化毫无影响"的假结论。
+★ 事后判据:trace 里 **`_grouped_fp8_persistent_gemm_kernel`(Triton 名)一次都不出现** =
+FLYDSL 真的生效了;它和 `kernel_grouped_nt_persistent`(FlyDSL 名)是互斥的一对。
+
+### ★★★ 5. 「卡住了」的三条判据 —— 别看 GPU util
+
+同一个现象(日志几十分钟不动、进程吃着 CPU)出现过两次,一次是编译一次是死锁,**GPU 全 0% 都一样**:
+
+| 判据 | 编译中 | 死锁 |
+|---|---|---|
+| **JIT 缓存 2 分钟内新增文件数** | >0 | **0** |
+| **8 个 rank 的 py-spy 栈顶** | **各不相同**(`_compile`/`deepcopy`/`_broadcast_cu_seqlens`…) | **全堵同一个**(`all_to_all_single`) |
+| 最新缓存文件时间戳 | 就在刚才 | 比本次启动还早 |
+
+```sh
+find /root/.flydsl -type f -newermt "-2 min" | wc -l     # 编译在推进?
+for P in $(pgrep -f "python -u -m primus.cli.main"); do py-spy dump --pid $P | sed -n 5p; done
+```
+⚠ 死锁那次的根因是**我给 ep1 的配置硬塞 `PRIMUS_EP=8`**(文件名就写着 `...tp1pp1ep1...`,里面还有
+`MOE_SKIP_IDENTITY_SORT=1` 明说只在 EP=1/TP=1 成立)。**改并行度必须连配套项一起改,否则 MoE 的
+all-to-all 会劈叉死锁。**
+
+### ★★ 6. `LOG_INTERVAL=999999` 会让你以为没跑
+
+mlperf config 把 iteration 日志压掉了。grep 不到 `iteration` **不代表没训练**;判完成看
+`Cleanup completed` + trace 文件是否落盘。
+
+### ★★ 7. OOM 说「37 GiB allocated 但 0 free」= 别人占着卡
+
+`rocm-smi --showpids` 一看是 `sglang::schedul` 各占 **248 GiB**。8 卡训练前**必须先核对整机每卡余量**,
+不是只看 util:
+```sh
+rocm-smi --showmeminfo vram | grep Used | awk '{printf "GPU%d: %.1f GiB\n", NR-1, $NF/1073741824}'
+```
+
+
 ---
-来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss)+ 2026-08-08 Crusoe 177 pretrain-yaml 真跑取 grouped-gemm FLOPS + 2026-08-13 smci355/syncv4 官方 mlperf EP1 config 跑通(变体 C + 崩溃排障三层遮蔽)+ 2026-08-25 smci355/`kyle_train` 真 C4 EP1 down-padk 复现 huangwei 0824 trace(变体 D:强制 FLYDSL 破静默 Triton fallback + per-shape can_handle 混合判读);见 [[project_kpad_e2e_trace_validated]]、[[project_gptoss_e2e_trace_grouped_flops]]、[[project_syncv3_so_rebuild_4arg]]、[[project_gptoss_fp8_wgrad_skew_padk]]、connection/gpt_oss/02·03·04、connection/smci355/01、connection/crusoe/01、pitfalls/07(glob/tracer 坑)、pitfalls/08(重编 .so)
+来源: 2026-08-03 gpt-oss-20b MLPerf K-pad e2e 验证(chi2798 mlperf_gptoss)+ 2026-08-08 Crusoe 177 pretrain-yaml 真跑取 grouped-gemm FLOPS + 2026-08-13 smci355/syncv4 官方 mlperf EP1 config 跑通(变体 C + 崩溃排障三层遮蔽)+ 2026-08-25 smci355/`kyle_train` 真 C4 EP1 down-padk 复现 huangwei 0824 trace(变体 D:强制 FLYDSL 破静默 Triton fallback + per-shape can_handle 混合判读);见 [[project_kpad_e2e_trace_validated]]、[[project_gptoss_e2e_trace_grouped_flops]]、[[project_syncv3_so_rebuild_4arg]]、[[project_gptoss_fp8_wgrad_skew_padk]]、connection/gpt_oss/02·03·04、connection/smci355/01、connection/crusoe/01;+ 2026-09-02 smci355/`kyle_train` 融合 MLP A/B 接入(变体 E:开关在未合入分支、flydsl 版本、后端默认 triton、编译 vs 死锁三判据)、pitfalls/07(glob/tracer 坑)、pitfalls/08(重编 .so)
