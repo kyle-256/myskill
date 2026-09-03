@@ -192,5 +192,36 @@
 - 一轮一个假设；perf 前先过 correctness gate；accept/rollback 有 lineage。
 - 每个 accepted gain **必须能迁移到真实训练 step**：不许 id(...) 作 key 的 activation/grad_out cache；不许只适配均匀分布的 GroupGemm 捷径（真实倾斜 token 分布下无效）。
 
+## ★★★★ dispatch 上的 first-call race 是自适应性的最后防线,不许用静态模型替代(2026-09-03 实测)
+
+dense fp8 GEMM campaign 里,agent 为了「省每次 launch 几微秒的 host 时间」,把 TN 的
+first-call race(建若干宏 tile → 各测一次 → 取最快)换成了「按解析模型排序、直接取第一个」。
+计分面(5 个 P0 形状)一切正常,**因为其中唯一的 TN 形状恰好新旧模型都排对**。
+
+换到计分面外的 llama-2 wgrad 就崩了(A=原 race 版,B=模型排序版,STREAM 三对中位):
+
+| shape | ratio(A/B) |
+|---|---|
+| 7B gate_up wgrad m=4096 | **0.8599** |
+| 70B gate_up wgrad m=4096 | 0.8645 |
+| 70B down wgrad m=4096 | 0.8686 |
+| TN 层整体 | **0.9145** |
+
+**恢复 race(去掉 `break`、`best=cands[0]` 改回 `_pick_dense_candidate`)后 TN 回到 1.0237,
+无一格倒退,llama 48 格整体转正 +0.79%。**
+
+诊断过程里有一条**方法论比结论更重要**:我先做了零 GPU 成本的**静态门控分析**——纯 Python 复刻新旧
+排序模型(`rounds` vs `rounds × cells`),算出「只有 70B gate_up/down 会从 SQUARE 翻到 RECT,
+模型差 4.5%」。这个分析**圈对了嫌疑面,但定错了罪**:实测显示 7B gate_up 也退 14%,而它新旧模型
+都选 RECT ⇒ 差异只能来自「旧代码 race 后按实测选,新代码信模型」。
+⇒ **静态分析用来圈嫌疑很划算(几分钟、不占卡),但定罪必须实测;别拿模型推演当判决。**
+
+★ 附带缺陷(次要):新模型 `_tn4_rounds` 只数 CU passes、**丢了每 pass 的代价**——TN 的
+SQUARE 是 256×256=65536 cells、RECT 是 384×192=**73728(大 12.5%)**,旧 makespan 是
+`rounds × cells`。但只要 race 还在,排序错只影响建构顺序,不影响最终选择。
+
+★ **判据**:任何「把 race / autotune 换成解析模型或硬编码」的改动,验收面**必须**包含计分面之外
+的兄弟形状(其它模型、其它 token 数)。省下的是微秒,赔出去的是可迁移性。
+
 ---
 来源: 06-autotune-design.md, 08-deadends.md, 04-tn-wgrad-kernel.md, SKILL.md, pr-merge-gate/SKILL.md, flydsl-fp8-gemm-results/SKILL.md, flydsl-fp8-gemm-tuning/SKILL.md, 02-nt-fwd-kernel.md, project_mxfp4_epilogue_store.md, 01-architecture.md, 03-nn-dgrad-kernel.md, gemm/optimization-directions.md, optimize-handoff/SKILL.md

@@ -204,3 +204,20 @@
 
 ---
 来源: remote-sync/SKILL.md, optimize-loop.md, SKILL.md, tool-rocprof/SKILL.md, optimize-handoff/SKILL.md, flydsl-fp8-gemm-tuning/06-autotune-design.md, flydsl-fp8-gemm-results/SKILL.md, flydsl-fp8-gemm-tuning/07-benchmarking.md, pr-merge-gate/SKILL.md, flydsl-kernel-authoring/SKILL.md, FlyDSL/CLAUDE.md, verify-performance/SKILL.md, mxfp8-8wave-devloop/SKILL.md, flydsl-fp8-gemm-tuning/SKILL.md, agpr_rawasm_progress.md, agpr_phase5_ldsr.md, project_mxfp4_epilogue_store.md, agpr_phase5_mono.md, 07-benchmark.md, bisect-perf-regression/SKILL.md, mi300-blockwise-gg-tuning/SKILL.md, 09-perf-numbers.md, gemm-optimization/SKILL.md
+
+## ★★★ 造尺子之前先 grep 有没有现成的(2026-09-03,同一个坑犯第二次)
+
+要测某个算子时,**先在 memory / `_bench_campaign_*.py` 里搜这个算子有没有被量过**。自己现搭的探针
+几乎必然会重踩已经记录在案的坑。
+
+实例:测「gpt-oss 稠密投影 FlyDSL vs scaled_mm」,我现写了个探针,同时犯了两条已记录的错:
+1. **把 bf16 喂给公共 op** ⇒ 每次调用都在量化。`project_gptoss_fp8_nopad_campaign` 的原话是
+   「走公共 op 的话量化占 ~40%,把比值稀释(我第一版就错在这)」——**同一句话适用于我这次**。
+   正确做法:`QuantizedTensor.quantize` **预量化一次**,闭包里只调 GEMM(部署里权重本来就是预量化的)。
+2. **单个 GEMM 紧循环计时** ⇒ operands 一直待在 L2,量的是热数据。dense fp8 campaign 专门弃掉了
+   这种计时,并因此**撤回过一个伪证**。正确做法 = **STREAM**:把该算子的若干形状排成链背靠背连跑,
+   同一形状两次调用之间其它几个自然把它的 operand 逐出 L2/MALL,链内逐个计时、median over ITERS。
+
+代价:第一版数字(1.078-1.099×)碰巧和正确尺子(1.091-1.095×)接近,**但逐格结构完全不同**——
+正确尺子才看得出「FlyDSL 不是全面更好,是更稳:scaled_mm 在两格塌到 1700 TF/s」。
+**数字对不代表方法对;方法错的时候,对也是碰巧。**

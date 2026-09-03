@@ -91,7 +91,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 
 ## methodology/ — 通用优化 / debug / profiling / FlyDSL 编程
 
-- [01-optimize-loop-benchmark](methodology/01-optimize-loop-benchmark.md) — 优化主循环、robust timing、测量噪声、公平对比、性能基线 regime
+- [01-optimize-loop-benchmark](methodology/01-optimize-loop-benchmark.md) — 优化主循环、robust timing、测量噪声、公平对比、性能基线 regime；★★★**造尺子前先 grep 有没有现成的**——自搭探针必重踩已记录的坑(把 bf16 喂公共 op ⇒ 量化占 40% 稀释比值;单核紧循环计时 ⇒ 量热数据,应用 STREAM)
 - [14-benchmark-shapes](methodology/14-benchmark-shapes.md) — **canonical 跑分 shape**：dense Llama-2 7B/70B + grouped MoE(gpt_oss-20b/Qwen3-235B/DeepSeek-V3, B=8, M∈{1024,2048,4096})
 - [02-correctness-race-cache](methodology/02-correctness-race-cache.md) — SNR/det 门控、cross-wave LDS-barrier race 诊断、长 K 非确定、JIT 缓存失效
 - [03-profiling-utilization](methodology/03-profiling-utilization.md) — ISA dump 权威、rocprofv3(kernel-trace/PMC)、regime 分类、ATT stall 根因、hotspot 分析、subtractive探针(★上界≠可达铁律)
@@ -105,7 +105,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [11-mxfp8-dense](methodology/11-mxfp8-dense.md) — dual-cast quant/preshuffle/LDS 转置写/scale_pack 预取/whole-loop 移植/全覆盖
 - [12-mxfp8-grouped](methodology/12-mxfp8-grouped.md) — grouped var-K wgrad/quant 融合/公平对标/e2e 计时与节点结果
 - [13-autotune-fleet](methodology/13-autotune-fleet.md) — Autotune 五原则/生产四轴 never-regress/N-GPU N-agent 调度
-- [16-campaign-harness](methodology/16-campaign-harness.md) — **跑自动优化 campaign 必读**:起(launcher 模板/环境红线)、bench 契约(★必须 mirror 部署配置)、盯盘(★轮内唯一活信号=kernel 文件 mtime)、停/续(工作区必须干净)、★坑清单(pgrep 自杀·孤儿 agent 改文件·effort=max 反而超时零产出·换机必重测 base/best·收官 squash 挑错 base+commit 游离·并发 pool 重叠致分数腰斩)、验收(不打扰在跑 campaign 的隔离复测法)
+- [16-campaign-harness](methodology/16-campaign-harness.md) — **跑自动优化 campaign 必读**:起(launcher 模板/环境红线)、bench 契约(★必须 mirror 部署配置)、盯盘(★轮内唯一活信号=kernel 文件 mtime)、停/续(工作区必须干净)、★坑清单(pgrep 自杀·孤儿 agent 改文件·effort=max 反而超时零产出·换机必重测 base/best·收官 squash 挑错 base+commit 游离·并发 pool 重叠致分数腰斩)、验收(不打扰在跑 campaign 的隔离复测法;★★★★**收官验收面必须大于计分面**=计分面+部署全表按占比加权+兄弟模型三层,本例计分面只占部署时间 39.2%、14% 的回退只在兄弟模型层暴露)
 - [17-e2e-kernel-trace-validation](methodology/17-e2e-kernel-trace-validation.md) — **e2e 训练里验证某 kernel 有没有真跑 = 开 torch profiler 看 trace,别加 print**(print 探针可能在死路);Primus mock 冒烟 + profiler 步骤、trace 落地目录(被 patch 改写)、gzip+json 解析(glob `rank[0]` 字符类坑)、kernel 名→后端对照表、K-pad 铁证(pad-quant kernel 只可能来自 syncv3);MoE 走 ragged 派发不经 PrimusTurboGroupedLinear/公共 grouped_gemm_fp8
 - [19-deployment-step-scoring](methodology/19-deployment-step-scoring.md) — **★★★拿真实部署的一步当分数**:热/冷尺子(同 kernel 30.7us vs 45.1us,排序翻转)、部署权重(56 形状均摊 +10% 而加权 −1%)、被抢时**取最小**(2 次取中位曾把基线记高 15%)、GLM-5.2 四个 decode GEMM 形状与调用数、`trace_step` vs `profile_decode` 的区别、四个运行期坑(spawn 孤儿/`/dev/shm` 攒死/别的容器孤儿/自杀式 pkill)；★★★**尺子必须走部署真正走的那条 kernel**——一个没传的 `num_cu` 让 20 轮 campaign 每一轮的「赢」在真路径上都是「输」(bench −5.2% vs 真训练 −0.84%)；拿真训练当 bench 的四个实现坑(步时间只能从 profiler trace 拿/冷缓存 autotune 落进 profile 窗口给出 2423ms 假值/loss 抖 3.2% 不能当紧门/ProfilerStep 每步发两次)
 - [99-misc](methodology/99-misc.md) — 其它零散事实
@@ -115,11 +115,11 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 ## pitfalls/ — 踩过的坑（最重要，动手前先查）
 
 - [01-tile-occupancy-register](pitfalls/01-tile-occupancy-register.md) — **256×256 唯一可行 tile**、512 合并寄存器池、量子边界、maxnreg/预取 spill 死路
-- [02-measurement-noise](pitfalls/02-measurement-noise.md) — 噪声地板/DVFS/掉频/并行口径/host 开销/虚高 TF/SNR 掩盖 race；★★★**同名多形状必须求和不能取中位数**(nt 名下挂 fc1+fc2 两形状,中位口径让同一改动的 Δ 跨轮极差 41-68us 且归因翻转,求和后降到 15-22us)
+- [02-measurement-noise](pitfalls/02-measurement-noise.md) — 噪声地板/DVFS/掉频/并行口径/host 开销/虚高 TF/SNR 掩盖 race;★★★★**自家孤儿探针空转 18h 把尺子从 0.29% 污染到 >2%、结论直接翻转**(+0.48%→−0.65%)⇒ 关键 A/B 前先扫孤儿;★★本地调用被中断后远端派发的活不会跟着死,必须去容器收尸；★★★**同名多形状必须求和不能取中位数**(nt 名下挂 fc1+fc2 两形状,中位口径让同一改动的 Δ 跨轮极差 41-68us 且归因翻转,求和后降到 15-22us)；★★★**别用标称峰值定价 headroom**——同日三次全被实测推翻(HBM 标称 8→实测 5.95,cast 其实在地板;fp8 GEMM 5000→实测 3151,grouped 其实 71-75% 不是 45.7%);参照系必须与被测同形态
 - [03-lds-l2-datapath](pitfalls/03-lds-l2-datapath.md) — LDS 容量/bank/带宽封顶、A/B 直读掉 2.5×、prefetch 何时有害、torch copy_ 假天花板
 - [04-race-vmcnt-correctness](pitfalls/04-race-vmcnt-correctness.md) — partial-drain/spill race、SRD 寻址、HW-walled 死路、SNR gate、attention 中性值
 - [05-mxfp4-mxfp8-deadends](pitfalls/05-mxfp4-mxfp8-deadends.md) — occ 天花板、epilogue store 暴露、wgrad feed-bound、mxfp8 scale 投递税/WL 死路
-- [06-autotune-dispatch](pitfalls/06-autotune-dispatch.md) — 禁 id(tensor) cache、别接不采纳候选、persistent 选择、缓存增益上限
+- [06-autotune-dispatch](pitfalls/06-autotune-dispatch.md) — 禁 id(tensor) cache、别接不采纳候选、persistent 选择、缓存增益上限;★★★★**dispatch 的 first-call race 不许用静态模型替代**(为省几微秒 host 时间换成模型排序,计分面全绿、计分面外的 llama wgrad 掉 14%;恢复 race 即全好)——静态门控分析只圈嫌疑、定罪必须实测
 - [07-flydsl-frontend-tracer](pitfalls/07-flydsl-frontend-tracer.md) — JIT 缓存不失效假象、字面 if/for 坑、前端编写陷阱、ThrVal/atom layout 静默错
 - [08-sync-build](pitfalls/08-sync-build.md) — rsync/git 远端同步陷阱、build/环境坑（HK undefined symbol/LLVM OOM）
 - [09-isa-profiling](pitfalls/09-isa-profiling.md) — sched_* 计数/s_setprio、ATT vs PMC 分工、code.json AGPR-blind

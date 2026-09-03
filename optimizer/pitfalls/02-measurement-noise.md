@@ -434,6 +434,41 @@ kernel-trace 双证:view 版 `.backward()` 15 次 dispatch/3832.9 µs,含一个 
 - 反过来用:如果一个 campaign 的 bench 就是 `.grad`,那么让 kernel **原生吐连续输出**这件事在尺上
   是噪声(本例 1.3254→1.3310),但在真实训练上是 **+11.5%**(1.1955→1.3327)。报告要把两个数都给。
 
+
+### ★★★★ 自家孤儿探针能把整场 campaign 的尺子污染到失真(2026-09-03 实测)
+
+dense fp8 GEMM campaign 收官复测时,同一份代码的配对 A/B 给出 **+0.48%、4W/2L**,噪声地板 >2%,
+我据此报告「卡在 keep 门上、判不了」。用户说「我要啊」。
+
+真凶:**我们自己 campaign 某一轮留下的探针 `_kyle_a2_ref.py fly 8 tn_lin1`,在计分卡 GPU3 上
+以 200% CPU 空转了 18 小时**(容器内 PPID=1 的孤儿)。清掉之后:
+
+| | 尺子噪声地板 | 同一对比的结论 |
+|---|---|---|
+| 孤儿在跑 | >2%(r10 跨度 2.2%) | +0.48%,4W/2L |
+| 清掉之后 | **0.29%** | **−0.65%,0W/4L** |
+
+**结论直接翻转**,而且清干净后的 r10 四读(1.0207-1.0237)与 `state.json` 记的 best=1.0205
+严丝合缝——尺子本来是准的,是被污染了。harness 自己对同轴前几轮判的 −0.22%~−0.32% 一直是对的。
+
+⇒ ★★**纪律:收官 / 任何关键 A-B 之前,先扫孤儿再测。**
+```bash
+docker exec <容器> ps -eo pid,ppid,etime,args | grep -E '_kyle_|_bench_|_probe_'   # 自家探针
+rocm-smi --showpidgpus | grep -A1 'is using' | paste - -                            # 目标卡上几个 PID
+```
+目标卡上 PID > 1 就先查清楚再测。**注意 `rocm-smi --showuse` 显示 0% 也不代表干净**——
+孤儿可能正好在两次 kernel 之间。
+
+### ★★ 本地调用被打断,远端派发的活不会跟着死(同日,一天犯两次)
+
+同一天第二次:我用 `bash remote.sh 'pytest ...'` 前台跑测试,**工具 10 分钟超时切断了本地这一端**,
+远端容器里的 pytest 毫发无伤继续跑;二十多分钟后我又起了一轮 A/B,于是**两个 pytest 在同一张卡上
+互抢**,两边都慢、都不可信。
+
+⇒ ★**凡是「本地进程 → ssh → 容器」这条链,本地一被中断(超时/Ctrl-C/kill),必须主动去容器里收尸**,
+不能假定信号会传过去。收尸时按 §pgrep 自杀那条:先把 PID 打印出来肉眼确认,再按显式 PID kill,
+**别用会匹配到自己命令行的 `pkill -f`**(我今天也在这上面自杀过一次 shell,exit 144)。
+
 ---
 来源: remote-sync/SKILL.md, pr-merge-gate/SKILL.md, 08-deadends.md, optimize-handoff/SKILL.md, optimize-loop.md, flydsl-fp8-gemm-tuning/SKILL.md, flydsl-fp8-gemm-tuning/07-benchmarking.md, fp8-gemm-bench/SKILL.md, 04-ceiling-analysis.md, flydsl-fp8-gemm-results/SKILL.md, 07-benchmarking.md, 10-grouped-wgrad-4wave-3buf.md, gpu-fleet-tuning/SKILL.md, 14-fused-preshuffle-e2e.md, mxfp8-grouped-gg-devloop/SKILL.md, project_mxfp8_wholeloop_port.md, 05-dead-ends.md, project_mxfp4_epilogue_store.md, verify-accuracy/SKILL.md, project_wgrad_occ_feed_bound.md, gfx950-vmcnt-race-debug/SKILL.md
 
@@ -569,3 +604,19 @@ level: ` 而 `(\d+)` 咬住 **`1`**,于是整轮 sclk 记成 "1 MHz / 2 MHz" 或
   同一改动的 A/B 才可判。
 - **推广**:任何「kernel 名 → 时间」的聚合,先确认这个名字下是不是只有一个形状/一种配置。
   profiler 只给名字,不给 launch 参数。
+
+### ★★★ 用标称峰值定价 = 系统性高估 headroom(2026-09-03,一天内犯三次)
+
+「这个核跑在峰值的 X%」这句话里,**分母必须是这张卡这种形态的实测可达值,不是标称/换算值**。
+同一天三次,每次实测都把结论推翻:
+
+| 项 | 我用的分母 | 同卡实测可达 | 结论 |
+|---|---|---|---|
+| tensorwise fp8 cast | HBM 标称 8 TB/s → 70-78% | **5.95 TB/s**(bf16→e4m3 `copy_`,256M/512M 两点一致) | 是**地板**:95.7-103.7% |
+| grouped fp8 GEMM | 5000 TF/s(从别处记录换算)→ 45.7% | **3151 TF/s**(M=N=K=12288 大方阵,两后端都收敛到 3095-3151) | **71-75%**,不是「有 15 倍空间」 |
+| 稠密投影后端 | 拿 hipBLASLt 当 TE 的代理 | 开关被 Primus 覆写、根本没开 | 「接不过来」的理由和结论都错 |
+
+★ **参照系要和被测对象同形态**:`copy_ uint8`(1r+1w)只有 4.6-5.2 TB/s,**低于**被测的 cast;
+换成同形态的 bf16→1字节 才得到 5.95。分母选错方向都可能反。
+★ **代价**:凭标称值我把「GEMM 还有大空间」写进过结论和优先级排序,据此判断「便宜的赢取完了、
+下一档在 GEMM 核心」——实测后这个排序不成立。**定价错会一路传染到优先级。**
