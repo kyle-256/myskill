@@ -96,6 +96,44 @@ step = statistics.median(steps[:2])
 带 `_xb/_kr/_mr/_cp` 后缀时才生效。已接 `xcd_band`(`HGEMM_XCD_BAND_OPTIONS=(1,2)`,
 名字加 `_xb2`,catalog 6571→13142;tuner 侧 `run_flydsl_gemm_bf16` 传 `xcd_band`)。
 
+### ★★★ 改了 tuned 表,必须清 `/tmp/aiter_configs`
+
+aiter 启动时把 `aiter/configs/*.csv` + 全部 `aiter/configs/model_configs/*.csv` **合并成一份缓存**
+`/tmp/aiter_configs/bf16_tuned_gemm.csv`(实测 3588 行),运行时查的是这份缓存,不是源表。
+**改了源表不删缓存 ⇒ server 读的还是旧表**,验证一路显示 notfound。09-03 因此白跑了一整轮验证。
+⇒ 改表后固定动作:`rm -rf /tmp/aiter_configs`,再起 server。
+
+### ★★★ 命中 tuned 表**默认不打日志**,别用 grep 判命中
+
+```python
+if AITER_LOG_TUNED_CONFIG:                       # ← 默认关
+    logger.info("... is tuned on cu_num ...")
+return config
+...
+logger.info("... not found tuned config ...")    # ← 无条件打
+```
+
+⇒ `grep -c "is tuned on cu_num"` **恒为 0**,拿它当"没命中"的证据是错的。
+正确判据二选一:
+- **看该形状有没有从 `not found tuned config` 名单里消失**(补表前后对比);
+- 直接调 `get_GEMM_A16W16_config(M=..,N=..,K=..,bias=False,dtype="torch.bfloat16",otype="torch.bfloat16")`
+  看返回的 `libtype`。⚠ 签名是 `(M,N,K,bias,dtype,otype,scaleAB,bpreshuffle)`,**`bias` 排在 `dtype` 前**,
+  用位置参数会静默错位、打出 `bias='torch.bfloat16' otype=None` 这种假日志,照着它能误判出"表字段写错了"。
+
+### ★★ GLM-5.2 部署真正发的 decode GEMM,取决于开不开 DP attention
+
+| 配置 | decode 每步发的 bf16 GEMM |
+|---|---|
+| **TP8 / EP1 / DP1**(官方、shipping) | `3072x6144`、`6144x1536`、`3584x512`(kv_b_proj=`64*448/8`) |
+| TP8 / DP8 + `--enable-dp-attention` | `2624x6144`、`16384x2048`、`6144x16384`(即 SIKL `who_wins` 抓到的那套) |
+
+**两套形状完全不重合。** 拿 DP-attention 下抓的形状去调,部署(DP1)一行都命不中。
+M 谱系 = `1`(EAGLE draft 步) + `batch * num-draft-tokens`(verify);`--speculative-num-draft-tokens 6`
+时 CONC 1..14 对应 M ∈ {1,2,4,6,8,10,12,14,24,48,60,84}。另有 prefill 的 `M = prompt_tokens`,
+是任意值,只能靠 `get_padded_m` 兜(实测 M=18 没兜到 24,仍走 torch)。
+⇒ **调形状之前先用 `--disable-cuda-graph` 起一次目标配置,把 dispatch 日志按 M 分类看一遍**,
+别信别的配置下抓的清单。
+
 ### 判负的两个"想当然"(别再试)
 
 - **照抄 hipBLASLt 的窄 tile**:它赢在 `MT16x16` → `6144/16=384` 个 WG 铺满 256 CU 不切 K,
