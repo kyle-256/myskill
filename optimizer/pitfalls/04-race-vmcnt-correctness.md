@@ -242,3 +242,30 @@ reviewer 核心观点：**"硬件 vmcnt 行为是约定，编译器在合理 pre
 
 ---
 来源: 10-grouped-wgrad-4wave-3buf.md, 05-dead-ends.md, gfx950-vmcnt-race-debug/SKILL.md, 08-deadends.md, 04-tn-wgrad-kernel.md, 02-nt-fwd-kernel.md, oob-detection/SKILL.md, flydsl-sync/SKILL.md, verify-accuracy/SKILL.md, debug-flydsl-kernel/SKILL.md, fp8-gemm-bench/SKILL.md, attention/optimization-directions.md
+
+## distance-2 手工流水里**哪条 s_barrier 能删**:只读尾部不是判据,"开场/收场"才是
+
+(2026-09-05,syncv3 grouped fp8 tensorwise NT 非持久,gfx950。每 K-iter 8 条 `s_barrier`、
+binary 489 条。全部结论来自**同进程、同算子、逐元素 xchk**,不是 checksum。)
+
+主循环一个 K-iter 的骨架(4 个 mfma group,每个被两条会合夹住):
+```
+ds_read b_c0,a_c0,b_c1        <- 读 stage
+[开场会合] mfma c00 [收场会合] g2s→b_c0    <- 收场会合承载 WAR: 大家读完 b_c0 才有人覆盖它
+[开场会合] mfma c01 [收场会合] ds_read a_c1 ; g2s→a_c0
+[开场会合] mfma c10 [收场会合] g2s→b_c1 ; g2s→a_c1
+wait_barrier(graded)          mfma c11 [收场会合]
+```
+* ❌ **别再试「只读尾部 K-step 的会合可以删」**。距离 2 的直觉是"最后两个 K-step 只消费、不填充,
+  所以没有跨 wave 边界" —— 实测 **xchk 13.5~15.6(逐位不同)**。原因:那两步读的是**前两步发出、
+  由 graded vmcnt 覆盖的填充**,这些填充的跨 wave 可见性会合**恰好落在这两步里**,
+  所以尾部是**最不能删**的地方,不是最能删的地方。
+* ❌ **也别按「开场会合只保护寄存器依赖、可以删」删**。逐条二分(mask 位)实测:
+  删 pre-c00 → **race**;删 pre-c10 → **race**;删 pre-c01 → **逐位相同(xchk 0.0)**;三条全删 → race。
+  ⇒ 开场会合里**有的**承载跨 wave 边界、有的不承载,**必须逐条二分**,没有可推导的通则。
+* ✅ **唯一安全的通则**:一串会合之间若**没有任何内存访问**(只有 `s_nop`/`s_setprio`),可以塌成一条;
+  以及"某个 mfma group 的**收场**会合"永远不能删(它是那个 stage 的 ds_read 对 g2s 回填的 WAR 边)。
+* ⚠ **而且删对了也不会更快**:那条逐位安全的(−46 条)双序实测 **−1.1…−2.3%**;
+  反方向**加**一条只读区间的重锁相会合(+63 条)是 **−3.9…−6.8%**。见 methodology/03 §wave-cycle 预算的
+  九扰动表 —— 这类核的 barrier 条数是双向局部最优,`s_barrier` 自带硬件 drain,
+  **条数与 graded drain 排期是同一个变量**。

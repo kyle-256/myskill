@@ -9,6 +9,20 @@
 - **s_setprio(1) 后必须归零**：MFMA block 前 `s_setprio(1)`、block 后立即 `s_setprio(0)`，防止 MFMA 被 VMEM/LDS 挤掉。❌ 别再试 忘记把它 DROP 回 0：会饿死 co-resident wave、直接砸 occupancy。
 - **s_setprio 的正负是 regime 决定的，别按 kernel 名搬结论**（2026-08-04 融合 hd64 flash bwd 实测；与 pitfalls/12 的 fwd 判负**相反**）。它唯一的作用是**给同一个 SIMD 上的两个共驻 wave 拉开相位**，所以三条同时成立才为正：①**有仲裁对象**(≥2 waves/SIMD；`waves_per_eu=1` 时恒中性，见 pitfalls/02)；②该 region **一个 wave 有 MFMA run 而它的兄弟没有**（GEMM2、carrier 的 GEMM3）；③body 是 **MFMA-pipe-serialized**（MFMA 占 ~47%）。齐了就是强正：拿掉包 GEMM2 的那一对 = **9/9 负 −2.8%**。反例都来自破坏②：把同一对**对称地**推广到 GEMM1（8 个 wave 全都有 MFMA run，没人可错相）= 7/11、6/11 噪声，**即使 hazard `s_nop` 198→102**；包 GEMM3 的 kstep ring = 6/11 且 spill +63 dword（setprio **不切 scheduling region**，却把 ring 的 live range 钉穿它）。
   - **幅度是 no-op，别扫**：全 wave 跑同一份码，比较恒为"in-region(1) vs not-in-region(0)"，1→2 改不了任何序（hd64 fwd 独立实测"提到 2 = 持平"，见 pitfalls/13）。
+    ✅ **第二次独立复现**（2026-09-05 syncv3 grouped fp8 tensorwise NT 非持久，gfx950/1400 W）：`s_setprio(1)` → `(2)` / `(3)`，
+    ISA 元数据**逐项完全相同**（指令数/VGPR/spill 全等，只差立即数），双序 4 格均值 **−0.09% / −0.02%** = 平。**这条卡准确，别再扫幅度。**
+  - ★★★ **⚠ 判据②「一个 wave 有 MFMA run 而兄弟没有」不是必要条件 —— 反例把 −2.8% 放大成 −21%**
+    （2026-09-05 syncv3 grouped fp8 tensorwise NT 非持久，8 wave/WG、2 waves/SIMD、MfmaUtil 67-71%）：
+    该核**最大程度违反②** —— 8 个 wave 被每 K-iter 8 条 `s_barrier` 锁在同一批 mfma group 上，
+    人人都有 MFMA run、没有任何可错相的兄弟，正是本卡记的那个「对称推广到 GEMM1 = 噪声」的形态。
+    但**拿掉包 mfma group 的那 22 对 setprio = −20.4…−23.9%，16/16 读数(双序 × 双 draw)、xchk 逐位 0.0**。
+    ⇒ **它在这类核上的作用不是（或不只是）硬件仲裁提示，而是 de-facto 调度锚点**：ISA 铁证是删掉后
+    编译器整体重排 —— `s_nop` 262→**163**、`v_*` 627→**652**、`vgpr_count` 256→**248**、
+    `vgpr_spill_count` 1→**0**、`private_segment` 8→**0**，而 mfma/ds_read/store/s_barrier **逐项不变**。
+    即"少 530 条指令 + 消掉唯一的 spill + 降 8 个 VGPR"仍然净亏 21%，代价全在被打乱的软流水上。
+    ⇒ 处置：**②只用来预测「加 setprio 能不能赚」，绝不能用来判「拿掉它安不安全」**；
+    任何 MFMA-serialized 的手工流水核，setprio 要按"结构件"对待，删它必须与重排后的 schedule 一起定价。
+    这也解释了本卡下一条「交织度与吞吐负相关」为什么会发生：setprio 变的是**调度**，不是交织度。
   - **⚠ 交织度指标与吞吐负相关，别拿它当判据**：拿掉 setprio 后 ISA 的 exp↔MFMA 交织**变多**（32 条 exp 里 ±3 指令内有 MFMA 的从 31 变 28），成绩反而 −2.8%。
 - **MFMA-issue 高 + TFLOPS 低 ≠ scheduler 没问题**（经典陷阱）：动调度旋钮前先 cross-check ATT stall trace 分类，判据见 methodology/03-profiling-utilization.md。
 - **GLOBAL_/SCRATCH_ 别用 FLAT**：地址可证明只落在单一 aperture 时，emit `GLOBAL_*` / `SCRATCH_*` 而非通用 `FLAT_*`。FLAT 付 aperture-decode 税，**且同时 double-count VM_CNT 和 LGKM_CNT**，害了 s_waitcnt 调度。

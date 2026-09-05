@@ -67,6 +67,12 @@
     把 B 进 LDS 时的 **operand 行**按对合 `16*t+m ← 2*m+t`(32 行块内)置换,这两个 fragment 就成为
     **相邻两列**,一条 `buffer_store_dword` 覆盖两列。g2s 是 `buffer_load_dwordx4 … lds` 直投、每 lane 的
     global 偏移本就是任意常量 ⇒ **零指令代价**;XOR bank key 仍按 LDS 行算 ⇒ **s2r 读侧逐位不变**。
+  - ✅ **2026-09-05 实作确认:这里的 16 是 fragment 宽度 W,对合写成 `W*t+m ← 2*m+t`(`2W` 行块内)
+    对 W 通用**。W=32 的 `32x32x64` 原子上按此参数化(`(row//2W)*2W + (row%W)*2 + (row%2W)//W`)一次落成、
+    xchk=0、store 仍是配对宽写 ⇒ 代数没问题。但**这不能救那个原子**:配对在 32 宽 fragment 上只值
+    **+1.3%**(不是 16 宽上的 +2.8~3.5%),因为 32 个 lane 的标量 2 B store 本来就已经覆盖 64 B 连续、
+    早已站在写请求地板上 ⇒ ★**配对的收益量 = `64 B ÷ (W × 2 B)`,W≥32 时它自己就归零**,
+    别把它当成"换宽原子后还能拿回来的那一项"(见 00-decision-index §32x32x64 行)。
   - 代价栏(ISA 自证):`buffer_store_short 160→32`(余下的是保持标量的窄边界体)+`dword 0→64`,
     **`v_cvt_pk 160→96` VALU 反而更少**(标量路每条 store 都发一条 pk-cvt 却只用一半结果),
     `v_mfma 920`/`s_barrier 304`/`.vgpr_count 256`/`spill 0`/`LDS 131072` **逐项不变**。
@@ -119,6 +125,19 @@
   条数**:NT 那笔顺带把 `buffer_store` 160→96 与 `v_cvt_pk` 160→96 都砍了,NN 的存指令条数一条没变
   (`TA_BUFFER_WRITE_WAVEFRONTS` 两臂同为 5.898e6)。⇒ **ΔP 的负号要归给指令条数,ΔF 的负号才是请求数的。
   给写侧的臂定价时只承诺 ΔF。**
+- ★★★ **2026-09-04 补(前提,必读):在贴着 TBP 的核上,store 宽度的收益走能量/DVFS,不走 tile 内 wall
+  ⇒ 同进程 wall 探针对它「零灵敏度」,别用探针给它定价。** 判据来自一次纯减法:在 syncv3 grouped fp8
+  tensorwise 非持久核(1400 W 封顶、满载 sclk 1723-1743 MHz)上把**整个 epilogue 删掉**(drop / alias 两臂),
+  四个 cell 的 wall 动 **0% ± 1pp**(bal/B8 +1.53%、B24 −0.36%、B32 +0.36% —— 全是噪声)。
+  ⇒ 上面那些 `+2.7% / +0.83%` 都是 **bench 口径**;拿同进程回文探针去量它只会读到位置项。
+  **定性只能靠 `TCP_TCC_WRITE_REQ`(机制)+ bench(幅度)两件套**,这正是本 campaign r2/r3 在这条轴上
+  反复出现「探针与 bench 打架」的根因。
+- ⚠ **2026-09-04 修订:行合并那条上轮加的「短 K」限定应换成形状限定。** 判据不是 K 深度,而是
+  **store run 是否致密(pad-both 窄输出:padded pitch + 真实宽度小于一个 L2 slice)**。实测:门以
+  `K_ITERS <= 32` 开时,GateUP dgrad(K_ITERS=45)被挡在外面;改成 `(n_stride and N <= K and
+  max(N, n_stride) <= 3072)` 之后同一个 K_ITERS=45 上 PMC(`TCP_TCC_WRITE_REQ` −48.89%、MFMA ±0.00%、
+  `MemUnitStalled` −37.1%、VGPR 逐项不变)与 bench(leg 0.9984 → 1.0117/1.0131)**都为正**。
+  ⇒ r2/r3 判负的不是深 K 本身,而是当时「门一开就波及所有深 K dgrad(含 qwen3/dsv3)」;K 只是相关变量。
 - ★ **epilogue 分解必须是三件套探针**:①**删整段**(量总量)②**同字节数只改段数**(量请求)③**保段数只删 VALU**(量发射)。
   只有 ① 动分数 ⇒ 成本是字节/带宽。mxfp4 grouped NT 实测 ②=+0.8%、③=−0.5%、①=−20.3% ⇒ **字节限**。
   ⚠ 任何改变**写入字节数或行集合**的"请求"探针都会假阳性:把 4 行塌成 1 行的"1 段"写法量到 −2.58 µs,

@@ -54,6 +54,29 @@
 ### 三级 tiling 与派生量
 - 三级 tiling:**block_x→M tiles、block_y→N tiles、K 为 reduction**。
 - 线程 256 = 4 wave×64 lane:`wave_id=tid//64` 划 N;`lane_div_16=lane//16` 划 M(4 组×16);`lane_mod_16` 划 MFMA 内 N。
+
+#### ★★★ `wave_id → (wave_m, wave_n)` 的分法值 26%,不是重命名(gfx950 8-wave/2-waves-per-SIMD 实测)
+- 8 个 wave 按 `wave_id % 4` 落在 4 个 SIMD 上 ⇒ **同 SIMD 的那一对永远是 `w` 与 `w+4`**。
+  把 `(wave_m, wave_n)` 这个双射换一种写法(tile 划分、LDS 字节、指令条数、`|C|` 全不变)实测:
+  | 同 SIMD 那对共享的坐标 | 写法(2(M)×4(N) 波格) | wall |
+  |---|---|---|
+  | 只共享 `wave_n`(读同一份 B fragment) | `wave_m = wid//4`,`wave_n = wid%4`(出厂) | **base** |
+  | 两个都不共享 | 上式再 `wave_n ^= wave_m*2` | **+0.19%(地板内,等价)** |
+  | 只共享 `wave_m`(读同一份 A fragment) | `wave_m = wid%2`,`wave_n = wid//2` | **−25.1~−26.5%** |
+- ⇒ 规律不是"要共享 `wave_n`",而是 ★**同 SIMD 的两个 wave 绝不能读同一份 A(重侧)fragment**。
+  本核 `N_TILES_A=4 / N_TILES_B=2` ⇒ 每 wave 12 条 `ds_read` 里 8 条在 A 侧;让共驻的一对同时索要
+  那 8 条同地址的读 = 两个 wave 的 LDS 请求完全同相,互相盖不住延迟。
+- **判负时几乎所有常规计数器都是瞎的**:`TCP_TCC_READ_REQ`/`TCP_TCC_WRITE_REQ`/`TCC_EA0_WRREQ`(含 64B 与
+  DRAM 拆分)/`TCC_HIT`/`TCC_MISS`/`TCC_EA0_RDREQ`/`SQ_INSTS_LDS`/`SQ_LDS_IDX_ACTIVE`/`SQ_LDS_BANK_CONFLICT`(=0)
+  **全部逐位相同**;`SQ_INSTS_MFMA`、`SQ_VALU_MFMA_BUSY_CYCLES` 也逐位相同。整个 26% 只落在
+  `SQ_WAIT_ANY/SQ_WAVE_CYCLES` **31.7% → 50.0%** 上 ⇒ 这类改动只能用 wave-cycle 预算定位(methodology/03)。
+- ⇒ **任何重写波格的改动(换 MFMA 原子、换 `n_tiles` 划分、改 `_bnd_*` 粒度)都要显式写出并复核这个双射**,
+  它长得像 index 代数、价钱是内核现存第二大的单一效应(仅次于配对列 store 的 +2.8~3.5%)。
+  (campaign 20260904_151102 r13,Down/bal+unbal 前向,16 发射/窗同进程配对 + inert 对照,xchk=0。)
+- 波格的 **M/N 极值本身也是第二个真变量**:同 M-major 写法下把 2(M)×4(N) 转成 4(M)×2(N)(每 wave 从
+  64 行×32 列变成 32 行×64 列,`(N_TILES_A, N_TILES_B)` 由 (4,2) 变 (2,4),LDS 读字节数、8 个累加器、
+  配对门 `N_TILES_B%2==0` 全部不变)实测 **−15.7~−15.9%**(bal/unbal 同向,xchk=0)⇒ 出厂的
+  "wave 沿 N 铺开、每 wave 只 32 列"不是随手选的,别在换原子时顺手把它转置掉。
 - 派生量:
   - `m_repeat = tile_m//16`
   - `n_per_wave = tile_n//4`

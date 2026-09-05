@@ -38,6 +38,38 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
   - 每迭代只 **1 个 `s_waitcnt vmcnt(0) lgkmcnt(0)`** + **1 个 double-buffer barrier**。
 - 满足即 compute 已 **MFMA-bound、零浪费,无 asm 可榨** —— 此时优化方向应转到 occupancy/feed,而非循环体指令调度。
 
+### ★ 指令足迹几乎不定价,`.vgpr_spill_count` 才定价(occ=1 whole-loop 核)
+
+ISA 行数/`v_mfma` 总数是**静态**量,而热路径一次只走其中一个 body。把「这颗核 emit 了 N 份重复
+body」当成一个可回收的池子之前,先按下面的顺序做,否则会把分配器的抖动记成足迹的收益:
+
+1. **先量,再改。** 用编译期开关把要摘的那份 body 关掉(保留它的 decode),做**固定-config 回文**
+   A/B,并带一条逐位相同的不变臂标定槽位偏置。
+2. **两边都 dump ISA**,同时记 `v_mfma` / 行数 / `.vgpr_count` / **`.vgpr_spill_count`**。
+3. **wall 差先减掉 spill 那一项再归因给足迹。**
+
+实测标定(gpt-oss fp8 per-tensor wgrad,gfx950,4-wave,occ=1,512 VGPR 吃满,两个投影):
+
+| 量 | gate_up 4 body → 2 | down 4 body → 2 |
+|---|---|---|
+| `v_mfma` | 2464 → **1232** | 2112 → **1056** |
+| ISA 行数 | 21103 → 10796 | 18988 → 9766 |
+| `.vgpr_count` | 512 → 512 | 512 → 512 |
+| `.vgpr_spill_count` | 0 → 0 | **0 → 1** |
+| wall(回文,两臂) | **+0.23% / +0.15%**(7/7 draw) | **−0.41% / −0.30%**(0/7 draw) |
+| 不变臂(逐位相同的重建) | −0.03% | +0.11% |
+
+读法:**指令足迹减半只值 +0.2%**(gate_up 那一侧,足迹是唯一变量);**一个 spill 槽值 ≈ −0.45%**
+(down 那一侧,足迹同样减半却净亏)。⇒ 「删掉死 body 缩小 ISA」不是杠杆;**「别让分配器多出一个
+spill 槽」才是**,而且它贵到足以单独解释一个改动的失败签名。⚠ 反直觉方向也成立:**减少代码会
+引入 spill** —— 分配器的输入变了,不存在"代码更少所以寄存器更松"。
+
+判「某条派发分支静态死了、可以不 emit」时,枚举**所有**会跳进来的原因,而不只是命名最显眼的那个
+(此核 head id 既做 split-K 的 cut,也做深组 tile 的 promote,而 plain 路径把 promote 的 tile 退掉了
+⇒ 摘 body = 丢 tile)。若这些条件是**运行期**的(如偏移表 / token 分布),静态证不掉;此时仍可造一条
+「只在本 harness 抽样分布下恒假」的**探针臂**来定价(要能写出硬上界,例如 `0.2+0.8*rand` 归一后
+G=24 单组上界 `1.0/(1.0+23*0.2)=17.9%` < 门槛 25%,并用 sha 逐位核对),但它**只能量,不能发**。
+
 ## rocprofv3 --kernel-trace 冷测 TFLOPS:排除 host overhead、认 kernel 归属
 
 ### 为什么用 rocprofv3 --kernel-trace
@@ -107,7 +139,48 @@ grep -oE "s_waitcnt.*" 21_final_isa.s | sort | uniq -c | sort -rn   # 数 vmcnt(
   ⇒ 结论是「barrier convoy 偏斜」，而不是 LDS/VMEM 延迟，于是 barrier 数与相位结构成为唯一相关的轴。
 - 判据：把 `SQ_WAIT_ANY / SQ_WAVE_CYCLES` 与 `MFMA_BUSY /（SIMD 数 × 时长 × 实测时钟）` 一起读；
   两者之差就是「可归因于 rendezvous」的空转。改动后若 `WAIT_ANY` 占比上升而 MFMA busy 不变，必然更慢
-  （实测 30.6%→34.2% 对应 −2%）。
+  （实测 30.6%→34.2% 对应 −2%；另一次 **31.7%→50.0% 对应 −26%**，campaign 20260904_151102 r13 的波格双射）。
+  ⚠ **符号可靠、斜率不可外推**：两个标定点是 −0.56%/pp 与 −1.42%/pp，差 2.5 倍 ⇒ 用它判方向，别用它折算幅度。
+- ★★★ **这套预算是「访存/LDS 计数器全部逐位相同」那类改动的唯一定位手段**。r13 的波格双射把 wall 打掉
+  26%，而 `TCP_TCC_READ_REQ`/`TCP_TCC_WRITE_REQ`/`TCC_EA0_WRREQ`（含 64B 与 DRAM 拆分）/`TCC_HIT`/`TCC_MISS`/
+  `TCC_EA0_RDREQ`/`SQ_INSTS_LDS`/`SQ_LDS_IDX_ACTIVE`/`SQ_LDS_BANK_CONFLICT`(=0)/`SQ_INSTS_MFMA`/
+  `SQ_VALU_MFMA_BUSY_CYCLES` **全部逐位相同**（同一份 kernel、同一组请求、同一份 `|C|`）。
+  ⇒ 只要候选是「同样的字节、同样的指令、换个分工」，就**不要**花时间扫访存计数器，直接上三项预算。
+- ★★ **`SQ_ACTIVE_INST_ANY / SQ_WAVE_CYCLES` 是「减指令条数」整族候选的立项门**：本核实测 **19.2%**
+  （与 00-decision-index 第 54 行独立记下的 20.8% 吻合）⇒ 发射槽有 5× 余量，任何"少发 N 条指令"的
+  候选期望值是 0，而它的代价（store 条数、fragment 几何、波格）是实打实的。这一条一次性解释了
+  32x32x64 原子为什么在四轮里每次 ISA 门全绿、wall 全负。
+- ★★ **三项占比相同不代表等待源相同 —— 必须同时报 `SQ_WAIT_INST_LDS / SQ_WAIT_ANY`**。上面那个 mxfp8 参照案例
+  里 `SQ_WAIT_INST_LDS` 占 `WAIT_ANY` 的 **59%**（所以它的结论落在 LDS/相位上）；而 syncv3 grouped fp8
+  tensorwise 非持久核实测三项 **21-22 / 45-48 / 31-33%**（与参照几乎重合），`WAIT_INST_LDS` 却只占
+  `WAIT_ANY` 的 **22.6-27.3%** ⇒ 同一个三项分布可以来自完全不同的等待源，只看三项会把结论误导到
+  「LDS 延迟」这条错路上。**报三项时一律附 `WAIT_INST_LDS` 占比**，剩下的那 ~73% 才是 barrier/vmcnt 会合。
+  （campaign 20260904_151102 r6，两个 cell 数字一致。）
+- ★★★ **⚠ 但「剩下那 ~73% 是 barrier/vmcnt 会合」≠「减会合条数能拿回来」—— 这一步必须实测，别当推论用。**
+  同一个核（syncv3 grouped fp8 tensorwise NT 非持久，`WAIT_ANY` 31-33%，8 条 `s_barrier`/K-iter、489 条/binary）
+  在 r7 把 rendezvous/drain 排期**双向**扫了 9 个扰动，**每一个都是负的**（同进程双序配对，xchk 单独判定）：
+
+  | 扰动 | s_barrier | xchk | 双序均值 |
+  |---|---|---|---|
+  | shipped | 489 | — | 0 |
+  | 删 pre-c00 开场会合 | 423 | ❌ race | −3.9…−6.1% |
+  | 删 pre-c01 开场会合 | 443 | **0.0 逐位** | −1.1…−2.3% |
+  | 删 pre-c10 开场会合 | 420 | ❌ race | −2.1…−4.8% |
+  | 删全部 3 条开场会合 | 308 | ❌ race | −2.9…−8.7% |
+  | 删只读尾部 K-step 的会合 | 461 | ❌ race | ~−0.3%(对 inert 基准) |
+  | **加** 一条只读区间的重锁相会合 | 552 | **0.0 逐位** | −3.9…−6.8% |
+  | graded g2s drain 收紧 1 条 | 489 | **0.0 逐位** | −1.9% |
+  | 收紧 2 条 | 489 | **0.0 逐位** | −3.7% |
+  | 收紧 4 条 | 489 | **0.0 逐位** | **−26%（悬崖）** |
+
+  ⇒ 三条可复用的判据：
+  ① **shipped 的会合条数/摆位往往是双向局部最优**：加一条与减一条都掉 1-7%，因为 gfx950 的 `s_barrier`
+     前 ISA 里**没有**显式 `s_waitcnt`（region 边界读作 `wait(-)`）⇒ 该会合自带硬件 drain ⇒
+     **barrier 条数与 graded drain 排期是同一个变量**，动其一必然打乱其二。
+  ② **drain 收紧是单调安全（只可能更强的等待，不违反 pitfalls/04 的"禁放宽"）但单调更慢**，
+     且存在悬崖 —— 悬崖位置就是"prefetch cover 刚好等于 HBM 延迟"的那一点，可用它反推 cover 余量。
+  ③ 这类核真正的 `WAIT_ANY` 杠杆不在"会合条数"，而在**调度锚点**（见 pitfalls/09 §s_setprio：
+     同一个核上拿掉包 mfma group 的 setprio 对 = **−21%**，而 `WAIT_INST` 45-48% 正是发射仲裁等待）。
 - `SQ_LDS_IDX_ACTIVE = 4 × SQ_ACTIVE_INST_LDS`（逐位）。**按 CU-cycle 归一才是 LDS 数据利用率**
   （gfx950 LDS 256 B/clk；某 8-wave GEMM 每 K-iter 每 CU 192 KB ⇒ 26.6%，3.8× 富余）；
   按 MFMA busy 归一得到的「10×」是量纲不明的说法，容易被读成结论。
