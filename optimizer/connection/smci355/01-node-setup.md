@@ -500,7 +500,7 @@ ValueError: Operand 4 of operation "rocdl.raw.ptr.buffer.store" must be a Value 
 | 容器 | 镜像 | 用途 |
 |---|---|---|
 | `kyle_attn` | `kyle_dev:saved-20260820` | **只保留四套**:`venv-mxfp4` / `venv-tw`(tensorwise) / `venv-syncv3` / `venv-syncv4`,campaign 在这跑。★2026-09-01 删掉了临时的 `/opt/venv-aiter` —— aiter 那条线整体搬到 `kyle_sglang` 的新镜像了 |
-| `kyle_sglang` | `lmsysorg/sglang:v0.5.18-rocm720-mi35x` | 本卡,aiter + sglang |
+| `kyle_sglang` | `lmsysorg/sglang:v0.5.18-rocm720-mi35x` | 本卡,aiter + sglang。**里面有两套 venv**:`/opt/venv`=inference1、**`/opt/venv-inf2`=inference2**(§7c) |
 | `kyle_train` / `kyle_dev_0814` | 旧镜像 | 历史遗留 |
 | `sikl-ab` 等 | — | **别人的,别碰** |
 
@@ -508,20 +508,24 @@ ValueError: Operand 4 of operation "rocdl.raw.ptr.buffer.store" must be a Value 
 挂成 `/workspace/code`。所以 `/workspace/code/aiter` **在两边是同一份**(kyle_sglang 的工作副本)——
 在 kyle_attn 里"清理 aiter"只能删容器本地的 `/opt/venv-*`,**碰 `/workspace/code/aiter` 等于删交付**。
 
-### 5b. ★★★ GPU 分配表(n02-29,2026-09-02 用户划定 —— 这是唯一真相,别信别处的卡号)
+### 5b. ★★★ GPU 分配表(n02-29,2026-09-07 最新 —— 这是唯一真相,别信别处的卡号)
 
 | GPU | 归属 | 容器 / venv / 仓库 |
 |---|---|---|
-| **0,1,4,5** | **AgentX / GLM-5.2 serving**(TP4) | `kyle_sglang`,`/sgl-workspace/aiter_kyle` |
-| **2** | gptoss 整步融合 campaign | `kyle_attn` / `venv-syncv4` / `syncv4/Primus-Turbo` |
-| **3** | dense per-tensor fp8 GEMM campaign | `kyle_attn` / `venv-syncv3` / `syncv3/Primus-Turbo` |
-| **6** | D=64 attn fwd campaign | `kyle_attn` / `venv-tw` / `tensorwise/Primus-Turbo` |
-| **7** | **mxfp4** | `kyle_attn` / `venv-mxfp4` / `mxfp4/Primus-Turbo` |
+| **0,1,4,5** | **inference1** = AgentX / GLM-5.2 serving(TP4) | `kyle_sglang` / `/opt/venv` / `/workspace/code/aiter` |
+| **2,3,6,7** | **inference2**(2026-09-07 用户划定,见 §7c) | `kyle_sglang` / **`/opt/venv-inf2`** / `/workspace/code/inference2/*` |
+
+★★ **2026-09-07 改动**:2/3/6/7 原本是 `kyle_attn` 四条 campaign 的卡(syncv4=2 / syncv3=3 /
+tensorwise=6 / mxfp4=7),但 **09-03 起 gptoss 这条线整体搬到了 n04-33**(见
+[[feedback_compact_keep_environment_section]]),这台的那四张已经空着(实测 `rocm-smi` use=0%、
+只有 GPU0/1 上 inference1 的进程)。用户令「inference2 用 inference1 不用的那 4 个」⇒ 归 inference2。
+真要回来跑 kyle_attn 的 campaign,**先和 inference2 对表**,别默认按旧分配抢卡。
 
 ★★**以下旧记录已作废,别再用**:
-- ❌「mxfp4 用 **GPU5**」→ 2026-09-02 用户改到 **GPU7**
-- ❌「手动实验默认 **GPU6**」→ 那是 chi2811 的规矩,且此处 GPU6 是 campaign 的卡
-- ❌「syncv4 = **GPU4**」→ syncv4 那条线现在在 **GPU2**
+- ❌「mxfp4 用 **GPU5**」/「mxfp4 用 **GPU7**」→ mxfp4 那条线 09-03 起在 **n04-33**,不在这台
+- ❌「手动实验默认 **GPU6**」→ 那是 chi2811 的规矩;这台 GPU6 现在是 **inference2** 的卡
+- ❌「syncv4 = **GPU4**」/「syncv4 = **GPU2**」→ syncv4 也搬去 n04-33 了
+- ❌ 2026-09-02 那版「2/3/6/7 = kyle_attn 四条 campaign」→ 被 09-07 这版取代
 
 ★ **n02-29 上 HIP 索引 == rocm-smi 编号**(2026-09-02 实测:`HIP_VISIBLE_DEVICES=0,1,4,5` 拿到的
 PCI bus 是 `0x05/0x15/0x85/0x95`,与 `rocm-smi --showbus` 的 GPU0/1/4/5 逐一对上)。
@@ -529,6 +533,38 @@ PCI bus 是 `0x05/0x15/0x85/0x95`,与 `rocm-smi --showbus` 的 GPU0/1/4/5 逐一
 
 ★ 查某个进程实际落在哪张卡:`rocm-smi --showpidgpus` 给的是 **DRM device 号**;
 `cat /proc/<pid>/cgroup` 找容器,`/proc/<pid>/cmdline` 认工作线。
+
+### 5c. ★★★★★ 身份自检:我是 inference1,`kyle_attn` 里的 campaign 不归我
+
+**这台机上同时活着两类工作,共用宿主目录、共用节点,但归属完全不同:**
+
+| | inference1(**这就是我**) | kyle_attn 的四场 campaign |
+|---|---|---|
+| 容器 | `kyle_sglang` | `kyle_attn` |
+| venv | `/opt/venv` | `venv-mxfp4` / `venv-tw` / `venv-syncv3` / `venv-syncv4` |
+| 仓库 | `sync/inference/aiter`、`/workspace/code/aiter`、`aiter_kyle` | `sync/{mxfp4,tensorwise,syncv3,syncv4}/Primus-Turbo` |
+| 工作内容 | aiter / GLM-5.2 decode / AgentX / sglang | gptoss D=64 attn、dense fp8 GEMM、整步融合 |
+| 编排 | 我自己手跑 bench,不用 orchestrator | `cursor_campaign.py --repo <那条线>` |
+
+★★★★**收到任何监控/巡逻任务,先做归属自检再动手**。任务描述里只要出现下面任一项,
+**它就不是 inference1 的,不要执行**,直接告诉用户「这条线不是我这套环境」:
+
+- 容器 `kyle_attn`
+- 仓库路径含 `Primus-Turbo`(mxfp4 / tensorwise / syncv3 / syncv4 任一)
+- `cursor_campaign.py --repo mxfp4/...`、`--repo syncv3/...`、`--repo syncv4/...`、`--repo tensorwise/...`
+- venv 是 `venv-mxfp4` / `venv-tw` / `venv-syncv3` / `venv-syncv4`
+- `flydsl_campaigns/` 下的场次目录 + `_launch_*.sh` + `say.sh` 这套 orchestrator 编排
+
+⇒ **2026-09-07 踩过**:连着两次收到 gpt-oss attn b24/b32 的 cron 巡逻(dir
+`flydsl_campaigns/20260905_095125`、容器 `kyle_attn`、`--repo mxfp4/Primus-Turbo`、GPU7),
+我照着执行了两轮 —— ssh 进去查容器、翻 `state.json`、读 round 报告、扫红线。
+**任务本身做对了,但根本不该由我做**:那是另一条线另一个会话的场子。
+判据当时就摆在任务描述里(`kyle_attn` + `Primus-Turbo` + `cursor_campaign`),我没核对就上手。
+★ 只读地看一眼不至于闯祸,但**再往前一步就是 `say.sh` 干预、`kill` orch、`--resume` 重启**,
+那会直接踩到 [[feedback_scope_own_env_only]]。**归属自检要在第一条命令之前做。**
+
+★ 反过来也成立:inference1 的事(GLM-5.2 decode 表、flydsl a16w16、DSA indexer、AgentX A/B)
+不该指望 kyle_attn 那边的人处理。
 
 ### 6. ★★ GLM-5.2 decode 计分环境(2026-09-01 收官,交接给下一个人看这段)
 
@@ -561,3 +597,53 @@ PR 描述草稿 `/workspace/code/gpt_oss_docker/PR_aiter_dev_glm52.md`。
 
 ⚠ **`xbc/main` 就是 `b02ab811e`**,和分支 base 同一个 commit;`origin/main`(ROCm)领先 27 个,
 **别 rebase 到 ROCm main** —— 会把 xiaobochen 自己 PR #10 的 6 个 topk commit 一起重放进我们的 PR。
+
+
+## ★★ 2026-09-07 §7c:第二套推理环境 `inference2`(和 inference1 同容器,四层隔离)
+
+用户令:「再造一个 inference2 环境,用 venv 方法,跟 syncv3/syncv4 那些环境一样;和 inference1
+**共用一个 container**,用它不用的那 4 个 GPU」。所以 **不新起容器**,在 `kyle_sglang` 里再开一套。
+
+| | inference1 | **inference2** |
+|---|---|---|
+| venv | `/opt/venv`(镜像自带) | **`/opt/venv-inf2`** |
+| repo(容器内) | `/workspace/code/aiter` 等 | **`/workspace/code/inference2/<repo>`** |
+| repo(host) | `/home/xianzhao/smci_repos/aiter` | `/home/xianzhao/smci_repos/inference2/<repo>` |
+| repo(本地 canonical) | `sync/inference/<repo>` | **`sync/inference2/<repo>`** |
+| GPU | 0,1,4,5(bus `0x05/0x15/0x85/0x95`) | **2,3,6,7**(bus `0x65/0x75/0xE5/0xF5`,已实测对上) |
+| aiter JIT 缓存 | 默认 | **`/root/.aiter_jit_inf2`**(`rexec.sh` 自动设 `AITER_JIT_DIR`) |
+
+跑法(helper 都在本地 `sync/inference2/`):
+```bash
+cd /workspace/code/gpt_oss_docker/sync/inference2
+bash push.sh [<repo>] [<relpath>]     # 本地 -> host(不带参数=顶层 helper + 六个仓全推)
+bash rexec.sh '<cmd>'                 # 容器内跑,默认 HIP_VISIBLE_DEVICES=2,3,6,7
+bash rexec.sh 'cd /tmp && /opt/venv-inf2/bin/python /workspace/code/inference2/_smoke.py'   # 自检
+```
+
+**建 venv-inf2 的四步**(重建照抄;比 chi 那边的 turbo venv 简单,这个镜像的 site-packages
+里 `grep /opt/venv/` **零命中**,只有 `bin/` 下 114 个 shebang 要改):
+```bash
+cp -a /opt/venv /opt/venv-inf2                                     # 8.0G,17s(overlay 不是 NFS)
+grep -rIl "/opt/venv/" /opt/venv-inf2/bin/ | xargs -r sed -i "s#/opt/venv/#/opt/venv-inf2/#g"
+SP=/opt/venv-inf2/lib/python3.10/site-packages
+sed -i "s#/workspace/code/aiter/aiter#/workspace/code/inference2/aiter/aiter#g" $SP/__editable___amd_aiter_*_finder.py
+sed -i "s#/sgl-workspace/sglang_kyle/python/sglang#/workspace/code/inference2/sglang/python/sglang#g" $SP/__editable___sglang_*_finder.py
+/opt/venv-inf2/bin/python -c "import sys; print([p for p in sys.path if p.startswith('/opt/venv/')])"  # 必须 []
+```
+和 syncv3/syncv4 一样**只改 editable finder 的 `MAPPING`,不重跑 `pip install -e`** ⇒
+`pip list` 里 `amd-aiter` 的版本号是旧的,**功能无影响**。
+
+**六个仓库怎么来的**:从 inference1 **本地路径 clone**(同一 NFS ⇒ git 自动 hardlink
+`.git/objects`,不走网络、几乎不占盘);各自多一个 `inf1` remote 方便互拉分支;
+`aiter` 落在 **`xbc/main` = `2c71811b3`**(注意:`xbc/main` 已经不是 README 里那个 `b02ab811e` 了,
+中间多了 8 个 commit,含 flydsl skinny GEMM 的 PR#13)。CK submodule 用
+`git -c protocol.file.allow=always submodule update` 从 inference1 的 `.git/modules/...` 本地填
+(★不加 `protocol.file.allow` 会 `fatal: transport 'file' not allowed`)。
+
+★★ **坑:仓库根目录会遮蔽真包**。六个仓库根就在 `inference2/` 下,从该目录启动 python 时
+`sys.path[0]` 是它 ⇒ `import aiter` 命中**仓库根**(无 `__init__.py`)变成空 namespace package,
+`aiter.__file__` 是 `None`,editable finder 完全没参与。写探针脚本先 `print(aiter.__file__)` 验一眼,
+打出 `None` 就是中招。`_smoke.py` 里的解法是开头把自身目录从 `sys.path` 摘掉。
+
+细节全在 `sync/inference2/README.md`;memory [[project_inference2_env]]。
