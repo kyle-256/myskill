@@ -542,9 +542,35 @@ PCI bus 是 `0x05/0x15/0x85/0x95`,与 `rocm-smi --showbus` 的 GPU0/1/4/5 逐一
 |---|---|---|
 | 容器 | `kyle_sglang` | `kyle_attn` |
 | venv | `/opt/venv` | `venv-mxfp4` / `venv-tw` / `venv-syncv3` / `venv-syncv4` |
-| 仓库 | `sync/inference/aiter`、`/workspace/code/aiter`、`aiter_kyle` | `sync/{mxfp4,tensorwise,syncv3,syncv4}/Primus-Turbo` |
-| 工作内容 | aiter / GLM-5.2 decode / AgentX / sglang | gptoss D=64 attn、dense fp8 GEMM、整步融合 |
+| 仓库 | **`/workspace/code/inference/{aiter,sglang,tools}`**(09-09 起统一收在这里) | `sync/{mxfp4,tensorwise,syncv3,syncv4}/Primus-Turbo` |
+| 工作内容 | aiter / GLM-5.2 decode / AgentX / sglang / **MegaMoE EP8**(09-09 接手) | gptoss D=64 attn、dense fp8 GEMM、整步融合 |
 | 编排 | 我自己手跑 bench,不用 orchestrator | `cursor_campaign.py --repo <那条线>` |
+
+### 5b-2. ★★★ 2026-09-09:inference1 的源码树统一到 `/workspace/code/inference/`
+
+用户令「`/sgl-workspace/` 下属于本线的东西全部放到 `/workspace/code/inference` 下」。已搬:
+
+```
+/sgl-workspace/sglang_kyle  ->  /workspace/code/inference/sglang
+                (新增)      ->  /workspace/code/inference/aiter
+                (新增)      ->  /workspace/code/inference/tools
+```
+
+**没搬、也不要搬的**:
+- `/sgl-workspace/mori` —— **两个 venv 都 editable 指向它**,搬了连带打断 inference2
+- 镜像自带的 `aiter`(6.9G)/`sglang`(3.5G)/`Mooncake`(3.8G)/`nixl`/`ucx`/`taskflow`
+  —— 是依赖不是我们的代码,且留在容器本地盘比 NFS 快
+
+★★★**两条搬迁时踩到的**:
+1. **`/workspace/code` 是 NFS 且容器 root 被 squash** —— 容器内写会 `Permission denied`。
+   落盘必须走 host 侧 `xianzhao@节点:/home/xianzhao/smci_repos/inference/`。
+2. **sglang 的 editable 是「路径映射 finder」不是软链** ——
+   `site-packages/__editable___sglang_*_finder.py` 里是一串绝对路径,
+   搬完 `sed -i 's#旧路径#新路径#g'` 改写即可,**不用重装**;改前先 `cp` 一份 `.bak.<ts>`。
+   判据:改完 `python -c "import sglang;print(sglang.__file__)"` 应指向新位置。
+
+★ MegaMoE 这条线的环境细节(JIT/config 隔离、`npes==8` 硬门槛、两把尺子)见 memory
+`project_inference1_megamoe_env`。
 
 ★★★★**收到任何监控/巡逻任务,先做归属自检再动手**。任务描述里只要出现下面任一项,
 **它就不是 inference1 的,不要执行**,直接告诉用户「这条线不是我这套环境」:

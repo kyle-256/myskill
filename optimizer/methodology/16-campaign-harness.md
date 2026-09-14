@@ -680,6 +680,23 @@ attention 场的 guard 腿噪声 3.2%,硬 cap 就变成单边税了 —— 见�
 
 ## ★ 这几场新踩的运维坑
 
+* **★★★★★ 任何长跑（campaign / 起 server 的 e2e / trace）都必须挂 cron 监视，不许用 `sleep` 蹲守。**
+  用户已纠正过多次（2026-09-12 又一次）。`sleep 570` 蹲一个 22 分钟的 e2e，代价不是"慢"，是
+  **窗口期内出事你完全不知道**：那一轮里 campaign 主进程变僵尸（日志停了 27 分钟我才发现）、
+  它的 cursor-agent 成了孤儿继续改工作树（污染了一次测量，12.7%）、容器被 SIGQUIT 带走、
+  端口冲突让 bench 去测了上一个 arm —— 四件事全发生在我 sleep 的时候。
+  **正确做法**：任务丢后台（`setsid nohup ... &`）立即返回，`CronCreate` 一个比任务周期略短的检查
+  （22 分钟的任务挂 ~9 分钟一次），cron 的 prompt 里写清「怎么判活 / 失败了查哪个日志 / 挂了怎么恢复 /
+  拿到结果后做什么、并删掉自己」。任务结束后 `CronDelete`。
+* **★★★★ 判活必须看 `stat` 非 `Z`，且 `pgrep -f <pat>` 会匹配到你自己这条命令。**
+  监控脚本连续几小时报"正常"，实际主进程早成了 `Zs` —— 因为 `pgrep -f "cursor_campaign.py"`
+  把当前这条含该字符串的 bash 也数了进去（假阳性）。同理 `pkill -f` 会**自杀**（exit 144，踩了三次）。
+  遍历时跳过 `$$`，并读 `/proc/<pid>/cmdline` 排掉含 `pgrep`／循环体本身的项。
+* **★★★★ campaign 主进程死了，它的 cursor-agent 不会跟着死。**
+  孤儿以 `ppid=1` 继续跑（实测又活了 55 分钟）并**持续写工作树**，而 bench 每轮 rsync 源码 ⇒
+  同一次测量的两个并发点可能跑的是两份代码。`ps -eo pid,ppid,stat,lstart | grep cursor-agent`，
+  认 `ppid=1` + 启动时刻等于日志里那一轮的开始时间；**cursor-agent 不理 SIGTERM，要 `kill -KILL`**，
+  杀完等 30 秒复查 `git status` 不再变动。其它 agent 的 ppid 指向各自活着的主进程，别误杀。
 * **★ 别用 score 反推 TF/s。** score 里含 guard 因子,反推会系统性偏高(实测偏 ~1.5%:
   反推 1057 vs 真值 1033–1043)。**直接从 bench 的 JSON 读 `tflops` 字段** ——
   在 bench 里就把它算好输出,别让监控端去凑。
@@ -737,3 +754,88 @@ autotune / dispatch 里往往落在**同一个分支**。本例 5 个 P0 里只�
 ★ 便宜的前置手段:**静态门控分析**。把改动涉及的门控条件(`N % bn == 0`、`K/BLOCK_K >= n`、
 覆盖率阈值等)用纯 Python 复刻一遍,对候选形状表跑一遍,先算出「哪些形状会走进被改的分支」。
 零 GPU 成本、几分钟,能把实测面缩小到值得跑的那部分。但**只用来圈嫌疑,不用来定罪**。
+
+---
+
+## 起 campaign 的进程纪律(2026-09-07 白停 2 小时换来的)
+
+★★★ **orchestrator 必须用 `setsid` 起,不能用裸 `nohup ... &`。**
+
+```bash
+setsid nohup bash _launch_xxx.sh --resume flydsl_campaigns/<dir> > /tmp/xxx.log 2>&1 < /dev/null &
+```
+
+裸 `nohup ... &` 起的进程留在**发起它的工具会话的进程组**里,会话清理时被信号打掉。
+它不像崩溃 —— **日志里没有任何 traceback**,`run.log` 停在某一行之后就再无输出,
+看起来就是"跑着跑着没了"。而且它起初是活的(本例存活 17 分钟以上),所以"起完看一眼是活的"
+证明不了什么。同一天用裸 `nohup&` 起了两次,两次都在几十分钟内被打掉;`setsid` 版本正常。
+
+起完要验证它**真的脱离了**:`ppid=1` 且 `sid == 自己的 pid`。
+
+```bash
+ps -eo pid,ppid,pgid,sid,stat,etimes,args --no-headers | grep "[c]ursor_campaign.py"
+# 期望 pid=N ppid=1 sid=N stat=Ss
+```
+
+★ 起在远端容器里的长跑(`docker exec -d`)不受这条影响,它不挂本地工具进程组。
+
+### 判活:必须显式排除僵尸
+
+容器 PID1 是 `sleep infinity` 时不 reap,机器上会攒下几万个 `Z`。
+**`ps -p <pid>` 对僵尸也返回成功,`kill -0` 也成功** —— 只看"命令没报错"必然误判为活。
+
+```bash
+ps -o pid=,stat= -p <pid>                                    # Z / Zs = 已死
+ps -eo pid,stat,args --no-headers | grep "[c]ursor_campaign.py" | awk '$2!~/^Z/'
+```
+
+⚠ `ps -eo ... -p <pid>` 里 **`-e` 会压过 `-p`**,列出全机进程 —— 在僵尸多的机器上会刷出几 MB 输出。
+查单个 pid 只用 `ps -o pid=,stat= -p <pid>`。
+
+### 巡逻提示词里必须写死这两条
+
+监控 cron 一旦被撤,上面这种死法就没人发现(本例死了 2 小时)。巡逻提示词里要写死:
+**按命令行找 pid(pid 会变,别写死数字)** + **`stat` 非 Z 才算活** + **orch 死了但容器在就立刻
+`setsid` resume**。
+
+### 配套坑:harness 存的 round diff 不能直接 apply
+
+`cursor_campaign.py` 用 `git(repo, "diff")` 写 `rounds/round-NN/diff.txt`,而那个 `git()` 末尾
+做了 `.strip()`,**把补丁结尾的换行削掉了** ⇒ `git apply` 报 `corrupt patch at line N`。
+要把工作树恢复到某轮交付态(中途死掉后 resume 前的标准动作)时:
+
+```bash
+git diff > <dir>/salvaged_rNN_partial_<why>_<date>.patch   # 先存在途半成品
+git checkout -- <改过的文件>
+{ cat <dir>/rounds/round-NN/diff.txt; echo; } | git apply -
+python3 -m py_compile <改过的文件>                          # 再起之前先自检
+```
+
+---
+
+## ★★ `sync()` 用的是 `rsync -azh` **没有 `--delete`** —— 本地删了远端不会消失
+
+`flydsl_campaigns/*/campaign_remote.py` 的 `sync()`:
+
+```
+rsync -azh <local_repo>/ <host>:<repo_remote_host>/     # 注意: 没有 --delete
+```
+
+后果(2026-09-11, GLM-5.2 EP4 r2 实际踩到):
+
+- analyze 轮为了做实验在 `aiter/configs/model_configs/` 下新写了一个 tuned CSV,
+  收尾时本地 `rm` 掉、`git status` 干干净净 —— **但远端那份还在,而且是实验版**。
+- 下一轮的 "control" 于是会命中实验版的 kernel 名,baseline 直接被污染
+  (本例远端残留的是 `_fp4` 版,control 的 rel_l2 会从 7e-4 变成 0.0418)。
+- 远端文件属主可能不是当前 exec 用户(`rm` 报 `Permission denied`),**删不掉**。
+
+**纪律**:
+
+1. 任何在 campaign 里新增的**配置/数据文件**(tuned CSV、json、pkl),都要当成
+   "会永久留在远端"来对待。
+2. 收尾不要只 `rm` 本地 —— 要么在本地把它**覆盖成一份无害的 no-op 版本再 sync 一次**,
+   要么 `remote.sh 'rm -f ...'` 确认删掉。
+3. **覆盖回去之后必须再跑一次 control,用 `ok=true` + baseline 分数确认远端状态干净**,
+   不要凭 `git status` 干净就认为远端干净。
+4. 反过来也成立: 远端的陈旧文件会让你误以为某个改动"生效了"。定位任何
+   "改了没反应 / 没改却有反应" 之前,先列一遍远端该目录的实际内容和 mtime。

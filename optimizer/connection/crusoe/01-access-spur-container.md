@@ -327,3 +327,86 @@ tar 在共享盘 → 任何节点 `docker load` 即用，省去重装 flydsl/重
 
 ---
 来源: 本 session (2026-07-20) 迁移 Crusoe 全程实测 + crusoe_user_guide 摘录;§11 = 2026-07-28 Shape A PMC 诊断实测。
+
+---
+
+# 9. 镜像 tar:打包、更新、在新节点起环境(2026-09-10 端到端实测)
+
+## 9.1 当前的 tar 清单(`/shared_nfs/kyle/images/`)
+
+| tar | 大小 | 内容 |
+|---|---|---|
+| `gpt-oss-docker_kyle-20260807.tar` | 28 GB | 旧 |
+| `gpt-oss-docker_kyle-20260809.tar` | 31 GB | 4 套 venv(venv / venv-syncv3 / venv-syncv4 / venv-tw) |
+| **`gpt-oss-docker_kyle-20260910.tar`** | **33.8 GB** | 上面那些 + **`/opt/venv-mxfp4`** |
+
+每个 tar 旁边有个 `.tar.done` 标记文件,**没有 `.done` 就说明还在写或写坏了,别 load**。
+
+## 9.2 打包(commit + save)
+
+```bash
+docker commit <容器名> gpt-oss-docker:kyle-YYYYMMDD
+docker save gpt-oss-docker:kyle-YYYYMMDD -o /shared_nfs/kyle/images/gpt-oss-docker_kyle-YYYYMMDD.tar
+sync && echo ok > .../gpt-oss-docker_kyle-YYYYMMDD.tar.done
+```
+
+★★ **`docker commit` 会静默跑十几分钟,期间看不到任何进度**,不要以为它卡死了:
+- 输出文件还不存在、`docker images` 里还看不到新 tag —— 都是正常的中间状态
+- **`du -sm /var/lib/docker` 在 `srun` 的挂载视图里恒等于 1 MB**(看不到宿主的 docker 数据目录),
+  拿它判断进度会误判成"没在写"
+- 唯一可靠的判活:`pgrep -af "docker commit"` 还在
+
+★★ **别被 `docker images` 报的 SIZE 吓到**:commit 出来报 **157 GB**,而 save 出的 tar 只有
+**33.8 GB** —— SIZE 是各层解压后的累加,tar 里是压缩且共享层去重的。按 SIZE 去估磁盘/时间会高估 4~5 倍。
+
+★ commit 是**快照**:不停容器、不改容器内任何东西,别人正在用的容器也能安全 commit(只是磁盘 I/O 重,
+按礼节先知会同节点的人)。
+
+## 9.3 ★★★ 换节点起环境:多数情况**不需要**等新 tar
+
+新旧镜像的差异往往只是一两个 venv 目录,而 **venv 是 `cp -a /opt/venv` 的拷贝**(editable finder 的
+MAPPING 指向 NFS 上的仓库,跨节点自动正确),**仓库和编译产物 `.so` 都在 `/shared_nfs` 上跨节点存活**。
+所以:
+
+```
+用旧 tar docker load(3~10 min) + 容器内 cp -a /opt/venv /opt/venv-xxx(秒级)
+        ≪  等新 tar save 完(十几分钟)再传再 load
+```
+
+2026-09-10 就是这么做的:`docker save` 在后台跑的同时,用 20260809 的旧 tar 在新节点把环境起好并跑完
+验证,save 完成后新 tar 只作为"以后开新节点一步到位"的存档。**两条线并行,别串行等打包。**
+
+## 9.4 ★★★ 抢到节点先验 dockerd,`which docker` 不够
+
+```bash
+docker ps >/dev/null 2>&1 && echo docker_daemon=OK || echo docker_daemon=DEAD
+```
+
+实测踩过两种坏节点:
+- `crsuse2-m2m-046`:连 docker 客户端都没有(旧记录)
+- ★ **`crsuse2-m2m-245`:`which docker` 有、`MAX_CLK=2400` 也对,但 dockerd 是 `inactive`、
+  `/var/run/docker.sock` 根本不存在** —— 只验二进制会被完全骗过去
+
+而且**救不回来**:我们没有 sudo(`sudo -n` 要密码),`systemctl start docker` 做不了;
+节点上虽有 `nerdctl`/`ctr`,但 `/run/containerd/containerd.sock` 是 `root:root rw-rw----`、
+rootless containerd 没配 ⇒ 整台只能弃用重抢。
+
+**把这行写进 sbatch 脚本体**,连同 `MAX_CLK` 和 `perf_level` 一起打进 `%j.out`,一眼判断节点好坏:
+
+```bash
+echo "node=$(hostname)"
+echo -n "docker_daemon="; docker ps >/dev/null 2>&1 && echo OK || echo DEAD
+echo -n "max_clk=";     amd-smi metric -g 0 | grep -m1 MAX_CLK | grep -oE '[0-9]+'
+echo -n "perf_level=";  cat /sys/class/drm/card0/device/power_dpm_force_performance_level
+sleep infinity
+```
+
+## 9.5 抢节点的 QOS 顺序
+
+| QOS | 限制 | 何时用 |
+|---|---|---|
+| `amd-agentx-2-qos` | 组 cap **node=3**,和同账号其他人共享 ⇒ 常撞 `QOSGrpNodeLimit` | 有空位时优先(priority 10000) |
+| `amd-burst-qos` | 无组 cap(node=182),**priority 100、被抢占直接 cancel** | agentx 满了就用它,长跑要自己做断点续跑 |
+
+★ 集群满载时(`sinfo` 里 idle=0)**换 QOS 也没用**,只能排队;先看 `sinfo -h -o '%T %D'` 有没有 idle。
+★ 一次提 2 个探测 job 挑好节点是可以的,但**挑完立刻 `scancel` 多余的**,别占着共享集群。

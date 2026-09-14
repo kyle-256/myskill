@@ -133,6 +133,12 @@
 - **Pattern1** V/K load 在 MFMA 循环内交替（每 load 只有 1 个 MFMA 的掩盖时间）→ stall_rate 80-95%。修法：把所有 V load **batch 到 QK MFMA 循环之前**预取进寄存器，让整个 QK MFMA 掩盖 VMEM 延迟。实测 **~20% 周期削减**。
 - **Pattern2** 连续 load 背靠背无 compute 交织 → VMEM 队列饱和。修法：在当前 tile MFMA 计算期间预取下一 tile 的 K load（double-buffer）。
 - **Pattern3** LDS prob 读紧接 PV MFMA → lgkmcnt stall。修法：先把所有 LDS 读 batch 发射，再统一做所有 MFMA，让 LDS 数据先就绪。
+  ⚠ **动手前先数 ISA,LLVM 在寄存器够用时自己就会做 Pattern3**。sparse-MLA decode producer(gfx950,
+  VGPR 162/168 预算)上显式把 QK 的 8 条 `ds_read_b128` 整体前提:`s_waitcnt lgkmcnt(0)` 从 54 条降到 34,
+  VGPR 162→174,墙钟 seq48/60 −1~−4.6%、**seq84 +2.7%** ⇒ 符号混杂、判负;而只把占用目标从 3 压到 2
+  (`lds_pad`,源码一行不改)同样把 54 降到 33 ⇒ **那 54 条全排空本来就是编译器在占用约束下的取舍,不是漏做**。
+  判据:先看 ISA 里下一 tile 的 load 是否已经被提到本 tile 的 MFMA 之前;若已经提了,Pattern3 无钱。
+  (完整数据见 pitfalls/12 §轮 7 补丁)
 - **Pattern4** scale load 和使用只隔 TLOOP 个 MFMA → 用太早 stall。修法：把 scale load 放到 **block 最开头、K load 之前**发射，最大化延迟掩盖距离。
 
 ## 深派发下 L2 命中的守恒量是 **WG 存活时间**，不是 tile 的 MFMA 条数
@@ -173,10 +179,193 @@ SQ_INSTS_MFMA / TCC_HIT_sum / TCC_MISS_sum`）：
 
 补 pool 宽度这一步本身就是负的：它把省下来的 B 字节又还回去，只剩 WG 数 +25% 的开销。
 
+### ❌ 别再试：小重排核去掉 LDS、改寄存器直接 gather（请求粒度反噬）
+mxfp8 scale preshuffle（`_emit_lds_repack`，每 WG 4KB 进 4KB 出、一次 barrier）改成
+"每个输出 lane 自己取 4 行、每行一条 dwordx4、零 LDS 零 barrier"：逐位一致，但
+**孤立标尺 −12.98%**，K128 越大越差（−34.3 / −24.8 / −16.2%）。
+- 机制：LDS 路径每条指令**连续读一行 64 B**，正好压在 gfx950 的读请求粒度上；寄存器
+  gather 每条指令只读 16 B 却要跨 16 行 ⇒ 同样字节数换来 **~4×** 的 TCP/L1 请求。
+- ISA 也没省（221 vs 209 条）：省掉的 ds_write/ds_read 被 gather 的地址算术吃回去。
+- ✅ 反过来成立的是**加宽**：读相位 `vec_width=1→4`（`buffer_load_dwordx4` +
+  `ds_write_b128`）叠加 `v_perm_b32` 打包（两条 perm + 一条 or 取代 4 条 shift-mask-or），
+  逐位一致、ISA −32.5%、LDS 与占用不变。但见下条的价值口径。
+- 🔁 再锚定（2026-09-11，sparse-MLA decode producer 的 Q publish，见 pitfalls/12 decode 节）：
+  同一对结论在另一族上重演。去 LDS 改「每 wave 自取一份 Q 进寄存器」= **+1.5~3.5%**（更慢）；
+  把 wave0 的 9 条 16B/lane 跨 16 行（整块 144 请求）改成 256 线程走连续 16B chunk
+  （整块 72 请求，128B 对齐块的下界）= 最多 **−1.5%**，逐位一致、VGPR 不跨台阶。
+  **请求数才是货币**这条判据可跨族直接用。
+- ⚠ 价值口径：这类"只减指令不减字节"的改写，**孤立标尺 +2.2~3.9%，进真实 step 后
+  只剩 −0.55%（0.13us/池）、折算 step 0.005%**。这些 dispatch 在 step 里是冷的、延迟
+  受限（544-880 WG，空核发射地板 1.76us vs 实测 4.8-5.3us，每 CU 仅 ~2 个 WG 可换），
+  发射槽不是绑定项。先用 kernel-trace 量池占比再决定要不要动。
+
 ### ❌ 别再试：FP4_LDSR 手动提前发射 ds_read
 - 手动把 a1/b1 的 ds_read 提到 iter 顶隐藏延迟 → **反退 ~20%**（K2048：2509 vs 3126）。
 - 机制：破坏编译器已做的**分段 lgkmcnt 软流水**。`FP4_RAWSPLIT=1` 每-mfma 一块时，编译器已自动做 operand 前置 + staggered s_waitcnt（`vmcnt(5)lgkmcnt(7)` → `lgkmcnt(6)` → `lgkmcnt(3)` …）。
 - LDS 读延迟隐藏**已由编译器做到位**，Python 层加不了价值。
 
+## 「请求数才是货币」要再往下修一层：**每行触碰的唯一 128B 行数**才是货币（gfx950 sparse-gather，实测定价谱）
+
+DSV4 sparse-MLA prefill（4096 token × topk2048 × 576B/行，576MB 池均匀随机 index）上做的定价谱。
+所有臂**指令流逐条相同**，只改「脚印」或「唯一行数」，同口径 60s ramp + HIP graph + min：
+
+| 臂 | 改了什么 | us | Δ |
+|---|---|---|---|
+| control | — | 739.7 | — |
+| 全 MALL 驻留 | row index 掩到 37MB 脚印 | 660.8 | **−10.7%** |
+| 全 L2 驻留 | row index 掩到 1.15MB 脚印 | 348.1 | **−52.9%** |
+| 唯一行 5→3 | chunk 偏移改成 (0,1,0,1)，请求数不变 | 537.4 | **−27.3%** |
+| out 写脚印 67MB→8.4MB | store 的 dv 偏移去掉 tile 项 | 732.2 | −0.9% |
+| PV MFMA 21→37 条 | 纯加计算，零额外访存 | 740.6 | **+0.1%** |
+
+两条可跨族复用的判据：
+
+1. **贵的是 TCC(L2) miss 本身，不是 DRAM 带宽。** 一条「每行多出来的唯一行」边际价 ~78us/(行·全量)，
+   而同一条行走 MALL 还是走 HBM 只值 15.6us。⇒ 看到 gather 核 memory-bound，先问「唯一行数能不能少」，
+   而不是「能不能让它 MALL 驻留」。后者在本例只值 10.7%，前者线性可兑。
+2. **请求数在唯一行数不变时是二阶量。** 同一个核上把 TCP 请求从 7/行压到 5/行（奇数行相位对齐、
+   算术逐位相同、VGPR 166→162、occ 不变）实测 **+0.9%（更慢）**；把唯一行数从 5 压到 3 则 −27.3%。
+   原有「请求数才是货币」那条是在**请求宽度**语境下说的（64B→128B 合并同时减了行数），
+   本条把它收窄：**合并请求只有在同时减少唯一行数时才赚**。
+
+### 定价探针写法（alias 臂，可直接照抄）
+让每条臂**发出完全相同的指令**，只改指令背后的地址集合，这样价差是纯粹的数据通路价：
+- 缩脚印 → 把 row index `& MASK`（0x7FF ⇒ L2 驻留，0xFFFF ⇒ MALL 驻留）。
+- 缩唯一行数 → 把 chunk 偏移序列由 `(0,1,2,3)` 改成 `(0,1,0,1)`。
+- 测计算是否被盖住 → 复制 MFMA（`for step in range(K*2)` + `step % K` 取操作数），
+  零额外访存。**本例 MFMA +76% 零成本 ⇒ 该核所有减指令/减 VALU/换占用的候选都不必做。**
+结果会是错的（checksum 变），所以**记分尺量不了这些臂**（它在计时前先判 relL2 会直接抛），
+必须另写一个同口径的非记分谱。
+
+### 推论：不整除的行宽是**必须报备的布局问题**，不是能在 kernel 里绕的
+576 不整除 128：偶行相位 0、奇行相位 64，两种相位都必然横跨 **5** 条 128B 行，其中 64B 属于邻行。
+邻行同时命中的概率在随机 topk 下是 0.2%，所以 5→4.5 行**只能靠改布局**（拆成 512B + 64B 两个池）。
+按上表边际价，−10% 行数 ≈ **−9~−10% 墙钟**。
+
+### ❌ 别再试：靠「把 index 排序」制造跨 CTA 的 L2 co-sweep
+理由不是 DRAM row locality（那是另一条），而是**并发窗口不够**：一次调用对 1.05M 行发 8.39M 次引用
+（每行约 8 次），但同时在飞的 CTA 只有约 96/XCD、各自流 1.31MB，行早被 4MB L2 挤掉。
+用「主机端预排序」这个**免费上界**量出来只有 **−1.5%**（727.8 vs 739.7）⇒ kernel 内做桶排/双调排序
+（每 CTA 多数千条 LDS 操作）不可能回本。要吃到 L2 驻留臂那 −52.9%，必须做**跨 token 的 gather 批量化**
+（先按 KV 行聚合再散回 token），那是改算法。
+
+
+## ★★★ M0 下溢：`buffer_load … lds` 的 LDS 基址**不能为负**，所以「预减 k-block」的槽不能是 leaf 0
+
+（2026-09-12 mxfp4 dense NT r50 实测；症状极具辨识度，值得先认症状）
+
+mxfp4 whole-loop 的 g2s 用**同一条 `offset:` 立即数**喂 global 地址和 LDS 目标
+（`_GBSK = KSTEP`，buf1 靠这条立即数免费跨一个 k-block），代价是 buf1 的 LDS 基址必须**预先减掉**
+一个 k-block：`M0 = ptr(A_buf[b]) + wave*wstride − KSTEP`。基线只让 `A_buf[1]` 当 buf1，永远为正。
+一旦把 A 环扩到 3 槽并**轮转**「哪个槽当 buf1」，轮转必然让**声明第一个** LDS leaf（偏移 0）去当 buf1
+→ wave 0 的 `M0 = 0 − 128` 下溢 → 该 wave 那批 g2s 的写**被丢弃**（不是回绕到 LDS 顶端）。
+
+- 症状：**正好一个 tile 索引全错**（2048 个 256×256 块里 512 个 = 每个 WG 一个 tile），
+  SNR **55.5 → 14.8 dB**，`block_rel_max ≈ 1.25`（错得离谱，不是精度问题）。
+- ⚠ 坏块集合别按 `bm` 直接读：`bm` 是 `grouped_xcd_pid` 之后的坐标。本例坏 `bm` = `{4..7, 20..23, …}`
+  即 `pid//group_m ≡ 1 (mod 4)`，代回 `r = 256*(bx%8) + bx//8 + 64t` 才看出它就是 **t == 1**。
+- ⚠ 写被丢弃 ⇒ LDS 里留着上一个 tile 的确定性数据 ⇒ **多次运行逐位相同**，看起来"不像 race"。
+- ❌ 改 `fx.struct` 的字段顺序（"把 A 挪到 B 后面"）**修不了**：`SharedAllocator(static=True)`
+  每个 leaf 是独立 `@__shared_alloc_*` 符号，摆放由后端定，源码顺序不决定地址。实测改了以后
+  输出**逐位不变**（连错法都一样）。
+- ✅ 修法：让轮转**永不把带 skew 的角色放到 0 号 leaf 上**。周期 4 的槽表
+  `((0,1),(2,1),(0,2),(1,2))` 同时满足两个约束：k-even 槽永远不属于上一个 tile（跨 tile 预取要的），
+  且 k-odd 角色只落在 1/2 槽。改完 SNR 回 **55.535 dB**、`|C|sum` 与基线**逐位相同**。
+
+## ★★★ NT 不是「整个 operand」的属性,而是「每条 load 指令」的属性 —— 按复用度给块打标
+
+(2026-09-12 GLM-5.2 TP4/EP4 a4w4 decode r12 实测,同批交错 3 对)
+
+MoE 权重流式 GEMM 给 B 打 NT(`_bnt2`)整体是 +8% 的大杠杆,理由是「每个 expert slab 只读一次」。
+但这个理由**对一部分块是假的**:token 数超过一个 m-block 的 expert(EP 里的共享专家必然如此)
+会被它的**每个 m-block 各读一遍整块 slab**,这些块之间有**真实的 L2 复用**,而 NT 恰好把它掐死。
+⇒ 正解不是「NT 全开/全关」,而是**同一个核里按块分类**:会被邻块重读的 slab 走 cached,其余保持 NT。
+
+- **先验证 XCD 前提**(不满足则复用物理上不存在,别写代码):N-fastest grid 下同 expert 相邻 m-block
+  的线性 WG id 相差 `grid.x`;只要 `grid.x` 是 XCD 数(8)的倍数,这些块就落在**同一个 XCD**、
+  共享那 4MB L2。本例 stage1 `gx=32`、stage2 `gx=96` ⇒ 都满足。
+- **判据**:kernel 内读 `sorted_expert_ids[blk±1] == expert`(两条标量 buffer_load,可忽略)。
+  一个长度 ≥2 的同 expert 连续段里**每一块**都至少有一个同 expert 邻居,所以 prev/next 这一格窗口
+  足够,不需要更宽的扫描。
+- **主机端必须再 gate 一层**:`token_num > block_size_M` 时才编出这个分支。因为 if/else 会把
+  GEMM body **复制两份**,而不可能有重复块的小 batch 只承担代价:b16 **+1.76us(+2.1%)**、b8 +0.35us。
+  gate 上以后 b8/b16 逐读回到基线。⇒ 这不是可选优化,是这条路能不能落地的前提。
+- **实测**:score 1.11075 → **1.13092(+1.82%)**,3 对逐对为正、区间不重叠;
+  b64 176.13→174.31(−1.83us)、b128 211.37→204.71(−6.66us);rel_l2 不变(缓存提示不改结果)。
+- ⚠️ **「跳过重复块」的减法上界会低估这条路**:那个探针量出上界 +2.11%(b64 −1.0us),
+  而 cached 版 b64 实际 −1.83us,**超过上界**。因为探针只删掉那块的算力/流量,而 cached 版还顺手
+  减轻了重复 slab 与其他流在 L2 上的互挤 ⇒ 别用「跳过」的上界去否掉「复用」这条路。
+- sc0/GLC(绕 L1、只留 L2)与纯 cached 实测**同分**(1.13120 vs 1.13137)⇒ 跨 CU 的复用与 L1 无关,
+  取写法简单的那个即可。
+- ❌ **别再试(同动机的两条替代路)**:
+  ①`persist_m=2`(让一个 WG 连做 2 个 m-block,把跨 WG 复用变成同 WG 复用)—— WG 数腰斩,
+  score **1.016**、b64 194.7us(+20us),并行度损失远大于缓存收益。
+  ②`xcd_swizzle=1`(把同 expert 的块重排到同 XCD)—— **0.92692**,b8 116us,灾难性;
+  此前只记过 xcd4 死,现在 xcd1(含 group_m=1 变体)也确认死。
+- 同理由的反向检查:A/scale 的 load 本来就是 `cache_modifier=0`(cached),**不要**给它们打 NT ——
+  32 个 N-block 共享同一个 A tile,这条复用是现役 grid 维序刻意保护的。
+- ★ **上一条已被实测坐实(2026-09-12 GLM-5.2 a4w4 EP4 r13)**:给 B-scale 流按「重读块 cached /
+  单读块 NT」分类定价(只在非复用块上打 NT,复用块保持 cached),score **1.10968 vs base 1.12915
+  = −1.7%**(b64 177.1 vs 174.4、b128 210.2 vs 205.6,只有 b16 反而 −1.8%)⇒ scale 流必须整条
+  cached,连"只给单读块打 NT"这个最保守的形态也是负的。scale 只占权重字节 5.9%,却是每 lane 4 B
+  的窄 load,NT 在这种宽度上拿不到 streaming 收益、只丢掉行内合并。
+
+## ★★★ CPol(aux)整轴一次扫完:除了部署的 `nt=2`,gfx950 上没有第二个可用值
+
+`buffer_load` 的 `cache_modifier` 直接进 CPol,位是 `sc0=1 / nt=2 / sc1=4`,决策索引里只记过 0/2。
+2026-09-12 在 GLM-5.2 a4w4 EP4 stage1+stage2 的 B 权重流上把 8 个值扫完(同 batch、每臂清
+`/root/.flydsl/cache`,因为 env 探针不改 kernel 名、共享缓存会把上一臂的二进制喂给下一臂):
+
+| CPol | 含义 | score | 判决 |
+|---|---|---|---|
+| 2(部署) | nt | 1.12915(base 均值) | — |
+| 3 | sc0+nt | 1.12864 | 平 |
+| 6 | nt+sc1 | 1.12858 | 平 |
+| 7 | sc0+nt+sc1 | 1.12989 | 平(噪声内) |
+| **4** | **sc1(device scope,绕 per-XCD L2)** | **1.00268** | ❌ **−11.2%**,b64 195.9 vs 174.4 |
+
+⇒ 两条可用信息:①`nt` 之外的位都不值钱,这条轴**整族封闭**,别再逐位试;②`sc1` 单独打开
+= **−11.2%**,说明即便每条 128 B 行只被一个 wave 读一次,**L2 仍在承担约 11% 的量**(请求合并 +
+重复 slab 命中),"单读流反正不复用、绕过 L2 更省"这个直觉是错的。判负成本 = 一次 8 臂扫描(80 s)。
+
+### ⛔ 上表的位编号是错的,"整族封闭"的判决作废(2026-09-13 GLM-5.2 sparse-MLA r14 实测)
+
+**skill 说 `sc0=1 / nt=2 / sc1=4`,实测 gfx950 上 `SC1 = CPol::SCC = 16`**(LLVM
+`SIDefines.h` 里 `SC1` 就是 `SCC` 这个位)。上表 value **4 是 `DLC`,对跨 XCD 可见性零作用**:
+
+| 判据 | cpol=0 | cpol=4/5(表里的"sc1") | **cpol=16/17(真 SC1)** |
+|---|---|---|---|
+| 一个 CTA 写、另一 L2 域的 CTA 读 partial(seq60/84) | 坏 1971 / 2940 个元素 | 坏在**完全相同的 1971 个元素**上 | **逐位干净** |
+| epilogue 用时 | 1.90us | — | **1.55us(更快 0.3–0.4us)** |
+
+⇒ ①那条 −11.2% 的判决是在**从未真正打开 device-scope 位**的情况下做的,**这条轴解封**:
+要 device scope 就写 `0x11`(SC0|SC1),不是 4。②**scope 该按"这条流被复用几次"定,
+不按指令族定**:GEMM 的 A/B gather 高复用 ⇒ 留在 L2(打 SC1 −11.2%);sparse-MLA 的
+partial 是**写一次、被另一个 CU 读一次** ⇒ 打 `sc0|sc1` 反而**更快**,因为把它留在写者的
+L2 里只是给读者买一次 miss。③同族还有一条硬结论:**这个核里永远不要用 agent-scope fence**
+(release 5.1us + acquire 1.3us,是整个 epilogue 1.3–2.3us 的 3–4 倍;fence 是整 cache 操作、
+每个 CTA 都要发)——**要跨 CU 可见性就逐指令挂 CPol,不要 fence**。
+
 ---
 来源: 08-deadends.md, agpr_phase5_lds.md, flydsl-kernel-authoring/SKILL.md, mi300-blockwise-gg-tuning/SKILL.md, 10-8wave-scvgpr.md, lds-optimization/SKILL.md, gfx950/kernel-implementation-notes.md, programming-model.md, optimization-directions.md, 09-8wave-ceiling.md, agpr_phase5_ldsr.md, diag_4w_vs_8w.md, project_mxfp4_epilogue_store.md, capture-kernel-trace/SKILL.md, kernel-trace-analysis/SKILL.md, mxfp8-8wave-devloop/SKILL.md, prefetch-data-load/SKILL.md, agpr_rawasm_progress.md
+
+## ★★★ 「co-sweep 判负」要先算**共驻窗口的联合脚印 vs 4 MB**;置换 CTA→tile 是免费的,跟 kernel 内排序不是一回事
+
+本卡上面 §❌「靠把 index 排序制造跨 CTA 的 L2 co-sweep」(prefill,免费上界只有 −1.5%)
+的判负理由是**并发窗口不够**:96 CTA/XCD 各流 1.31 MB,行早被 4 MB L2 挤掉。
+2026-09-12 在 **GLM-5.2 sparse-MLA decode** 上,同一动机的候选**实测 −33.6%** ——
+不矛盾,是窗口条件反过来成立了,而且实现形态完全不同:
+
+- decode 的一个请求 = 6 个 verify token × 8 split = **48 个 CTA**,一个 XCD 有 64 个共驻
+  槽位 ⇒ **整个请求同时在飞**;它们的**联合**脚印(live server 实测 topk 复用 4.05-4.29)
+  只有 **1.6-1.8 MB < 4 MB** ⇒ 复用物理上存在。
+- 实现是**纯置换 `owner → (token, split)`**(输出逐位相同、零指令代价),不是在 kernel 里
+  排序 index(每 CTA 数千条 LDS 操作,不可能回本)。
+- 反例侧同样成立:记分尺的均匀随机索引下,同一置换是 **−0.1%(平)** ⇒ 这条杠杆的全部
+  价值来自**数据的结构**,与调度无关。
+
+⇒ 判据清单(看到 gather 核 memory-bound 时按序问):①**唯一行数**能不能少(本卡主判据);
+②共驻窗口里**同时在飞的 CTA 的联合脚印** vs 4 MB —— 小于就去改**派发映射**(免费),
+大于就别碰;③别拿"请求数/带宽利用率"当货币。
+详见 pitfalls/12 §轮 3 补丁(含 decode 的完整定价谱:1.18 MB −31.4% / 4.1 MB −28.9% /
+9.4 MB −18.2% / 56.6 MB −3.4%,以及"同脚印不同结构差 25%"的对照)。

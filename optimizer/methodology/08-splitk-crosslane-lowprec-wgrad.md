@@ -68,7 +68,10 @@ band-cyclic 反而是 **skew 崩溃的主因**,不是解:
 ## Split-K 修少-tile 大-K 欠订阅:asm 自包含只改 Python body、bf16 atomic 累加
 
 ### 何时用 split-K(候选门)
-- 目标形状:few-tile 大-K,即一 WG/tile 撑不满 CU(tiles < ncu/2)且 K≥2048 → tile 数不足以填满 device,K 维长足以切分摊。
+> ★★★ **门的判据是波量化(wave quantisation),不是"tile 数够不够填 CU"** — 2026-09-10 Llama mxfp4 dense
+> 实测把 `tiles < ncu/2` 这条门修正为下式,单格 +13.7%(详见本节末「波量化门」)。`tiles < ncu/2` 只是它的
+> 一个特例(欠订阅 = 第一轮就参差);**填满了却参差**的形状(1.5 波 / 3.5 波)被旧门恒判成不可裂。
+- 目标形状:一 WG/tile 的网格**落不到整数波**上,且 K≥2048、K/256 可被 s 整除 → 有空转 CU-slot 可造活,K 维长足以切分摊。
 - 实证:`1024×1024×8192` fly/ait 从 **2.00 → 1.07**(修少-tile 大-K 欠订阅)。
 - Split-K factor 候选集:**2/3/4/6/8/12/16**(仅对 few-tile 大-K 报)。
 - Skinny/small-M GEMM(M≤~16–32、N*K 大,如 decode/output-projection)天然配对 split-K,因为 M 填不满 device。
@@ -81,7 +84,43 @@ band-cyclic 反而是 **skew 崩溃的主因**,不是解:
   - scale soffset 位移
   - 输出 workspace 布局 `[ksplit*M, N]` + `base_row` 位移
   - grid × ksplit
-- Host 端 reduce:`ws.view(ksplit, M, N).sum(0)`,用 **bf16 累加**(比 fp32-upcast 快 **2×**,误差~**1 ULP**)。
+- Host 端 reduce:用 **bf16 累加**(比 fp32-upcast 快 **2×**,误差~**1 ULP**),但**别写成 `sum(dim=0)`** —— 见下「归约」。
+
+### 归约:两操作数 `torch.add(out=)`,不是 `sum(dim=0)`(2026-09-10 实测)
+- bf16 `ws.view(k,M,N).sum(dim=0)` 只跑到 **3.70 TB/s**;`torch.add(ws[0], ws[1], out=dst)` 跑 **7.50 TB/s**,
+  正好是纯写地板(同尺寸 `copy_` 7.53 TB/s)。2×6144×4096:**40.78 → 20.14 µs**。
+- 归约占一次裂 launch 的 ~1/6 ⇒ **它的写法决定这一格裂不裂得起来**(QKV_wgrad 同一个裂 GEMM,`sum` 形态
+  只值 +8.8%,`add` 形态 +14.9%)。
+- ksplit>2 做**成对折叠**(每轮把活着的 band 数减半,`out=` 复用输入 band),让每次 add 都保持两操作数宽;
+  最后一次 add 直接写进 caller 的 buffer(beta=1 时改成 `target.add_(折叠结果)`)。
+- 精度:partial 是 bf16、折叠再舍入一次 ⇒ QKV_wgrad SNR 55.6 → **52.2 dB**(地板 12);尾部分裂只有尾行
+  多这一次舍入,整矩阵 **54.2 dB**。逐位可复现、beta=1 精确。
+
+### 波量化门(判据 + 12 格实测分布)
+- `eff(t) = t / (ncu * ceil(t / ncu))` = 这个网格的派发轮次里被占用的 CU 槽比例。1.0 = 整数波。
+- 只在 `eff(tiles*s) > eff(tiles) + 0.05` 时提候选 s;并列取**较小的 s**(partial 存与归约字节 ∝ s)。
+- ksplit=1 永远留在候选集里 + 竞速取全局最小 + 1% 保护边距 ⇒ **裂错永不可能让某格倒退**。
+- Llama 12 格:QKV_wgrad 384 tile = **1.5 波 / eff 0.75**、FC2_wgrad 896 tile = **3.5 波 / 0.875**,其余
+  **10 格 eff = 1.000**(12/8/56/28/7 波整数)→ 单臂、零首调用代价。⇒ 这个门天然只在该开的地方开。
+
+### ★★★ 尾部分裂:只裂"参差的那一轮"(2026-09-10,QKV_wgrad 再 +7.3%,合计 +21.5%)
+- 均匀裂让**全部** M 行产生 partial,归约字节 ∝ M。只把参差余量那几条 **M-tile 行**交给裂核:
+  makespan 与均匀裂**相同**(tile·k-block 总量、CU 填充都不变),partial 却降到尾部那一份
+  (QKV_wgrad **151 → 50 MB**,归约 20.1 → 8.7 µs)。
+- **不用改 kernel**:同一个 stub 里发三个现成核 —— preshuffle(整个 A/B,两个 GEMM 都读它)、
+  `c_m = H_rows` 的 plain 核(算整波部分,**直写 caller 的 C**;`a_nrec = (c_m - bm*BM)*K2` 就是 A 的行界)、
+  `c_m = m_tail` 的 ksplit 核(A 与 packed scale 传切片视图重基址)。
+- **切片数学**:packed E8M0 slab 是 **128 行一组的 row-group-major**,每组 `128*K128` dword ⇒ 尾部 slab 就是
+  `a_sp[m_main * (K//128):]`(m_main 是 256 的倍数)。验证抓手:未分裂行带必须与 plain **逐位相同**
+  (整-K tile 的累加序没变,只是子网格 swizzle 换了)——切片错了这条会立刻炸。
+- 尾部是**连续行带** ⇒ 归约就是 `torch.add(ws[0], ws[1], out=out[m_main:])`,不需要窄归约核、不需要
+  按 (bm,bn) 散写、也不需要第二个输出缓冲。
+- ⚠**两半各自都必须整波**:同流两个 launch **串行**,不共享调度,第二个要等第一个排空。判据
+  `(mt-t)*nb % ncu == 0 且 t*nb*s % ncu == 0`(t 从小到大取,字节最少)。不满足就只是把空转轮**搬了个位置**:
+  FC2_wgrad 896 tile 无解(3.5 波 → 3 + 1 = **4.0 波**,比不裂更差),竞速自己判负、留在 plain。
+- ⚠ beta=1 时主核要读回 C ⇒ 它关掉折叠宽存(`_CSTORE`),而折叠宽存**会改 packed B scale 的行序**
+  (`b_ilv`)。一个 preshuffle 喂两个 GEMM ⇒ **两边必须同时折叠或同时不折叠**,给核加一个 `cstore` 参数配对,
+  否则 B scale 布局不一致(会被 assert 抓住,不然就是静默错值)。
 
 ### kernel 内 packed-bf16 atomic 累加(去 intra-CTA 争用)
 - 用 `buffer_atomic_pk_add_bf16` reduce bf16 partials(每 32-bit op 打包两个 bf16)。

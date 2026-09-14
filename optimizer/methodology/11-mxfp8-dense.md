@@ -79,6 +79,7 @@
 - 分相探针:读+行写 ~7.5 TB/s;转置**列写**散写崩到 ~1.5 TB/s → 唯一瓶颈是 `AtQd[K,M]` 转置写的**合并度**(每 K-行的 M-run 太短)。
 - 判断带宽受限的判据:移除 barrier / 占用 / 计算(SK env)均无效 ⇒ 计算非瓶颈。
 - 节点/HBM 带宽上限数据：见 methodology/12-mxfp8-grouped.md「e2e 计时/节点占用检查」;dual-cast 达 3.2-4.6 TB/s = 真上限的 55-73%。
+- ★★★ **⚠ 上面"唯一瓶颈 = 列写合并度 / 3.2-4.6 TB/s"只对 1d(per-32)半区成立,别套到 `use_2d_block` 半区**(2026-09-11 mxfp8-nt r5 实测,MI355X)。1d 体在 step 内已达 **3.97-5.54 TB/s**、孤立 **5.76**(越过本卡上界);而 **2d-block(权重 operand,`ScalingRecipe(use_2d_block=True)`)那一路在五格里都是最慢的搬字节者,仅 3.04-3.41 TB/s**。同形状同 buffer 的三臂 A/B(nat/惰性 ctl/alt)测 15 条 cast:**2d 比 1d 慢 +9.6~+20.1%,15/15 同号**,ctl −5.1~+0.5% ⇒ **慢在 emission,不在 2d 语义**。根因(PMC 每 WG,l1.w 21504×3072):旧 2d 半区"一个 warp 领一块 32×32"(`riw=lane>>3`/`tir=lane&7`,4 pass)使**数据写退化成单 dword 4 B/lane** ⇒ 64 条 store / 512 请求 / **2.00× 扇区放大**,两张 scale 平面又各 512 请求,再加 `_WR64` 两轮 **12 条 `ds_bpermute`**:`SQ_INSTS_VMEM_WR 208`、`TCP_TCC_WRITE_REQ 1792`、`VGPR 28`。**修法 = 让一个 wave 整整领两块 32×32**(ROW:`rq=lane>>2`/`qc=lane&3`,拿 `rb*32+rq` 与 `+16` 两行 × 16 列,4 lane 拼满 64 B;蝶形掩码 `[1,4,8,16,32]` 保住 lane bit 1;scale 字节 `(qc&1)==0` 发;COL:`c=ckb*32+(lane&31)`、`mblk=mp*2+(lane>>5)`,逐字复用 1d 体 + 掩码 `[1,2,4,8,16]`)⇒ **56 / 1024 / VGPR 24**,`GRBM_GUI_ACTIVE` −10.2% 且与 1d 参照只差 0.4%(缺口整条抹平);四张输出平面在 11 形状 × 3 种 2d 模式上**逐位相同**(max 与顺序无关)。定价:孤立 −8.3~−15.4%(ctl ±1.1%)、同进程 step gm **+0.80%**、`bench.sh` 3 rep 中位 **106.496→107.383 = +0.83%**。⇒ 树上旋钮 `_QD_2D_FLAT`(默认 True)。**残余**:ROW/COL scale 平面各 256 请求,1d 只要 128(一行 4 个 scale 字节被两个 wave 各写一半),要合到 128 得让一个 wave 领满 128 列 = 每 lane 64 个 f32 活寄存器。
 
 ### LDS-合并转置写(制胜招)
 - 根因:列写 run 长度 = `bm`(每 K-行 tile 内连续 M 字节)。旧 `BM=32` 列写 run 仅 32B。
@@ -179,3 +180,137 @@ and M*K<2**31 and N*K<2**31
 
 ---
 来源: mxfp8-8wave-devloop/SKILL.md; project_mxfp8_wholeloop_port.md; mxfp8-grouped-gg-devloop/SKILL.md 优化7; project_mxfp8_grouped_wgrad_wl.md(WL 相关结论已在两文中被后续 commit 标注为废弃/删除,详见正文各节说明)
+
+## dual cast:已被证伪的四个方向(r8,全部在地址鲁棒 ruler 上)
+
+先看 pitfalls/02 关于"输出地址摆动 10-15%"那条 —— 下面每个结论都是在共用 buffer、
+全臂预热、回文、跨 4-8 个摆放取均值的 ruler 上得到的,四个输出平面逐位 `torch.equal` 校验。
+
+1. **`mrun`(M 轴长跑,krun 的镜像):11/11 cast 全负**,−1.1% 到 −25.9%,包括
+   21504x3072 / 16384x3072 / 3072x15360 这些 col 平面散射的窄 cast。
+   机理:`krun` 拉长的是**输入读**和 row 平面写的连续段;`mrun` 两个 M-tile 是**分开的
+   store 阶段**,col 平面仍然是两次 128 B 而不是一次 256 B,col E8M0 仍是两次 4 B。
+   换来的只有 workgroup 寿命翻倍和 grid 减半 —— 那是 pitfalls/03 已经标价的成本。
+   ⇒ K 轴和 M 轴**不对称**,不要因为 krun 成功就推 mrun。
+2. **非对称 tile(256x64 / 64x256)** —— 真正能把那两次 store 并成一次 256 B 的做法,
+   `bm*bk==16*nth` 且 `nth<=1024` 时只有这两个可达,且不费 LDS 不掉 occupancy。
+   实测 −6.3% 到 **−43.1%**:两边都拿满 128 B burst 远胜"一边 256 B 一边 64 B",
+   而且 krun 越大越差。128x128 是真最优点。
+3. **`ldsc_pad`(col stage 行 padding,消 LDS bank 冲突)**:11/11 cast 上 +0.0~+0.6%,
+   pad 4/8/16/32 都一样。LDS 在这个 kernel 里**不是成本**(和 pitfalls/03 的"LDS 端口
+   ≥5× 余量"一致)。之前读到的 +8~9% 全是地址假象。
+4. **`col_map=1`(让每个 lane 拿不同 K-col,LDS 读无冲突)**:−0.4% 到 −21.9%。
+   生产 map 下同 K-col、相邻 mblk 的四个 lane 写的是**连续四个 col-E8M0 字节(一个 dword)**;
+   col_map=1 把 64 个字节 store 散到 64 条不同的 line。scale 平面的成本是 **line 数**,不是 store 数。
+
+## r7 的 krun=3 + gm0.b8 在新 ruler 上复核通过
+
+跨 6 个摆放取均值:krun=1 比生产慢 4.6-9.4%,r6 的 k1g1 慢 3.0-14.9%。
+**符号和排序是真的**,但 r7 归给它的**幅度**(lin1.go 单靠 band +11.3%)有相当一部分是地址运气。
+
+## 每 step 的 preshuffle 到底多少
+
+`kern_0` 这个名字同时盖住 dual cast 和 fused scale preshuffle,历轮没分开过。
+单独按生产 launch 维度计时:每次 launch 有 ~5.1 µs 的**与尺寸无关的地板**(3.3 MB 和 26 MB
+都是 ~5.3 µs),地板之上的边际速率 ~11 TB/s;整 step 15 次 launch 合 15.9-20.8 µs/cell。
+但那个地板很可能是**探针自己的 per-call Python dispatch**:生产里 preshuffle 和 GEMM 共用
+同一个 `@flyc.jit` stub,不付第二次 dispatch。
+⇒ audit 表里的 `cast+preshuffle` 基本**就是 cast**,不要把它当成 preshuffle 的优化空间。
+
+## NT GEMM 的 per-tile 固定成本 F:量级、构成、以及它值多少
+
+把 `wall/tiles` 拟合成 `F + R·K_ITERS`(M=N=8192,1024 tile,任何 K 都恰好 4.000 轮,
+load balance 不变;K 一直扫到 `K_ITERS=3`,让 F 在它占主导的区间被**读出**而不是外推)。
+再把同一拟合跑两遍:一遍四个 C-store quadrant 全活,一遍每个 quadrant 的 row-band SRD 用
+`span_rows=0` 建(整条指令流原封不动 —— 同样的 cvt / permlane / 地址 VALU、同样的
+`buffer_store` 发射 —— 只掉流量)。`written=1.000` vs `0.000` 就是"这一臂确实减掉了东西"的证据。
+
+```
+keep=4/4   F = 31.84 ns/tile   R = 5.249 ns/tile-Kiter
+keep=0/4   F = 19.42 ns/tile   R = 5.438 ns/tile-Kiter
+```
+
+- **C-store 流量 = 12.4 ns/tile(F 的 39%)**。131072 B/tile / 12.4 ns ≈ 10.6 TB/s,就是 MALL
+  写速率。C 是输出,这些字节不可谈判。
+- **launch + prologue + epilogue 发射 = 19.4 ns/tile(61%)**。折成每 workgroup 是
+  `256 × 19.4 ns = 4.97 µs`,按这个核实际跑的 ~1.52 GHz 算约 7,600 cycle。
+
+**R 已经贴在硬件地板上**:一个 K-iter 每 workgroup 是 256 条
+`v_mfma_scale_f32_16x16x128_f8f6f4`,每条 32 cycle,8 wave 分 4 个 SIMD = 每个 MFMA 单元 2 个
+wave ⇒ 2048 cycle = 1347 ns @1.52 GHz;实测 `5.249 × 256 = 1344 ns`。⇒ **稳态 K 循环没有任何
+暴露的访存**,g2s 双缓冲已经做满,K body 的下一个杠杆是 MFMA 调度本身,不是预取深度。
+
+**F 值多少**:`F × tiles_per_step` —— linear1 7152 tile → 228 µs / 2733(8.3%);linear2 5328 →
+170 / 1989(8.5%);QKV 2096 → 67 / 708(9.4%);MLP-up 2816 → 90 / 903(9.9%);MLP-down 同 9.8%。
+这也正是对 Tensile 剩余赤字的形状:PT 在还赢 GEMM 的那几格用 MT320x256x128 / MT384x192x128
+(MLP-up −14.4 µs / MLP-down −40.3 / linear1 −89.0)—— **更大的 tile = 更少的 workgroup = 更少的 F**。
+
+### 已从 F 里抠出来的一刀:scale 预取提到算子 prologue 之前
+
+scale plane 是**第三条** DRAM 流(A、B_T、两张 E8M0),而 k=0 的 scale load 原本发在两条
+`wait_barrier` **之后**,离第一条吃 `sa0/sb0` 的 MFMA 只隔 ~2 个 ds_read 和一个 barrier ⇒
+一次冷访存延迟**串行**叠在 stage fill 上,每 workgroup 一次,且在 occ=1(LDS 128 KB/WG)下
+是纯暴露时间 —— CU 没有第二个 workgroup 可跑。提到 prologue 之前在统一 in-order vmcnt 上是安全的:
+它们先于 `cur0` 退休,所以每个 `wait_barrier` 字面量含义不变,**barrier 数量也不变**
+(顶部的半波 skew barrier 要求 wave 0-3 / 4-7 严格配对,增删 barrier 会死锁)。
+实测 **F 31.84 → 30.85(−3.1%)**,R 不变;`K_ITERS=24`(所有 fwd pass 的 K)那档 157.94 → 154.95。
+
+**顺带把"再多发一点"证伪了**:把 k=1 的算子 stage 也提上来凑成一发 7 条的 burst,F = 31.14,
+不比只提 scale 好。机制:prologue 卡在**第一段的争用**上,不是发射率上 —— 256 个共驻 workgroup
+一次性问内存要 16.8 MB 而不是 8.4 MB,并不会让 `cur0` 更早到。**只有那条被串行化的第三条流值得动。**
+
+## r10:两张 scale 平面的完整放置账 + step 内 kernel 分解
+
+### 放置账(单 cast ruler,只换地址不换字节;`_probe/r10_qbw.py`)
+
+拆法:每个平面各一条 DROP 臂(`span_rows=0` / `num_records_bytes=0`,指令流不变、只掉流量)和一条
+STREAM 臂(字节数不变、地址改成连续)。STREAM ≈ DROP 就说明**这个平面的成本是地址不是字节**。
+
+| cast | prod | d.scal | s.scal | s.read | s.rowd | s.cold | **s.all4** |
+|---|---|---|---|---|---|---|---|
+| lin1.go 16384×21504 | 291.9 µs / 4.90 TB/s | +6.29% | **+6.59%** | +2.54% | +1.75% | +0.64% | **+13.10%** |
+| lin1.w 21504×3072 | 51.1 µs | — | **+9.57%** | +3.00% | +0.80% | +1.66% | **+14.52%** |
+| lin1.x 16384×3072 | 35.7 µs | — | **+7.74%** | −0.20% | +1.12% | +0.11% | **+9.24%** |
+
+- **col-major fp8 store 已经基本完美**(s.cold 只有 +0.11…+2.59%)—— 定向怀疑它是错的。
+- row E8M0 边际带宽 0.34–1.11 TB/s vs fp8 数据平面 4.2–9.6 TB/s,差 10 倍,全在 line 共享上:
+  row line 的 32 个共享者是**连续 pid** ⇒ 8 个 XCD 全碰(≈16× 放大);col line 的共享者相距 NBK,
+  `NBK % 8 == 0` 时落在同一个 XCD(lin1.x:同样 1.6 MB,row 3.2 µs vs col 0.4 µs)。
+- **分母要用同形参照**:同进程 1431 MB 下 bf16→bf16(2r2w)只有 **5.30 TB/s**、u8→u8 5.33
+  (201 MB 时是 7.06/6.74)。拿 6.5 TB/s 只读峰值定价会把 headroom 系统性放大 —— lin1.go 的
+  4.90 TB/s 其实已经是同形连续拷贝的 **92.5%**。
+
+### "让两条 line 都只归一个 XCD"的方块模型:**被证伪**
+
+按 `units = ceil(rl/Bk) + ceil(32/gm)` 枚举 (gm, Bk) 方块,**u2 臂在宽 cast 上恰恰是最差的一档**
+(lin1.go g32b896/u2 −2.62%、g64b896/u2 −6.04%),而赢家是 u5–u9 的中等方块。原因:M 方向一长,
+bf16 读就按 K*2 跨步。**scale line 的归属和读的连续性是对抗的,没有共同最优,只有每形状的折中。**
+`krun` 能把"placement left"压到 0.00%(机制确认),但 grid 随之缩小(NBM·NBKG/krun),总账 −1.3…−48%。
+
+### 走位表本身在 step 里是负的 ⇒ 别再走这条路
+
+见 `pitfalls/02` 的第三个杀手。**顺带在 step ruler 上复核了 r7 当年用单算子尺定下的生产配置,
+全部站得住**(每一项消融都是负的,漂移之外):`plain(gm1/b0/krun1)` −0.47…−1.61、`krun1` −1.03…−2.47、
+`band0` −0.33…−0.81、`gm1` −0.56…−1.04;`pad_extra` 0/8、`cm_row/col=0`、`cm_data=0/2` 也都不如现状。
+**这一套 knob 已经在 step 尺上到位了,下一刀不在 knob 里。**
+
+### step 内 kernel 分解(`_probe/r10_pre.py`,per-launch 拆开)
+
+`kern_0 ×6` 不是 6 次 cast:FlyDSL 发出的核都叫 `kern_0`,实际是 **3 次 dual cast + 3 次 scale
+preshuffle**(后者由 fused gemm stub 在同一条流上先发)。拆开后:
+
+| 格 | 3×cast | 3×preshuffle | preshuffle 占整步 |
+|---|---|---|---|
+| QKV | 126.5 µs | **14.5 µs** | 2.1% |
+| MLP-up | 167.5 | 15.0 | 1.7% |
+| MLP-down | 158.5 | **20.5** | 2.3% |
+| linear1 | 417.5 | 26.0 | 1.0% |
+| linear2 | 295.5 | 22.0 | 1.1% |
+
+preshuffle 只搬 15–56 MiB(~3–11 µs 的带宽),却花 14.5–26 µs ⇒ **是发射/延迟档,不是带宽档**。
+**下一个杠杆:让 cast 直接写出 GEMM 要的 preshuffle 布局,把这 3 次 launch 整个删掉**,几何平均
+约 +1.5%(阈值 0.6% 的 2.5 倍)。可行性:`_MX_SCALE_PACK=4` 意味着一个 dword 装 4 个 K-group 的
+scale,而 `bk=128` 的 tile 每行正好产 4 个 scale ⇒ **每行恰好一个 dword**,`_store_scale` 的
+`pack==1` 分支(整 dword store)本来就在;难点是 A-scale 的 preshuffle 布局跟 GEMM 的
+`_BLOCK_M=256` 绑定(见 `gemm_mxfp8_kernel.py` 注释),cast 的 bm=128 要按 256 行块的次序落盘。
+这同时也会把 row-scale 的 4 B/line 写放置一并解决 —— 但按本轮的教训,**收益要在 step 尺上认**。

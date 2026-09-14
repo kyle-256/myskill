@@ -269,3 +269,34 @@ wait_barrier(graded)          mfma c11 [收场会合]
   反方向**加**一条只读区间的重锁相会合(+63 条)是 **−3.9…−6.8%**。见 methodology/03 §wave-cycle 预算的
   九扰动表 —— 这类核的 barrier 条数是双向局部最优,`s_barrier` 自带硬件 drain,
   **条数与 graded drain 排期是同一个变量**。
+
+## ★★★★★ buffer descriptor 的 `max_size` 决定越界写是"被丢弃"还是"污染邻居"（2026-09-12 GLM-5.2 MoE）
+
+`aiter/ops/flydsl/kernels/buffer_ops.py::create_buffer_resource(t, max_size=True)` 的语义
+**不是"关闭硬件边界检查"**，而是 `num_records = 0xFFFFFFFF` = **4 GiB 上界**。
+读 `from_memref` 确认：`max_size` 走 `_create_i64_constant(0xFFFFFFFF)`；
+`max_size=False` 才从 memref 静态尺寸推真实字节数；`num_records_bytes=` 显式指定优先级最高。
+
+两个直接后果：
+
+1. **`0x7FFFFFFF` 丢弃哨兵是成立的。** flydsl kernel 里大量用
+   `addr = present.select(real_idx, fx.Int32(0x7FFFFFFF))` 来"让硬件吃掉这次 store"。
+   它是**元素**索引，i32 下 byte offset = ×4 ≈ 8.6 GiB > 4 GiB ⇒ 确实被丢弃。
+   **别看到 `max_size=True` 就断定这个惯用法坏了**（我据此推过一次"自相矛盾"的错误根因）。
+2. **但中等大小的野索引拦不住。** byte offset < 4 GiB 的越界写会静默落进邻域内任何
+   映射内存 —— 不 fault、不报错，污染别人的缓冲区，后面某个读到脏数据的算子才崩。
+   索引**来自数据**（表、sorted row、topk id）而不是 threadIdx 推导时，一律显式给
+   `num_records_bytes=<真实字节数>`。
+
+### ★★★★★ 同样的边界检查，放对地方是免费的
+
+GLM-5.2 MoE 的 scale scatter 实测（算子级 score，配对同时段）：
+
+| 写法 | score |
+|---|---|
+| 不检查（`max_size=True`） | 1.13511 |
+| 软件谓词 `(row_ok) & (row < len)` 写在 store 循环里 | 1.1029（**−2.8%**） |
+| `create_buffer_resource(..., num_records_bytes=…)` | 1.13583（**零代价**） |
+
+**判据：能用描述符表达的边界，绝不要写成 store 循环里的谓词。** 内层循环里的一条
+比较会挡住 store 的合并/调度，代价远大于它看起来的样子；硬件的 range check 是免费的。

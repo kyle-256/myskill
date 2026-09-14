@@ -50,6 +50,7 @@
 ### const_expr 只包编译期已知值，绝不包运行时 GPU 值
 - ❌ 别再试：`if const_expr(lane==c_zero)` / `const_expr(gpu.thread_id('x'))` / `const_expr(warp_id...)`。即使 `@flyc.kernel(known_block_size=...)`，`gpu.thread_id('x')`、`lane`、`warp_id` 都是**运行时 SSA 值**（编译器只知取值范围，不知当前 lane/thread 实例）。正确写法是运行时 `if lane == c_zero`（AST rewriter 下沉为 scf.IfOp）或 `.select()`。
 - `const_expr` 只用于 trace/编译期已知值：Python bool、constexpr 参数、循环展开 / 类型 / layout 分支（如 `if const_expr(trans_v)`）。
+- ★★ **kernel body 里的 `and` / `or` 不短路**：`flydsl/compiler/ast_rewriter.py` 的 `RewriteBoolOps.visit_BoolOp` 把 `A and B` 改写成 `dsl_and_(A, B)` —— 函数调用，**两侧一律先求值**（源码自带注释叫 "repeated-evaluation convention"）。所以 `if const_expr(STRIDE and dt % STRIDE == 0):` 在 `STRIDE == 0` 时**照样算 `dt % 0`**，trace 期直接 `ZeroDivisionError`；同一行拷到裸 python 里跑却完全正常（实测：裸 python 打印 4 个 `0` 无异常）。踩证 2026-09-10 gpt-oss D64 bwd：D64 计分路能编，D128 SNR 探针（旋钮为 0 的那条路）当场崩。⇒ **右操作数只在左操作数为真时才合法的写法（取模 / 除 / 索引 / `.shape[i]`）一律不能靠 `and` 守卫**，要么拆成嵌套 `if const_expr(...)`，要么把条件写成无陷阱的等式（`if const_expr(K == 1):`）。翻遍 body 会发现现存代码全是两侧都安全的形式（如 `dt == 0 and len(_q) > 0`），这个坑一直被风格躲开、没被记下来。
 
 ### 字面 for + Python int 边界 = 静默展开丢 init=
 - FlyDSL loop bounds **必须是 `fx.Index(...)`** 才能 lower 成真正的 scf.for 并带 loop-carried operands（phi 节点）。普通 Python int 会让 trace 把它当 Python range **UNROLL 展开，并静默丢掉 `init=`** —— 任何 prefetch/double-buffer 对 MLIR 都变不可见，**无报错**。这是流水线被静默禁用的头号原因。（run-time loop 边界必须用 `fx.Index(...)` 不能用 Python int 这一条同样适用于前端编写场景。）
@@ -185,5 +186,44 @@
 - **规矩**:改窄任何一侧的 `width` 之前,先把 `RS` 换成 `(width // 16) * chunk_stride`;
   只要还是"一套配置喂两侧",就别为了"修正"去动这个立即数——那是在无收益地扰动热核的 ISA。
 
+## AST 改写只作用于 `@flyc.kernel` 本体:被它调用的普通 Python 辅助函数里不能有数据相关的 `if`
+
+本卡此前只说"绑定外层名字的编译期分支要用 `if const_expr(...)`"。实测补充:**分支能不能用,
+取决于代码写在哪个函数里**。tracer 是在 `@flyc.kernel` 装饰的函数上做 AST 改写,把 `if <动态值>`
+翻成 `scf.if`;**没有这层改写的普通函数不会被翻译**。
+
+- 实测(r7,`mxfp8_quant_flydsl.compile_qdual`):为了让 workgroup 走 krun 个 K-tile,把 ROW/COL
+  两个 half 提到 `compile_qdual` 作用域的普通函数 `emit_halves()` 里再从 kernel 调用,立刻在
+  `if half == z` 上炸 `RuntimeError: cannot evaluate dynamic 'Boolean' as Python bool during tracing`。
+  只好把两个 half 原地内联回 `kern`,多付一次整块缩进的改写。
+- **没有 device-function 装饰器**:`flydsl.compiler.kernel_function` 是**模块**不是装饰器,
+  别照名字猜。`flyc` 导出里也没有别的等价物。
+- **规矩**:普通辅助函数只能发射"无数据相关分支"的代码(纯 `range_constexpr` 循环 + `.select()` +
+  带 `mask=` 的 load/store)——`gemm_helper.py` 里的 helper 全是这个形状,不是巧合。
+  凡是要写 `if <runtime 值>` 的代码,必须待在 kernel 本体内;**先确认这一点再规划重构的形状**,
+  否则缩进方案会推倒重来。
+
 ---
 来源: flydsl-sync/SKILL.md, pr-merge-gate/SKILL.md, 03-emit-knobs.md, debug-flydsl-kernel/SKILL.md, FlyDSL/CLAUDE.md, programming-model.md, mxfp8-8wave-devloop/SKILL.md, mxfp8-grouped-gg-devloop/SKILL.md, feedback_flydsl_cache_staleness.md, project_mxfp8_grouped_wgrad_wl.md, remote-sync/SKILL.md, 08-deadends.md, prefetch-data-load/SKILL.md, flydsl-kernel-authoring/SKILL.md, flydsl-tile-programming/SKILL.md, agpr_phase5_lds.md, add-target-atom-op/SKILL.md
+
+## ★★★ 长跑进程(live server)在跑时换掉源文件 ⇒ `ASTRewriter: unexpected ast node <ast.ClassDef>`
+
+(2026-09-12 GLM-5.2 decode 记分线,代价一次 server 启动 ~4 min)
+
+症状极具辨识度,而且与"我改坏了 kernel"无关:
+```
+flydsl/compiler/ast_rewriter.py:268 in transform
+AssertionError: unexpected ast node <ast.ClassDef object at 0x...>
+```
+**机制**:`@flyc.kernel` 在被调用时才对内层函数做 `inspect.getsource` → `ast.parse`。
+`getsource` 用的是**已加载 code 对象的 `co_firstlineno`**,但读的是**磁盘上的当前文件**。
+长跑进程(sglang server)启动后文件被换掉(rsync/编辑),行号就错位;`findsource` 向上找
+`^\s*@` 时越过 `@flyc.kernel(`,命中它上面那个 `@fx.struct class PartialStorage`
+⇒ 拿到 ClassDef 而不是 FunctionDef。
+
+**规矩**:
+- campaign 的 `remote.sh` / `bench.sh` 这类包装**每次调用都会 rsync 整棵树**,所以
+  **server 在跑时本地树必须冻结**——连"只是 poll 一下日志"的远端调用都会触发同步。
+- 要在 server 生命周期里带自己的改动,就在**启动前**同步好、启动后一行不动。
+- 反过来:这个断言**不能**用来判断"我的 kernel 写法有问题"。先看是不是文件在进程
+  生命期内被换过(`stat` 的 mtime 晚于进程启动时间即可确认)。

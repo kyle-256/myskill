@@ -74,5 +74,45 @@ score 取**跨模型的几何平均**。这样任何往单一形状贴的判据�
 - 单一分数 = **combined step TFLOPS 的几何平均**：`Combined = 6/(2/fwd_tf + 4/bwd_tf)`，对所有 shape 取 geomean（见 methodology/01）。
 - 噪声：DVFS ~2-3%，判分门槛 ≥2% 才算真收益（见 pitfalls/02）。
 
+## ★★★★★ 部署形状集 ⊋ 计分形状集 ⇒ 差集里的代码等于没测过（2026-09-12 GLM-5.2 MoE，代价一整天）
+
+bench 只有 decode 形状 `M∈{8,16,64,128}`，而排序路径 `launch_4k_fused` **只在 M>2048 触发**
+⇒ 那条路径**整场 campaign 一次都没执行过**。后果：
+
+- 一个未定义变量 `is_local_expert`（r5 引入、r11 删除）**在树里活了四个 commit**，
+  中间任一 commit 部署就是 `NameError`
+- 一处越界写把线上 server 打崩，排查花掉大半天
+
+口径差异同样算：bench 用 `num_experts=258`（多一个 fake slot），server 实际是 **257**。
+
+### 修法：加一道**只判通过、没有基线**的覆盖门（关键是别动计分）
+
+改计分口径会让冻结基线失效、历史分数失去可比性（这场的 +13.1% 全靠 `BASELINE_US` 冻结
+才有意义）。所以覆盖门必须和计分**分开**：
+
+```python
+COVERAGE_M = (3072, 7144)        # 计分形状够不到的尺寸
+COVERAGE_EP_IDS = (0, 3)         # ep_id=0 的 mask 前缀和是平凡情况，必须带一个非 0
+SERVER_TOTAL_E = ROUTED_E + SHARED_E   # 257，server 口径
+
+def coverage_gate():
+    """返回 problem 列表；空=通过。无基线 ⇒ 以后加形状不必重测基线。"""
+```
+
+三条设计要点：
+
+1. 只判 raise / 非有限值，**不产生分数** ⇒ 可以随时扩展
+2. 配一个 `CFM_SKIP_COVERAGE=1`，**只用于给已知会在这些形状上崩的臂取分做配对对比**；
+   判分的臂绝不允许设
+3. 被测路径若有"只在大尺寸才走"的门槛，**给门槛加个 env 覆盖**
+   （本例 `AITER_P23_FUSED_MAX_T`），让小 M 也能走到那条路径，覆盖门就不必跑昂贵的大形状
+
+### 配套：验证的输入必须能到达被验证的分支
+
+同期 inference2 踩的同型错：改 `MAX_ROWS` 48→96 后做正确性对拍，用的是**单请求**，
+而 verify 行数 = 6 × 并发 ⇒ 6 行，两种配置都 ≤48、都走融合路径 ——
+**那个对拍是拿一条路径和它自己比**。必须构造到 84 行（14 路并发）才真正跨过分支。
+**"输入覆盖到了分支"这件事不会自己成立，要专门构造并用 trace 确认。**
+
 ---
 来源: benchmark/ops/training/config.py（DenseModelConfigs / MoEModelConfigs / gen_gemm_test_cases / gen_grouped_gemm_group_lens）, methodology/12-mxfp8-grouped.md（三模型 grouped shape 表）, 09-perf-numbers.md, mxfp4_4w_oddki_llama_aiter.md

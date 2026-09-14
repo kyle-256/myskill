@@ -150,6 +150,81 @@ G=24 单组上界 `1.0/(1.0+23*0.2)=17.9%` < 门槛 25%,并用 sha 逐位核对)
   （与 00-decision-index 第 54 行独立记下的 20.8% 吻合）⇒ 发射槽有 5× 余量，任何"少发 N 条指令"的
   候选期望值是 0，而它的代价（store 条数、fragment 几何、波格）是实打实的。这一条一次性解释了
   32x32x64 原子为什么在四轮里每次 ISA 门全绿、wall 全负。
+  - ★★★ **⚠ 这道门的阈值是 occupancy 的函数，符号会反 —— 19.2% 是 2 waves/SIMD 上的值**
+    （2026-09-11，mxfp4 dense NT，gfx950 occ=**1**，campaign 20260910_041317 REPLAN 实测）：
+    同一个比值在 occ=1 的核上是 **56.70%**（FC1_fwd）/ **59.48%**（out_proj_wgrad），是参照核的 **3 倍**，
+    **发射槽没有余量，「减指令条数」整族在这里是头号杠杆**。机制：occ=1 时没有 sibling wave 去填
+    发射空档，同一个 wave 的每一条非 MFMA 指令都直接落在自己的 MFMA 影子外面。
+    ⇒ **用这道门之前先报 occupancy**；`MeanOccupancyPerActiveCU = 1.000` 的核不适用 19.2% 那条结论。
+    - ★★★ **⚠ 这道门开出来的「删指令」族里,`s_setprio` / `sched_barrier` / `iglp_opt` /
+      `sched_group_barrier` 这类**区域标记**必须先剔除 —— 它们的条数收益是假的。** 同一个 occ=1 核
+      (`ACTIVE_INST_ANY` 50.05%,gpt-oss D64 fused bwd)删掉 GEMM2 的 4 个 `s_setprio`:指令 4024→3959
+      (−65,正是这道门最看好的方向),LLVM 却把 GEMM2 与邻居合并成一个调度区域,回来的排期
+      `inloop_lgkm0` **44→88**、`exposed` 4042→5675、`trip` +6.7%,wall **+4.678%(区间不相交)**,
+      并且破了 dS 栅栏的竞态(`snr` 读出 `52.3 nan nan`)。⇒ 立项清单第一步是**分类**:这条指令是
+      在算东西,还是在给调度器画线?画线的那类只能整段重测,不能按条数定价。
+  - ★★★★★ **occ=1 的 MFMA 核有一个两点可标定的闭式模型：`duty = 16 / (16 + c·n)`**
+    （`16` = 该 MFMA 原子的管线拍数，PMC 实测 `SQ_VALU_MFMA_BUSY_CYCLES / SQ_INSTS_MFMA`；
+    `n` = 每条 MFMA 伴随的**非 MFMA** 指令条数；`duty` = `TF/s ÷ (FLOP/cyc/SIMD × #SIMD × 实测 sclk)`）：
+
+    | 形状 | LDS | SALU | VMEM | VALU(扣 MFMA) | **n** | 实测 duty | 反解 **c** |
+    |---|---|---|---|---|---|---|---|
+    | FC1_fwd 32768×28672×4096 | 0.2579 | 0.2140 | 0.1720 | 0.2419 | 0.8858 | 68.05% | **8.481** |
+    | out_proj_wgrad 4096²×32768 | 0.2509 | 0.1908 | 0.1445 | 0.0352 | 0.6214 | 75.12% | **8.528** |
+
+    两行独立标定一致到 **0.6%**。`c ≈ 8.5` ≈ 4 拍发射（64-lane wave / 16-wide SIMD）+ 4.5 拍依赖/仲裁，
+    与同核 `SQ_WAIT_INST_ANY 32%`、`SQ_VALU_MFMA_COEXEC_CYCLES / MFMA_BUSY = **2.07%**` 自洽。
+    ⇒ 用法：**每 MFMA 少发 0.1 条指令 ≈ +3.7~4.7% wall**；候选排序直接比 Δn，不必先跑 bench。
+    ⚠ 两点标定，**符号与量级可用，斜率别外推到 n 变化 >2× 的改动上**。
+    - ★★ **第三个标定点(n 大一倍以上时 `c` 会掉):gpt-oss D64 fused attention bwd,gfx950 occ=1**
+      (2026-09-11,campaign 20260910_112555 r11)。ISA census `instr=4024` / `mfma=1280` ⇒ **n = 2.144**;
+      PMC 直接量到 `SQ_VALU_MFMA_BUSY_CYCLES / SQ_INSTS_MFMA` = **16.00 拍/条**(闭式里的 `16` 就此独立坐实),
+      实测 duty = `MFMA_BUSY /(WAVE_CYCLES×4)` = **54.4%**,而 `c=8.5` 预测只有 **46.8%** ⇒ 反解 **c ≈ 6.25**。
+      ⇒ `c` 不是常数,n 从 ~0.75 涨到 2.14 时从 8.5 掉到 6.25(每条非 MFMA 指令的**边际**代价随 n 变小,
+      共执行与影子重叠的机会更多)。**用法不变(排序、定方向),但别用任一单点的 `c` 去折算绝对幅度**。
+  - ⚠️ **`SQ_INSTS_VALU` 把 MFMA 也算进去了**（实测 out_proj_wgrad VALU 1.737e7 vs MFMA 1.678e7，
+    只高 3.5%）。算 `n` 必须先减掉 `SQ_INSTS_MFMA`，否则 n 会大一倍，并且会凑巧拟合出一个
+    漂亮但错误的「4 拍/条、零共执行」模型（本项 KB 差点就这么记错了）。
+  - ★★★★★ **闭式模型的下一级：把 `c` 拆开,`SQ_WAIT_INST_ANY` 就是「空掉的 MFMA 影子」,可以逐拍记账**
+    （2026-09-11，campaign 20260910_112555 r12，gpt-oss D64 fused bwd，occ=1）。
+    上面的 `c` 是拟合量;它其实等于 `4 +（未被占用的影子拍数 ÷ 非 MFMA 指令条数）`,所以 **`c` 变小
+    就是影子被填得更满** —— 这解释了为什么 n 翻倍时 `c` 从 8.5 掉到 6.25。而右边那一项是可以**直接数**的:
+    - **供给**:一条 MFMA 占管道 `P` 拍(PMC 实测 `MFMA_BUSY/INSTS_MFMA`,本例 16)、只占发射 4 拍
+      ⇒ 每条留 **`P−4` 拍影子**(本例 12),乘 MFMA 条数 = 每 trip 的影子供给。
+    - **需求**:把 ISA 逐条按发射拍数计价并求和。gfx950 实测单价:MFMA 4 / trans(`v_exp` 等,**half-rate**) 8 /
+      `ds_*_b128` 8 / 其他 LDS 5 / VMEM 6 / 普通 VALU 4 / `s_*` 1。
+    - **归因**:顺着 ISA 走一遍,对每一对相邻 MFMA 之间的间隙 `d`,记
+      `used += min(d, P−4)`、`empty += max(0, P−4−d)`、`uncovered += max(0, d−(P−4))`。
+      ⚠ **必须按「每个间隙独立」算,不能把没用完的需求攒着留给后面的 MFMA** —— 机器是按序的,
+      一段连发 M 条的 MFMA 就是白白扔掉 `(M−1)×(P−4)` 拍,攒着算会把成批改动算成正收益
+      (这正是 r10「成批 VALU 判负、静态模型却给它高分」的根因)。
+    - **接地**:本例供给 15360 / 需求 13616 / **EMPTY 7424(48.3%)** / FREE 7148,而 PMC 的
+      `SQ_WAIT_INST_ANY` = 11809 拍、`15360 − COEXEC 3457 = 11903` —— **1% 内吻合**。
+      再把 EMPTY 按合法性拆开:**RAW(读上一条 MFMA 的目的寄存器)= 0**、DRAIN(`s_waitcnt` 隔着)= 364、
+      HAZARD(`s_nop` 隔着)= 424 ⇒ 结论是**摆放**问题不是**依赖**问题,而这个区分单看三项预算得不到。
+    - ⚠ **`SQ_VALU_MFMA_COEXEC_CYCLES` 只数 VALU 共执行**,不含 LDS/VMEM 骑影子:本例静态"仅 VALU"
+      收获 4208 拍 vs 计数器 3457 拍(82% 吻合),而含访存的总收获是 7148 拍。**拿计数器校验静态模型时
+      要用同口径的子集**,否则会以为模型高估了一倍。
+    - ⚠ 这套账只算**发射占用**,不含依赖延迟:本例静态 trip 26167 vs 实测 36775(低估 28%)。
+      **它足以排序**(已与 COEXEC 接地),**不足以预测绝对 wall**;要那 28% 得上 ATT。
+    - ★★★★★ **总账只说"浪费了多少",要落到臂上必须再切两刀:按 emitter 切、按调度区域切。**
+      ① **成批普查(按 emitter)**:扫出所有**中间不含一条 MFMA 的极大连续实指令段**,对每段算发射拍数,
+         再算它 ±8 条 MFMA 内的空影子 = **就地 1:1 交织能吸收的上界**。本例 109 段 / 5922 拍
+         (= 影子供给的 38.6%)/ 可吸收 5240 拍,而且 59 段来自**同一条 emitter 链**。
+         EMPTY 告诉你浪费了多少,**成批站点告诉你是谁浪费的**——后者才能写成臂。
+      ② **区域账(按调度边界)**:按 ISA 里真正存在的区域标记(gfx950 上是 `s_setprio` / `s_barrier`)
+         切段,对每段算 `slack = 供给 − 需求`。**slack > 0 的区域自己没有足够的活填满自己的影子**,
+         只能跨边界进口;slack < 0 的区域有富余可以出口。于是
+         **纯区域内重排的上界 = Σ(EMPTY − max(0, slack))**。本例 49 个区域:EMPTY 7623 拍,
+         其中 **4567 拍不跨任何边界就能拿到**,3056 拍是硬地板。⇒ 这一刀直接把"要不要动跨区域的
+         大结构"这个问题变成一个可以先算再决定的数,**在开轮前就能判断本轮该不该碰寄存器**。
+      ③ ⚠ **别把长连发 MFMA 一律当成"批量取数没交织"**。本例六段 15 连发前面只压着 1-2 条 load
+         (要 1:1 填满需要 84 条),因为它们的操作数是**寄存器/AGPR 常驻**的(`K_REG=True`)——
+         寄存器常驻的 GEMM 链**自己没有访存可交织**,它的影子只能靠进口填,所以排序要排在
+         "有活但排错了"的那些区域后面。开臂前先看**连发前窗口里到底有几条可搬的指令**。
+      ④ ★ **同一个核里往往已经存在一段做对了的样板,先找到它**。本例 head-step staging 段
+         (ISA 476-501)已经是 `[MFMA][ds_read/buffer_load]` 1:1、**每条 MFMA used 12 / empty 0**,
+         证明硬件与调度器在发射序要求时是肯做的;它同时是"改动不能把它弄坏"的回归基准。
 - ★★ **三项占比相同不代表等待源相同 —— 必须同时报 `SQ_WAIT_INST_LDS / SQ_WAIT_ANY`**。上面那个 mxfp8 参照案例
   里 `SQ_WAIT_INST_LDS` 占 `WAIT_ANY` 的 **59%**（所以它的结论落在 LDS/相位上）；而 syncv3 grouped fp8
   tensorwise 非持久核实测三项 **21-22 / 45-48 / 31-33%**（与参照几乎重合），`WAIT_INST_LDS` 却只占
@@ -561,6 +636,36 @@ gpt-oss D=64 fwd 在**变好方向**上实测:`kh1,nf1` arm 让 `GRBM_GUI_ACTIVE
 ---
 来源: flydsl-fp8-gemm-tuning/SKILL.md, 10-8wave-scvgpr.md, flydsl-kernel-authoring/SKILL.md, agpr_rawasm_progress.md, project_mxfp4_epilogue_store.md, gemm-optimization/SKILL.md, 07-benchmarking.md, 07-benchmark.md, capture-kernel-trace/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, kernel-trace-analysis/SKILL.md, tool-rocprof/SKILL.md, diag_4w_vs_8w.md, prefetch-data-load/SKILL.md, gemm/overview.md, programming-model.md, 08-att-root-cause.md, project_mxfp4_k28672_ceiling.md, lds-optimization/SKILL.md
 
+## ★ 两个不用 profiler 的判 regime 探针(比 PMC 快、比 PMC 硬)
+
+memory-bound 的核上,PMC 只告诉你「多少字节/多少请求」,不告诉你「少一条会省多少秒」。
+这两个探针直接给**边际价**,各 70s,不需要 rocprofv3。
+
+### 1. 计算加法性探针:计算到底被盖住了没有
+往核里**纯加计算、零额外访存**,看秒表动不动:把 MFMA 循环由 `range(K)` 改成 `range(K*2)`、
+操作数取 `[step % K]`(结果会错,只用于计价;记分尺量不了,要另写同口径非记分谱)。
+- 秒表不动(实测 MFMA +76% ⇒ **+0.1%**)⇒ 计算完全被盖住 ⇒ **该核所有「减指令 / 减 VALU / 减 LDS 发射 /
+  换占用」的候选全部不必做**,一次性砍掉一整族候选。这比 `SQ_ACTIVE_INST_ANY` 19.2% 那道门更直接:
+  门只说「比例低」,这个探针说「边际价 = 0」。
+- 秒表按比例涨 ⇒ 计算在关键路径上,减指令是真杠杆。
+- **这个探针能分开「同一算子的两个 kernel」**:sparse-MLA 的 prefill 加 MFMA = +0.1%(计算全被 fabric 盖住),
+  同一族的 decode producer 加 PV MFMA ×4 = **+7%**(≈6 墙钟 cycle/条 mfma32,约 1/3 透过率)。
+  ⇒ 别把「本算子 memory-bound」当成整族的结论,**逐 kernel 各测一次**,70s 就能避免整轮预算排错地方。
+- **配套的第二条加法臂:纯同步加法性**(往每 tile 多塞 2 条 `gpu.barrier`)。免费(±0.5%)⇒ 屏障本身与 wave
+  收敛不在关键路径,「合并/挪 barrier」那族候选可直接砍掉;此时消融出来的那几个点必然在**被屏障保护的数据
+  往返**上(LDS rendezvous),要改的是所有权划分而不是同步原语。
+- ⚠ **加法臂的计时不要在 `FLYDSL_DUMP_IR=1` 或 `REPS=1` 下取**:一次实测里 dump 版给出 +15.44%,
+  正常复测三次全部是 ±0.2%。dump 走的是另一条编译/落盘路径,会污染同进程的第一次计时。
+务必用 ISA 核对指令真的加进去了(本例 `v_mfma` 21→37、VGPR 166→168、spill 0),否则可能是被 DCE/CSE 掉了。
+
+### 2. 「表观字节率 > 可达流带宽」⇒ 你不是带宽限,是缓存命中在帮你
+先用 `torch` 标一次本机可达流带宽(实测 MI355X:`copy_` 4.98 TB/s、`add(out=)` 6.25 TB/s、
+`sum` 只有 3.74、`amax` 2.01 —— **reduction 不能当带宽尺**,见 pitfalls/03 同名条)。
+再把核的字节数除以墙钟:如果**高于**可达流带宽(本例 sparse gather 折算 7.24 TB/s),说明这份"字节"里
+有相当比例来自 MALL/L2 命中 ⇒ **不要写"已到 HBM 带宽上限"**,该去量的是「哪一级 miss 才是那笔钱」
+(用 pitfalls/03 的 alias 臂:掩 index 缩脚印,分别做出 L2 驻留 / MALL 驻留 / 真实分布三条臂)。
+本例三条臂给出:L2 驻留 −52.9%、MALL 驻留 −10.7% ⇒ 贵的是 TCC miss 本身,HBM-vs-MALL 只值 10.7%。
+
 ## ★ 共驻两个 kernel 时,用 **full − nored 分解**把"body 变慢"和"共驻核被赶走"分开(2026-08-13)
 
 **场景**:一条流水里主核与辅助核(reduce/epilogue/prefetch 核)**共享同一个 512 dword 寄存器池**并
@@ -589,3 +694,70 @@ gpt-oss D=64 fwd 在**变好方向**上实测:`kh1,nf1` arm 让 `GRBM_GUI_ACTIVE
 * "让 reduce 按生产者写入顺序读,能吃 MALL 余温" → 反转 grid 顺序:0.004 ms ⇒ 死。
 ⇒ 判一个共驻核该不该继续调形状(wave 数/WG 宽/向量宽/顺序),先用这两个探针问"exposure 是字节项
 还是延迟项";是字节项的话,**所有形状旋钮都无效,只有减字节有效**。
+
+---
+
+## 补丁(r19):sclk 不要用 `rocm-smi` 采,用 `GRBM_GUI_ACTIVE` 反推
+
+本卡「采 sclk/power 是 profiling 第 0 步」的处方是对的,但**采法**在短 kernel 上会骗人:
+JIT 缓存命中后 driver 早已跑完,`rocm-smi` 采样窗口落在空闲段上(实测读到 **158 MHz**),
+据此算出的 roofline 会把 duty 高估到接近饱和(某核被误判为 "76% roofline",实际 ~56%)。
+
+★ **可靠采法**:`GRBM_GUI_ACTIVE ÷ XCD 数 ÷ dispatch 时长`。
+MI355X/gfx950 上 `GRBM_GUI_ACTIVE` 是**跨 8 个 XCD 求和**的,必须先除 8:
+`40,318,962 / 8 = 5,039,870 cyc / 2.764 ms ⇒ ~1823 MHz`(profiling 下,未 profiling 约 2.0 GHz)。
+
+★ 顺带校验管线深度:`SQ_VALU_MFMA_BUSY_CYCLES / SQ_INSTS_MFMA` 应等于该 MFMA 的标称拍数
+(`v_mfma_f32_16x16x32_bf16` 实测 **16.00 cyc/inst**,整数落点即说明时钟与计数口径自洽)。
+两个数都对上之后,`duty = MFMA_BUSY / trip_cycles` 才是可信的。
+
+★ gfx950 发射速率补正:`v_exp_f32`(以及同族 trans)是**半速 8 cyc**,不是四分之一速。
+用 `SQ_ACTIVE_INST_VALU` 按类建模来验:各类条数 x 速率之和应与实测在 1% 内(见 pitfalls/13 §r19.1)。
+
+---
+
+## 补丁(r20):PMC 拆不开的等待,用「加法探针」定价
+
+★ **先确认计数器在这台 build 上真的有值**。gfx950 / rocprofv3 1.1.0 实测:
+`SQ_LEVEL_WAVES` 与 `SQ_ACCUM_PREV_HIRES` **恒读 0**(不是 0 占用,是不可用)⇒
+拿不到「平均在飞 wave 数」;等待类只剩 `SQ_WAIT_ANY` / `SQ_WAIT_INST_ANY` /
+`SQ_WAIT_INST_LDS`,**无法把 vmcnt 等待与 barrier 等待分开**。
+
+★ **加法探针(additive probe)**:把怀疑的那段**复制一遍**、再把结果无损折回去,
+测「多做一次」的边际成本,作为「少做一次」的**上界**(仍受「上界≠可达」铁律约束)。
+关键工程细节,少一条就测不准:
+1. **做成编译期参数并写进 kernel 名**,让 baseline 与探针能在**同一进程里 ABBA** 对打。
+   跨进程展幅可达 12.9%,1~4% 的边际成本在那种噪声下不可见。
+2. **折回要数值精确**:跨 wave 求和后 `×(1/N)`,N 取 2 的幂 ⇒ 二进制浮点精确,
+   `relL2` 一位不变,correctness gate 照常过。
+3. **探针写到独立 scratch**,避免与原数据构成 WAR ⇒ 只需一个额外 barrier,
+   否则要两个,成本被高估。
+4. **探针放在原操作之后**(vmcnt/lgkmcnt 已满足)⇒ 测到的是纯粹那一类操作的成本,
+   不掺前置等待。
+实例(sparse-MLA decode producer):多一次跨 wave rendezvous = +1.0~4.0%;
+多一套 8 条 `ds_write_b128`/tile/wave = +3.5~4.9%。见 pitfalls/12 轮 2 补丁。
+
+⚠ **「上界」这个词在这里比想象的弱:加法探针与减法臂可以符号相反**。同一个
+sparse-MLA decode producer 上,「多一次 rsum rendezvous」= **+1.0~4.0%**,而真的
+把 rsum 的每 tile 折叠**删掉**(合法地推迟到最后一个 tile)= **+1.2/+2.0/+5.9%**,
+也就是**删了反而更慢**。原因是那 4 条 `ds_read_b32` 是 barrier 之后第一批 LDS 流量,
+正好盖住喂 PV 的 `plds` 读的延迟 —— 它们不是净开销,是**延迟填充**。
+⇒ 加法探针量的是「这段在关键路径上的边际价」,只有在核**没有空闲发射位可吸收
+额外访存**时才等于「删掉能省的钱」。**决定要不要花几小时写减法重构之前,
+先看这个核是访存/调度限还是发射限;凡是「已知有空转槽」的核,加法探针的数
+不能当立项依据,必须做减法臂。**(实例见 pitfalls/12 「KB 纠错:rsum」)
+
+★ **bank conflict 的比值单独看没有行动价值**。必须和**手算的宽访问地板**对比:
+按 `b128`(8 cyc/指令)/ `tr8_b64`(4 cyc)/ 窄操作逐类累加出 cycle/wave,
+再和 `SQ_LDS_IDX_ACTIVE / wave` 比。实测 908(算)vs 900(测)⇒ 已在地板上,
+此时**改 stride 动不了**(16B 对齐 ⇒ dword stride 是 4 的倍数 ⇒ `gcd(stride,32) ≥ 4`),
+只有 lane→row/col 相位旋转(XOR swizzle)+ 写端配套才有戏。
+
+★ **固定工作量对照**:给「网格形状 / CTA 数」归因时,**不能扫 batch/seq** —— 那同时改了
+总工作量。正确做法是固定 seq、扫每 CTA 的 tile 数(`inner_iter` 之类),让
+`tile 总数` 不变。实测一例:0.75 → 3.0 CTA/CU(跨过 2 CTA/CU 硬上限)只差 0.4%,
+而扫 seq 得到的拟合线曾把同一现象定价为 +11.6%。
+
+★ **本容器的 `rocprofv3` 边界**:`--pmc` 配 `SQ_*`/`GRBM_*` 稳定可用(~13s/次);
+`--kernel-trace` 与 **`TCC_*`/`TCP_*` 计数器组**会把 KFD 卡住
+(`rocminfo did not return within 60s`,重试撞 300s timeout)⇒ L2 命中率只能算不能量。

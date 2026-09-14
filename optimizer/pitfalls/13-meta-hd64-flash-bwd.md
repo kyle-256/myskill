@@ -629,8 +629,13 @@ r6 实测寄存器构成(D=64 ⇒ D_CHUNKS=2):v_o 32 + 跨 cluster 携带的 v_p
 |---|---|---|---|
 | r7 | **代换探针**:64 条 exp2 换成同条数 `v_mul_f32` | wall 只 +1.9% ⇒ 推 "≈全速率(~5 拍)" | ❌ 被 r10 推翻 |
 | r10 | **PMC 直接分解**:`SQ_ACTIVE_INST_VALU` 1091.7 拍 / `SQ_INSTS_VALU` 206.7 条(扣掉 32 条 MFMA 按 4 拍) | 64 条 exp 每条 **8.14 拍**,142.7 条普通 VALU 每条 4 拍 | ✅ 采信 |
+| **gpt-oss D=64 bwd r12**(**另一具 kernel、另一种拟合**) | 同样 PMC 分解但在 **bwd dkdv** 上做:`SQ_ACTIVE_INST_VALU` 12698 拍 / 2705 条 VALU-类。按"普通 VALU 4 拍 + 512 条 exp 各多 4 拍"预测 18140 拍,实测 18435(含 b128 LDS 的额外拍) | 每条 exp **8 拍** | ✅ **第三个独立标定点,fwd/bwd 一致** |
 
-⇒ **gfx950 `v_exp_f32` ≈ 8 拍 = half-rate。** r7 那 +1.9% 读低的原因是**差额被重叠吃掉了**,
+⇒ **gfx950 `v_exp_f32` ≈ 8 拍 = half-rate,已在 fwd 与 bwd 两具 kernel 上各自独立测到。**
+★ 8 拍这个数有一个直接可用的推论(gpt-oss bwd r12 首次用它排臂):一个 MFMA 的阴影是
+**16−4 = 12 拍**,所以 **一条 exp(8)+ 一条 `v_cvt_pk_bf16_f32`(4)= 12 = 正好填满一个阴影**。
+`iglp_opt(3)`(MFMAExpSimpleInterleave)只认 exp 链,所以它把 exp 塞进阴影后**每个阴影都还剩 4 拍**;
+把 pack 与 exp 做 1:1:1 配对是这条硬件常数直接给出的排程处方,不需要再猜。 r7 那 +1.9% 读低的原因是**差额被重叠吃掉了**,
 不是指令本身便宜 —— 这正是 methodology/03「代换/减法探针给的是上界不是可达值」的又一个实例:
 **代换探针能测"删掉省多少 wall",测不出"这条指令本身占几拍";要拿单价必须用 PMC 分解。**
 
@@ -1004,7 +1009,7 @@ body 5.619 ms / 540672 trip / 256 CU ⇒ **5589 cycle/trip**,其中 MFMA 只有 
 | 家族 | 条/trip | cycle | 备注 |
 |---|---|---|---|
 | `v_mfma_f32_16x16x32_bf16` | 160 | 2560 | 矩阵管线,16 cycle/条 |
-| `v_exp_f32` | 64 | **1024** | quarter-rate,1 条/元素,**条数已是下限** |
+| `v_exp_f32` | 64 | **1024** | ⚠ 这 1024 是按 quarter-rate(16 拍)算的,**实测是 half-rate 8 拍 ⇒ 512**(见 §623);1 条/元素,**条数已是下限** |
 | `v_cvt_pk_bf16_f32` | 72 | 288 | P 32 + dS 32 + dQ partial 8,**已是下限** |
 | `ds_read_b64_tr_b16` + `b128` | 88 | 352 | |
 | `v_pk_mul_f32`/`v_mul_f32` | 37 | 150 | dS = P·dP,1 次乘/元素,**下限** |
@@ -1785,3 +1790,856 @@ AGPR 在 gfx950 的统一 512 池里不改变 waves/SIMD。⇒ **输出态是几
   先量一次 ruler 的单次耗时再规划轮内预算。
 * `SPX`/`SVX` 这类只改调度处方的 DEV 旋钮在 M=1 上 **md5 逐字节等同**却读出 1.0084 / 1.0041 —
   这是免费的**同二进制噪声地板**样本，应当并进对照池（本轮对照因此做到 n=9）。
+
+---
+
+## r14(bwd D=64,a16 dQ 路,occ=1 4-wave):MFMA 发射阴影的「空转 EMPTY」是这颗核唯一还在动的静态量
+
+上一节那张表把「指令数 / `s_nop` cyc / MFMA 连跑长度」判成与 wall 反向。r14 在**另一族臂**上
+(GEMM1/GEMM3 的读落点)独立复现,并把正面的仪器换成一个可闭合的恒等式。
+
+### 1. 恒等式:`EXCESS = demand_nonmfma + EMPTY − 12 × N_MFMA`
+
+`v_mfma_f32_16x16x32_bf16` 占矩阵管线 16 拍、只占发射 4 拍 ⇒ **每条 MFMA 白送 12 拍发射阴影**。
+本体 1280 条 MFMA/q-block ⇒ 阴影供给 **15360 拍**。把非-MFMA 指令按发射拍数计价
+(exp 8、`ds_read_b128` 8、`ds_write` 8、`ds_read_b64_tr_b16` 5、`v_cvt_pk`/`v_pk_mul`/VALU 4、
+atomic/VMEM 6、标量/`s_nop`/`s_waitcnt` 1),逐个 MFMA 间隙求 `max(0, 需求 − 12)` = **EXCESS**
+(真正推迟 MFMA 发射的拍数),求 `max(0, 12 − 需求)` = **EMPTY**(浪费的阴影)。两者恒等相连。
+
+**十一个变体实测:`demand_nonmfma` 恒在 13446–13558(±0.4%)** —— 指令组合已在算术下界,
+`v_exp`(512×8=4096)、`v_cvt_pk`(576×4)、`v_pk_mul`(256×4)都动不了。
+⇒ **EMPTY 是唯一自由变量,想赢只能让 EMPTY 变小。** 别再为「省几条指令」开轮次。
+
+### 2. 三条上机臂:EMPTY 3/3 定符号,指令数 1/3 定反
+
+同 session、Thue-Morse、`R7_REPS=80`、b4、5 腿(含逐字节相同的对照腿 base2:+0.057%、
+faster_in 3/6、区间与 base 重叠 ⇒ 尺子有效)。
+
+| 臂 | 热循环指令 | 发射 trip | **EMPTY** | vgpr/agpr | wall |
+|---|---|---|---|---|---|
+| 冠军 | 4024 | 18758 | **7424** | 479/223 | — |
+| GEMM1 A-fragment 按链下沉 `g1_rd=1` | 4025 | 18759 | 7616 | 483/227 | **−1.565%**(0/6,区间不相交) |
+| GEMM1 C-init 按链下沉 `g1_rd=2` | **3997** | **18731** | 7669 | 483/227 | **−2.401%**(0/6,区间不相交) |
+| GEMM3 读 1:1 提示 `g3_rd=1` | 4036 | 18770 | 8789 | 479/223 | **−7.695%**(0/6,区间不相交) |
+
+- ★ **`g1_rd=2` 是判决性反例:热循环少 27 条指令、发射 trip 也少 27,却是三条里第二慢。**
+  ⇒「热循环指令数与 wall 单调」在这颗核上**证伪**(继 `naked_sum`/`trip`/`tail_sum`/
+  `inloop_lgkm0`/`cover_dist`/`Δ(EMPTY-only)` 之后第七个被证伪的静态排序量)。
+- ★ EMPTY 的量级也大致对得上:ΔEMPTY 192 / 245 / 1365 → wall −1.57 / −2.40 / −7.70%,
+  即 **≈0.0056 %/拍**,跨 4 倍量程外推误差 <2×。**用它做零 GPU 预筛,别用它做验收。**
+
+### 3. ★★★ `sched_group_barrier` 处方会把「没被点名的指令类」赶到 region 末尾
+
+`g3_rd=1` 就是把 GEMM2 那对 `sched_mfma(n)/sched_dsrd(1)` 原样搬到 GEMM3 的 kstep 环上
+(marker 不产生指令,Δ指令名义为 0、vgpr/agpr 逐位不变)。**它命中了自己的目标**:
+`{LDS_TR:12}` 那族裸读批的 excess 934→**566**(≈ 预测的 416 全额兑现)。
+但同 region 里的 exp 链**没有被任何组点名**,LLVM 把未匹配指令一律排到所有组之后 ⇒
+EXP excess 566→**2142**,净亏 1365 拍,wall **−7.695%**。
+
+⇒ **判据:给一个 region 写 `sched_group_barrier` 处方前,先普查这个 region 还载着哪些指令类;
+凡是靠共发射盖住的类(exp/trans、pack)必须一起点名(trans 掩码 `0x400`、VALU `0x2`),
+否则处方会把它们踢出 MFMA 阴影。** 这也解释了 GEMM2 的 `_rd_hints` 为什么能活:
+它所在的 region 由 `s_setprio` 切开,里面本来就没有 exp 链。
+
+### 4. 零 GPU 预筛表(全部被 EMPTY 挡下,一次 bench 都没花)
+
+| 变体 | demand | EMPTY | 判 |
+|---|---|---|---|
+| 冠军 `iglp=3` | 13505 | **7424** | 最小点 |
+| `iglp=0` | 13501 | 7987 | 挡 |
+| `iglp=2` | 13491 | 8635 | 挡 |
+| `iglp=1` | — | — | **编译器崩**:`AMDGPUIGroupLP.cpp:2087` `MFMASmallGemmSingleWaveOpt` 断言 `DSWCounters should be zero in pre-RA scheduling`(与 r13 记的策略 1 同一条,复现) |
+| `g1_ks_outer=1` | 13446 | 9195 | 挡(D=64 走 nt-outer 是对的,差 1771 拍) |
+| `g3d=4` / `g3d=2` | 13454 / 13496 | 7688 / 7516 | 挡 |
+| `g3_dbat=2` / `g3d=6` | 13505 | 7424 | **ISA 逐字节等于冠军**(G3_DBAT 本来就是 2;G3D 6 与 8 在 `G3_KSTEPS=8` 下同调度) |
+
+### 5. EMPTY 7424 的去向 —— 下一手该打哪里
+
+| 来源 | 拍数 |
+|---|---|
+| MFMA 背靠背游程(游程内间隙需求为 0) | **3756** = 长度-4 游程 43 处×36 + 长度-2 游程 84 处×12 + 长度-15 游程 6 处×168 |
+| 部分间隙(需求 1–11 拍) | 3668,摊在约 800 个间隙上 ≈ 4.6 拍/个,属碎屑 |
+
+按「间隙签名」聚合 excess(冠军):
+
+| excess | 处数 | 签名 | 归属 |
+|---|---|---|---|
+| 688 | 16 | `LDS_TR:3 LDS_WR:1 PACK:4 SCALE:4` | G2_WEAVE 块(43 拍压在 1 条 MFMA 后面) |
+| 558+450 | 6+5 | `EXP:5 PACK:12 SCALE:4` / `EXP:2 PACK:17 SCALE:4` | softmax→GEMM2 过渡的 P-pack 爆发 |
+| 472 | 8 | `LDS_RD:8 LDS_TR:1` | GEMM1 A-fragment 批(r14 臂 a 打过,−1.57%) |
+| 416 | 8 | `LDS_TR:12` | GEMM3 环前言(r14 臂 b 打过,−7.70%) |
+| 360+320+252 | 6+16+9 | `PACK:4 SCALE:4` ± `LDS_WR`/`ATOM` | G2_WEAVE 其余块 |
+
+⚠ **两条「把读喂进游程」的臂都亏,而且都在别处把 EMPTY 顶回来了。** 机制假说(未单独验证):
+479 vgpr / 223 agpr / spill 0 是紧贴分配上限的点,`g1_rd` 两臂各要 **+4 vgpr +4 agpr**,
+调度器为压活跃区间改用更聚簇的 MFMA 排布 —— **读落点类杠杆的前置条件是先腾寄存器**,
+不是先找间隙。下一手按此排序:先做寄存器减法(不掉 EMPTY 的前提下),再回来喂游程。
+
+### 6. 寄存器供体:`agpr=N` 旋钮在 D=64 上是反向的,别拿它做「腾 arch VGPR」
+
+`build_flash_attn_bwd_dkdv_module(agpr=N)` 的语义是**用 inline asm 把恰好 N 个 MFMA 累加器钉进
+AGPR**,不是「允许多用 AGPR」。冠军 `agpr=0` 让分配器自由使用,实测就已经落在
+**vgpr 479 / agpr 223 / spill 0**。强行给 N:`agpr=8` 直接 `error: inline assembly requires more
+registers than available` 编不过;`agpr=16` → vgpr 272 / agpr 16 / **spill 4516**;
+`agpr=32` → vgpr 288 / agpr 32 / **spill 4115**。⇒ 这个旋钮**封顶**而不是**扩容**,
+「腾 arch VGPR 换调度自由度」这条路要另找载体(tied-operand `"=a,v,v,0,v,v"` 见 methodology/06)。
+
+---
+
+## r15 三条「寄存器类 / 排布」腿全部为负:issue-bound 内核的静态代理与覆盖模型都失效
+
+第二场 campaign optimize round 1。尺子 `_bench_attn_bwd2.py`,同 session ABBA 配对,
+**逐字节未改动的 drift 腿读数 1.0052**(不是 1.0)——判定任何一臂都必须先减掉这个零点偏移,
+而 harness 的 KEEP 阈值 0.8% 已经和尺子自身的偏移同量级了。三个 guard cell
+(b4win / b1win / l70b)在这三臂里都是**逐字节相同的代码路径**(旋钮只在 `D==64 && _fuse_wide && a16`
+生效),所以它们是天然的 in-run zero control,可用来扣掉批次偏置。
+
+| 臂 | 杠杆 | 静态证据 | score | 扣偏置后 |
+|---|---|---|---|---|
+| A | 逐字节未改动 | — | **1.0052** | 零点 |
+| P1 | `--greedy-regclass-priority-trumps-globalness=True` | 热循环 **−24 指令 / −18 s_nop / −11 vgpr / −11 agpr**,accvgpr 8→0,工作量计数逐条相同 | 0.9959 | **−0.93%** |
+| P2 | V pack 组 tied 空 asm `"=a,0"`(32 dword) | agpr **223 → 219**(反向!),GEMM3 的 B 操作数被从 `a` 挤回 `v`,热循环 B=a 的 MFMA 112→256,kernel shuttle 159/156→176/163 | 0.9991 | **−0.49%** |
+| D | `g2_ppk`:把 P pack 推进 GEMM2 的 weave,每 kv tile 4 条、夹在两条 MFMA 之间 | PACK burst **13/11/8 全部消失 → 最大 4**;MFMA run 15 → 最大 8;EXP/MFMA/PACK/SCALE/LDS_RD **计数完全相同**;vgpr/agpr/spill 与 base 一致,shuttle 8→7;`s_nop` **72 → 88** | 0.9948 | **−0.67%** |
+
+### 1. 第八个被推翻的静态代理:「更少指令 + 更少 s_nop + 更少寄存器」也不预测 wall
+
+P1 在 ISA 上是**全面**更好的:指令更少、s_nop 更少、两半寄存器都更省、热循环里
+`v_accvgpr_*` 从 8 条清到 0 条、而且工作量逐类计数与 base 逐条相同(纯分配器差异)。
+实测 **−0.93%,3/3 target cell 同向下降**。⇒ 分配器侧的「省」在这个 kernel 上不是收益来源;
+本卡的静态代理黑名单再加一条。
+
+### 2. methodology/06 clause 2 的 +0.79%/+0.53% 在本配置下不复现,且其前提被证伪
+
+clause 2 说「把 kv-block 不变的 MFMA 操作数 tied-pin 进 AGPR」值 +0.79%/+0.53%。
+本轮在 V pack 组上原样复现(严格 tied `"=a,0"`,无 `&`),得 **−0.49%**。
+ISA 给出了原因:**「AGPR 半区还有 33 个空位可以花」这个前提是错的**——钉进 32 dword 之后
+agpr 不是 223→255 而是 **223→219**,分配器把 GEMM3 的 B 操作数从 `a` 挤了出去,
+净效果是**换**而不是**填**。⇒ clause 2 应加限定:该定价只在「被钉的值不与其他 AGPR 常驻值竞争」
+时成立;钉之前必须先确认 agpr 计数真的**涨**了,涨不上去就是在做零和替换。
+
+### 3. 「给裸露 VALU 盖上 MFMA」这条主线在本 kernel 已经用尽
+
+四个已入账的胜利(含 G2_FILL / G2_WEAVE)共同的机制都是「把无掩护的 VALU 塞进 MFMA run」。
+arm D 把这套原样搬给**最大的 excess 类 PACK(1571 cycle)**:P 的 f32 输入本来就因为
+dS 乘法而活到 weave 里,所以延后 pack **不增加任何 live range**(vgpr/agpr 与 base 逐位相同,
+这一点被 ISA 证实)。burst 结构也确实按设计改造成功了(13/11/8 → 全 4)。
+**但实测 −0.67%**,而 `s_nop` 涨了 16 条。
+
+⇒ 机制解释:`flat_wg=256` 即**每 SIMD 只有 1 个 wave**,wave 自己的 VALU 和 MFMA 走同一条
+发射流、串行发射,**不存在「MFMA 执行期间免费发射自己的 VALU」这种影子**;
+r14 的恒等式 `EXCESS = demand_nonmfma + EMPTY − 12×N_MFMA` 本来就是这个意思。
+在 issue-bound 下**纯重排是发射中性的**,而打断 MFMA 连发只会新增寄存器相关性的 s_nop 填充
+(MFMA run 15→8,s_nop 72→88)。所以:**剩下的 PACK excess 不可能靠 placement 回收**——
+下一步必须冲 issue **数量**(减少 576 条 PACK / 704 条 LDS_RD 本身),而不是它们的**位置**。
+这也反向解释了 G2_WEAVE 当初的收益不是「issue 覆盖」而是 LDS 写延迟的掩盖。
+
+### 4. 尺子会为每一臂单独编译一份 artifact(实测确认)
+
+曾怀疑「只改 `_hints` 的臂」会因为 FlyDSL 的 cache key 不含 context compile hints 而
+两臂共用一个二进制、从而让 P1 的读数无意义。用 `_r2_key.py`(直接调尺子自己的 `_arms()`,
+跑完 ref 再跑 cand,diff cache 里的 `.pkl` 清单)证实:candidate 在同一个 manager 目录下
+写出了**自己的** dkdv artifact(`a378ac26…pkl` 与 ref 的 `d3fc56d7…pkl` 并存)。⇒ 臂间确实不共享二进制。
+
+### 5. 尺子自带的 SNR gate 看不见宽 band(methodology/06 clause 3 的具体化)
+
+`_bench_attn_bwd2._snr_gate` 跑 B=1 S=1024,`_fuse_blockkv_for` 在这个 Skv 上返回 **128**,
+`_fuse_wide = D*block_kv >= 16384` 为 False ⇒ **宽 band 的 a16 D=64 路径根本没被构建**。
+任何只在该路径生效的旋钮(本轮三臂全是)都过不了「真正被验到」这一关。
+本轮补了 `_r2_snr.py`(打印实际 `block_kv` / `a16` / `wide` 再算三梯度 SNR):
+S=2048 → 48.8/48.9/49.0 dB,S=4096 → 48.2/48.9/49.2 dB(gate 45)。
+⇒ 宽 band 旋钮上线前必须跑这个探针,不能只信 bench 的内置 gate。
+
+## r16(bwd D=64,a16 dQ 路,occ=1 4-wave):IGLP 整轴定价完毕 + 「释放 72 个寄存器」买不到任何东西
+
+本轮两臂上尺子、三臂被 40s ISA 门挡在尺子外,树内零改动(md5 与 base 逐位相同)。
+
+### 0. 先把 wall 的账做平(本轮新数据)
+
+- `rocprofv3 --kernel-trace`:`flash_attn_bwd_dkdv_kernel_0` 占含 fwd 全部 GPU 时间的 **91.08%**;
+  扣掉 fwd 后 **dkdv ≈ 被计分 backward 的 96.6%**(odo 1.7% / slotred 0.6% / lset 0.15% / torch fill 0.9%)。
+  ⇒ **不存在「辅助 kernel 池」**,任何收益只能出自 dkdv 本体。
+- LDS 组(r15 没采到、goal 明确要的那一组):`SQ_LDS_BANK_CONFLICT/SQ_LDS_IDX_ACTIVE = 0.23%`,
+  LDS 约 **28% busy**,`SQ_WAIT_INST_LDS/SQ_WAVE_CYCLES = 8.37%`。
+  ⇒ **bank/swizzle 与 LDS 带宽两条杠杆被数据关闭**;那 8.4% 是纯**延迟**暴露。
+- 每 trip ≈ **36,850** 真实 cycle;MFMA 管道地板 1280×16 = **20,480 cycle = 55.6%**(与 PMC duty 54.34% 吻合)。
+  非 MFMA 指令 2,744 条 × 4 cycle = **10,976 cycle 的发射占用**,要塞进 1280×12 = **15,360 cycle 的影子**
+  ⇒ 需要 **71% 的影子利用率**,而 `COEXEC/MFMA_BUSY` 实测只有 **16.88%**。这就是 46% 非 MFMA 时间的来源。
+- 热循环 = **17 个 barrier 段**:8 个大段(441–452 条:MFMA 150 / EXP 64 / PACK 72 / SCALE 32 / TR 32 / RD 24 / WAIT 28 / ATOM 8 / GLD 4)
+  与 7 个小段(58 条:TR 32 / MFMA 10 / WR 4 / WAIT 9)交替,尾段 99 条。
+
+### 1. gfx950 只有一条 in-order `vmcnt`,但本 body 没有饱和(排除一条看似很像的杠杆)
+
+`_r3_vm.py` 按发射序重放整个热循环:dQ 的 `buffer_atomic_pk_add_bf16` 是 fire-and-forget,
+谁都不读,于是 LLVM 从不为它们插 wait,队列**单调堆积**。看着很像 vmcnt 6-bit(上限 63)饱和,
+实测 **peak inflight = 30**,稳态在 8→20 之间循环。Q/dO publish 的 `vmcnt(11/10/9/8)` 阶梯
+确实会顺带排掉**上一个** head-step 的 8 条 atomic,但它们此时已经老了整整一个 head-step(≈4,600 cycle)。
+⇒ **VMEM 队列 / atomic 耦合不是杠杆**,别再查。
+
+### 2. IGLP 策略轴整轴定价完毕:部署值 3 就是最优(四个值全部有据)
+
+源码注释只比过 2 与 3(「wide band 取 SIMPLE exp-interleave,full strategy 在这个 MFMA:exp 配比下
+白花 hazard nop 和架构寄存器」),0 与 1 从未定价。本轮补齐:
+
+| iglp | LLVM strategy | 结果 |
+| --- | --- | --- |
+| 0 | MFMASmallGemmOpt | 构建通过(vgpr 481 / agpr 225 / spill 0),**score 0.9832(−1.68%)** |
+| 1 | MFMASmallGemmSingleWaveOpt | **编译器 assert 崩溃**,不可用 |
+| 2 | MFMAExpInterleave | 源码已判负(劣于 3) |
+| 3 | MFMAExpSimpleInterleave | **部署值,最优** |
+
+`iglp=1` 的崩溃是上游 LLVM 断言,不是本仓 bug:
+`AMDGPUIGroupLP.cpp:2087 MFMASmallGemmSingleWaveOpt::applyIGLPStrategy` 的
+`DSWCounters should be zero in pre-RA scheduling!`。名字里的 "SingleWave" 很诱人(本 body 正是 1 wave/SIMD),
+**但它在 pre-RA 阶段就 assert,别再试**。
+`iglp=0` 的 ISA 确实动了(大段 441→434、小段 58→70、hazard nop 8→4、总指令 4024→4052):
+它把每 head-step 约 12 条指令从大段挪进**小段**,而小段正是延迟暴露区 ⇒ 越挪越慢,与 §3 的结论同源。
+
+### 3. ★ `g3_kreg=False` 释放 72 个寄存器,实测 −2.05%:寄存器不是这颗核的总阀门
+
+源码把 `g3_kreg`(整 band 常驻 K^T fragment)的收益写成「**pure read removal**」,
+而同文件另一处探针把 GEMM3 读数 1536→1024 定价为 **6/11 = 噪声**并写下「Do not spend a round on read count」。
+两条加起来推出一个很强的假设:它在用寄存器买一个已被证明无价值的东西。ISA 完全证实了代价面——
+**vgpr 479→407、agpr 223→151(各 −72),spill 仍为 0**,LDS 不变。
+
+**实测 score 0.9795(−2.05%)**(b4 ×0.9770 / b2 ×0.9754 / b1 ×0.9860,guard 全 1.0)。
+
+两条要记的更正:
+
+1. **「skill(methodology/06)说寄存器是总阀门,实测释放 72 个寄存器收益为零(实为 −2.05%)。」**
+   occ 不变(407 > 256,仍 1 wave/SIMD),分配器的余量在 issue-bound 下换不到任何东西。
+   r15 已经给过 clause 2 一个 caveat,本轮把它推到极端:**寄存器释放本身不是收益,别再为「省寄存器」立臂**。
+2. **「源码说 GEMM3 读数免费(6/11),实测反向加 256 条读 = −2.05%。」**
+   免费的是**被 MFMA run 覆盖的**读(那次探针靠 CSE 去掉的正是覆盖区内的读);
+   `g3_kreg=False` 新增的 32 条/head-step 落在 **barrier 之后的暴露小段**里。
+   ⇒ 判据不是读的**条数**,而是读**落在覆盖区还是暴露区**。读数轴与读位置轴必须分开记账。
+
+### 4. GEMM3 prefetch ring 深度:越深越好,而且已经顶到上限(40s ISA 门,省下一次尺子)
+
+调度器本来就把 GEMM3 的 32 条 MFMA 中的一部分吊出暴露小段。ring 深度直接控制吊出多少:
+
+| g3d | 吊进大段的 MFMA | 小段大小 | 小段 WAIT |
+| --- | --- | --- | --- |
+| 8(部署) | **22 / 32** | **58** | **9** |
+| 4 | 18 / 32 | 62 | 9 |
+| 2 | 14 / 32 | 71 | 14 |
+
+三者 vgpr/agpr 完全相同(479/223)⇒ 这不是寄存器题。方向是**越深越好**,而
+`G3D = min(g3d, G3_KSTEPS)`、`G3_KSTEPS = BLOCK_KV // PV_K_STEP = 256/32 = 8`,**部署值已经就是上限**。
+⇒ 想在这条轴上继续走,只能抬高 `G3_KSTEPS`(即 BLOCK_KV > 256),那会改 `_fuse_halves` 与整个几何。
+
+### 5. 下一步该冲的具体杠杆(由本轮数据指名)
+
+暴露小段只有 58 条指令,却含 **32 条 `ds_read_b64_tr_b16`**(GEMM3 的 dS fragment),
+而 §3 刚证明**往这个区里加读 = 直接掉 2%**,所以对称地:**从这个区里搬走读 = 应当直接赚**。
+两条候选,都不改算术、不碰精度:
+
+- **dS 写侧预 swizzle**:`ds_read_b128_tr_b16` 在 gfx950 不存在,但**普通 `ds_read_b128`(16 B/lane)存在**。
+  dS 的 LDS 布局是 softmax 的 `_ds_write_vec` 自己定的 ⇒ 把 transpose 提到**写侧**(它在 MFMA 密集的大段里,有掩护),
+  GEMM3 就能用普通宽读,把暴露区的 32 条读降到 **16 条**。这是「把工作从暴露区搬进覆盖区」,
+  和本 body 四个已入账胜利同一机制,但从未在 **dS 读**这一家上做过。
+- **EXP 家族的条数**:`v_exp_f32` 是半速(8 cycle)且走 trans 口,64 条/head-step = 512 cycle/head-step
+  = 4,096 cycle/trip ≈ wall 的 11%。条数 = MT(4)×NT(4)×4,是每 lane 的 P 元素数 ⇒ 只能靠改 tile 几何降低
+  (宽 MFMA atom 本轮被禁),但它是 EXP 轴唯一的方向,值得单独一轮。
+
+## ★ r17(bwd D=64,a16 dQ 路,occ=1 4-wave):把**裸 MFMA run 搬进暴露小段**= 这颗核近两轮第一条正收益(+0.9%)
+
+本轮三臂上尺子(两次复测),一条新旋钮 `g2_hs=1` 入账,另一条 `g2_rd_at` 判负后整块删除。
+r15/r16 连着两轮全负(寄存器类、排布类、IGLP 类),本轮换了记账口径就直接拿到分:
+**不再问"这颗核缺什么资源",只问"哪条 wait 没有 MFMA 掩护"**。
+
+### 1. 机制:大段尾部的裸 MFMA run 是**免费的掩护料**,而它紧邻的小段正是暴露区
+
+每 head-step 的大段(441 条 / 150 MFMA)是这样收尾的:GEMM2 最后一个 d-tile 的 8 条 MFMA
+成一串裸 run(`WAIT MFMAx4 WAIT MFMAx4`)——**操作数早在一个 d-tile 前就读完了**,
+所以这 8 条只占 8×4 = 32 cycle 的发射,却占 8×16 = 128 cycle 的矩阵管道 ⇒ 约 **96 cycle 的发射空转**。
+紧接着 dS fence 之后的小段(58 条 / 只有 10 条 MFMA)开头是 **12 条 `ds_read_b64_tr_b16` 突发**,
+它的第一条 `s_waitcnt lgkmcnt(10)` 把 LDS 延迟裸露在外,段内没有任何 MFMA 可以掩护它。
+
+`g2_hs=k`:把 GEMM2 **最后一个 q-half 的最后 k 个 d-tile** 的 MFMA 组以 thunk 形式交给 `_gemm3`,
+在它的 read ring 发射完之后立刻 emit。这些 MFMA **既不读 dS 也不读 GEMM3 的任何操作数**,
+于是读突发退休在它们的管道影子里。ISA 证实(`FLYDSL_DUMP_IR` + 按发射序重放 in-order lgkm 队列):
+
+| | base(r4 部署面) | `g2_hs=1` | `g2_hs=2` |
+| --- | --- | --- | --- |
+| 小段 run-length | `TRx12 WAIT …` | **`TRx12 MFMAx8 WAIT MFMA TRx3 …`** | `TRx12 MFMAx16 WAIT …` |
+| TR 读的 MFMA 覆盖均值 | 7.30 | **9.28** | 9.92 |
+| 热循环指令 | 4010 | 3980 | 3969 |
+| vgpr / agpr / arch / spill | 495/239/256/0 | **逐字节相同** | 逐字节相同 |
+| score(raw) | 1.0059 | **1.0137 / 1.0151**(2 session) | 1.0054 |
+| score(guard 零对照校正后) | 1.0078 | **1.0171 / 1.0134** | 1.0119 |
+
+⇒ `g2_hs=1` 对 r4 部署面 **+0.9% raw / +0.74% 校正**(b2 +1.0~1.4% / b1 +2.6~3.0% / b4 ≈ 中性)。
+宽 band 真路径 SNR(`_r2_snr.py 2048`,bench 自带的门跑不到这条路)dq 48.8 / dk 48.9 / dv 49.0 dB,
+与 base 逐位同序(每个累加器的 pks 升序不变)⇒ 纯排布,不动数值。
+⚠实现两个坑:①只能交**最后一个 q-half**的尾巴,否则会打乱累加器顺序;
+②MASK_SKIP 的 `_if_wave` 路径**不能**接 thunk(延迟的 MFMA 会逃到 wave-uniform 分支外),
+用一条 `assert not _g2_hs_q` 守住"交出去的 tile 必须被 emit"。
+
+### 2. 掩护量有**饱和点**:搬 8 条赚,搬 16 条不赚
+
+`g2_hs=2` 校正后 1.0119,低于 `g2_hs=1` 的 1.0134~1.0171。机制:`s_barrier` **不等 MFMA 完成**,
+搬 8 条时大段尾部管道里还有在飞的 MFMA 跨过 barrier 继续算;搬 16 条把大段尾部的管道也抽空了,
+而小段那边买到的掩护已经饱和(覆盖均值 9.28→9.92,只多 0.6 条)。
+⇒ **"把工作搬进暴露区"这条机制的正确剂量 = 刚好盖住第一条 wait,多搬只是把暴露从小段搬回大段。**
+
+### 3. ★ 读的**突发化**再次判负,而且很贵:−1.4%
+
+`g2_rd_at=1`:GEMM2 环的 `4*_nk` 条 TR 读改成"1 条 MFMA 引导 + 成组发射 + 其余 MFMA",
+替掉部署的 1:1 `sched_mfma(1)/sched_dsrd(1)`。ISA 门全过(495/239/256/spill 0,TR 覆盖 7.30→7.93),
+叠在 `g2_hs=1` 之上实测 score 0.9996 / 校正 **1.0031 = 比 hs1 低 1.4%**。
+
+这复核了源码里那条旧结论(「整组读提到 MFMA run 之前会输,因为读突发挡住 MFMA 发射」)并把它推广:
+**即便先放引导 MFMA、即便覆盖均值升高,突发化仍然输**。
+- 「**skill(pitfalls/09)说 1:1 sched hint 把读钉在退休它的 wait 旁边是失效模式 ⇒ 应当把读拆开;
+  实测拆成突发 = −1.4%。**」失效模式的诊断是对的,**处方是反的**:
+  不要动读的位置(读一动就挡发射),要给那条 wait **加 MFMA 掩护**(= §1)。
+- **`cover_dist` 作为排序代理第三次失效**:at=1 覆盖均值(7.93)高于部署(7.30)却慢 1.4%。
+  覆盖距离只能用来**确认机制**(ISA 是否真的动了),永远不能用来**排序臂**。
+
+### 4. 对 methodology/06 的正面更正(r16 给了负面那一半)
+
+`g2_hs=1` 的寄存器头与 base **完全相同**(vgpr 495 / agpr 239 / arch 256 / spill 0 / LDS 86016),
+即这 0.9% 与寄存器预算**毫无关系**。配上 r16 的「释放 72 个寄存器 = −2.05%」:
+**这颗核的阀门既不是寄存器、也不是读的条数,而是"指令落在覆盖区还是暴露区"。**
+本轮供 supervisor 预留的 tied-operand `"=a,0"` 兜底(怕 prefetch 压出 spill)**一次都没用上**——
+搬 MFMA 不新增任何 live range,所以它天然 register-neutral。
+
+### 5. 下一步(由本轮 ISA 直接指名)
+
+TR 家族的覆盖直方图仍有很长的低尾:512 条 TR 读里约 **240 条覆盖 ≤7 条 MFMA**
+(hist 0:26 / 1:25 / 2:39 / 3:25 / 4:27 / 5:31 / 6:65 / 7:61),RD 家族 192 条里有 **20 条覆盖为 0**。
+下一轮的正确做法是**先把这条低尾按「读家族 × barrier 段」归属**(哪一家的哪条 wait 还裸着),
+再对每个低尾家族复用 §1 的同一机制——**搬独立 MFMA 过去,不要搬读**(§3)。
+r16 §5 提的「dS 写侧预 swizzle」仍然有效且与本轮正交:它减少暴露区的**读条数**,
+而 `g2_hs` 增加暴露区的**掩护量**,两者可以叠。
+
+## ★★★ r18(bwd D=64,a16 dQ 路,occ=1 4-wave):量出真时钟,这颗核第一次有了 roofline —— 76%,而且瓶颈不在 MFMA 覆盖
+
+前 4 轮(r14~r17)都在 MFMA 覆盖轴上一次赚 0.8~0.9%,却从没算过"离顶多远"。本轮用
+`rocm-smi -c` 在 b4 跑时采样 5 次,拿到**持续 sclk = 1402 MHz**(DPM level 1,不是 2.4 GHz 标称)。
+
+| 口径 | 数 |
+|---|---|
+| `v_mfma_f32_16x16x32_bf16` | 16384 FLOP / 16 cyc = 1024 FLOP/cyc/SIMD |
+| MFMA 管线 roofline @1402 MHz | 256 CU x 4 SIMD x 1024 x 1.402e9 = **1470 TF** |
+| 实测 b4 / b2 / b1 | 5.050 / 2.4674 / 1.2235 ms = 1122 / 1149 / 1158 TF(含 3.1% padding 的真 MFMA 量) |
+| 离 roofline | **76% / 78% / 79%** |
+| 每 q-block trip | 26819 cyc,管线 roofline 20480 cyc ⇒ **多花 6339 cyc(+31%)** |
+
+三个 cell 都落在 76~79% ⇒ **机器级负载均衡已经不是瓶颈**(`_a16_qsplit` 把 causal 三角摊平了),
+6339 cyc 是热循环自己的。★ **一个 cell 的 wall 只有配上真时钟才是 roofline;标称 2.4 GHz 会把
+76% 读成 45%,得出"还有 2 倍"的错误结论。**
+
+★★★ **这条不是新发现,是本臂欠的账。** `methodology/03` 第 335 行早已写明「**采 sclk/power 是
+profiling 的第 0 步(本项 KB 曾连续 10 轮漏掉,把 util 算错 20%)**」,第 484 行连"用 2.4 GHz 标称
+算出 in-loop util 52.8%"这个具体错误都点名了,第 333 行的 Power/clock-bound 行给的处方正是
+「**降每单位工作的指令数与搬运量**」。
+⇒ 「**skill(methodology/03)说先量 sclk、且 sclk 远低于 boost 就按"砍指令条数"走;实测 bwd 这条臂
+连做 5 轮(r14~r18)没量过一次时钟,一直按覆盖轴走。**」**KB 是准的,是本臂没执行第 0 步。**
+本轮 §1 的发射预算拆解与 §5 的下一步,本质上只是把 `03` 那一行处方在 bwd 上算了出来。
+
+### 1. ★★★ 把 6339 cyc 拆开:发射流(~22132 cyc)比矩阵管线(20480 cyc)还长,而 exp 占它 37%
+
+trip 内 3997 条指令的构成(ISA 普查):MFMA 1280、`v_exp_f32` 512、`v_cvt_pk_bf16` 512、
+`v_pk_mul_f32` 256、LDS+atomic 864、wait 230、nop ~70、寻址 ~273。按发射占用折算:
+
+| 类 | 条数 | 发射占用 |
+|---|---|---|
+| MFMA | 1280 | 1280 x 4 = 5120 |
+| **`v_exp_f32`(四分之一速率)** | **512** | **512 x 16 = 8192** |
+| 其余 VALU | 768 | 3072 |
+| LDS + atomic | 864 | 3456 |
+| wait/nop/SALU | 573 | 2292 |
+| 合计 | | **22132 > 20480** |
+
+⇒ **occ=1 下这颗核是 issue-bound,不是 pipe-bound**;而发射预算里最大的一项不是 MFMA(5120),
+是 **512 条四分之一速率 exp = 8192 cyc(37%)**,比全部 LDS 流量(3456)大 2.4 倍。
+
+★ 这与本文件 `r17 fwd` 那条卡**完全一致**:「MFMA 与 trans 在功耗域符号相反……排序要按 trans /
+访存 **指令数**,不按 MFMA 拍数」,fwd 上 `noexp` 删 64 条 exp = **+8.7% wall**。
+「**skill(本文件 r17 fwd)早已说清 trans 才是这颗核族的大头;实测 bwd 的 exp 占发射预算 37%,
+而 bwd 的 r14~r17 四轮全花在 MFMA 覆盖上,每轮只买到 0.8~0.9%。**」
+⇒ **KB 是对的,是 bwd 这条臂没去读 fwd 的卡。** 本轮的 sclk 也印证功耗侧:bwd 1402 MHz vs
+fwd 1621~1684 MHz,低 15%,正是 512 exp + 1280 MFMA 的功耗代价。
+
+⚠ 上表有一个**未证的假设**:`v_exp_f32` 是否真的把这个 wave 的发射槽占满 16 cyc。若只占 4 cyc,
+发射总量降到 ~16k < 20480,核就回到 pipe-bound,6339 cyc 得另找出处。ISA 里 LLVM 的
+`iglp_opt(3)`(MFMAExpSimpleInterleave)把 exp 与 MFMA **严格交替**排(body 48~74),暗示硬件
+是能重叠的 ⇒ **下一轮第一件事就是用 PMC 判这个分叉**,别再凭静态模型猜:
+`SQ_INSTS_VALU_TRANS_F32` / `SQ_VALU_MFMA_BUSY_CYCLES` / `SQ_BUSY_CYCLES` / `SQ_WAIT_ANY`
+(rocprofv3,b4 cell)。这三个数一出来,6339 cyc 就能唯一地分给 trans 占用 / wait 停顿 / 发射串行。
+
+### 2. ★★ 两个静态覆盖模型同时失效 —— 这是第 4、第 5 个失效的静态代理
+
+本轮在 `_r6_cov.py` 里加了两个模型,都**定位有用、排序无用**:
+- `pipe`(MFMA 占管线 16 cyc,其余 4 cyc 发射):热循环矩阵管线**空转仅 0.9~1.0%**,而且几乎全在
+  seg0 前导。⇒ 「哪里管线空着可以塞 MFMA」这个问题的答案是**没有**,r17 §5 指的低尾不是空转。
+- `slack`(每条 wait 处还在飞的 MFMA 拍数):slack **单调累积**到 seg16 的 4590 cyc —— 这是
+  "管线需求 20480 > 发射 15988"的必然产物,于是**每条 lgkm wait 的 slack 都是几千拍**,模型给出
+  "所有读都免费"的结论,与实测的 0.8~0.9% 收益直接矛盾。
+
+⇒ 与 r15/r16/r17 的 `cover_dist` 三连失效合起来:**这颗核上任何"数拍子"的静态模型都不能排序臂。**
+静态模型只有两个合法用途:(a) 确认机制真的落到 ISA 了;(b) **定位**结构性不对称。
+本轮 (b) 唯一的产出:**seg1 是全循环唯一低 slack 段**(min 0 / mean 216,其余大段 min 652~4084),
+因为上一个 head 的 GEMM3 MFMA 沉不过循环回边。但把它当机会是**错的**:seg1 开头那两条
+`lgkmcnt(1)/(3)` 前面已经有 17 条寻址 VALU + 4 条 `buffer_load_dwordx4` 共 68 cyc 在遮 ~120 cyc 的
+LDS 延迟,净暴露只剩 ~50 cyc/trip = **0.24%**,不值得为它冒 loop-carried 寄存器的风险。
+
+### 3. ★ `g1_pf` 整轴定价完毕:只有 `G1_PF_AT == DT-1` 赢,别的位置等价且更差
+
+`g1_pf` = 从上一个 q-half 的 GEMM2 第几个 d-tile 发下一个 half 的 GEMM1 A 片段读(r4 部署 =3,+0.8%)。
+本轮同 session 配对 + guard 校正(4 臂,零对照臂 = 原封不动的树):
+
+| 臂 | score(raw) | guard bias | 校正后 | vs 零点 |
+|---|---|---|---|---|
+| 零点(部署 `g1_pf=3`) | 1.0132 | +1.0002 | 1.0130 | — |
+| **`g1_pf=1`** | **1.0210** | +1.0048 | **1.0161** | **+0.30%**(raw +0.77%) |
+| `g1_pf=2` | 1.0143 | +1.0028 | 1.0115 | −0.15% |
+
+机制(ISA 证实):`_rd_hints()` 每个 d-tile 只分配 `_n_out * _hn = 8` 个 `sched_dsrd(1)` 槽。
+`g1_pf=2/3` 落在 `_rd_next == True` 的 d-tile 上,8 条 `ds_read_b128` 预取和 4 条环 TR 读抢同一批槽,
+环读被挤到**零 slack 的 `lgkmcnt(0)` 全排空**;`g1_pf=1` 落在 `dt = DT-1 = 3`,那里 `_rd_next == False`
+没有环读竞争,预取独占槽位。裸 wait 站点 **41 → 25**,GEMM2 的 `lgkmcnt(0)` 全排空变成
+`lgkmcnt(6)/(2)`,指令 3980 → 3997,寄存器头**逐位相同**(vgpr 495 / agpr 239 / arch 256 / spill 0 /
+LDS 86016),SNR(真宽带 a16 路)dq 48.8 / dk 48.9 / dv 49.0 dB。
+⇒ **赢的不是"覆盖更多",是"消掉零 slack 的全排空"** —— 全排空是唯一在发射之外**额外加停顿**的东西,
+这也解释了为什么 r17 的搬 MFMA 只值 0.9%、而 r17 §3 的读突发化会 −1.4%。
+
+### 4. ❌ r17 机制往里再推一层(`g2_hh`)判负:−0.35%
+
+`g2_hh=1`:把上一个 q-half 的 GEMM2 收尾 d-tile(8 条 MFMA,操作数早已读完)交给下一个 half,
+站在它的 4 条 `_ld_rd` 累加器初始化读与 GEMM1a 之间。ISA 证明机制落地了(8 处裸 `lgkmcnt(4)`
+初始化读站点消失、寄存器头逐位相同、+13 条指令、`s_nop` 每大段 7→9),实测 raw 1.0126 /
+校正 **−0.35%**。
+
+⇒ **诊断错在"覆盖只算读之后的 MFMA"。** 那 4 条初始化读**之前**紧挨着 4 条 MFMA,矩阵管线异步
+排空,这 ~64 cyc 的**管线残留(carry-over)本来就把这条 wait 遮住了**。
+★ **修正机器模型:一条读的 wait 由它前后两侧的 MFMA 共同掩护 —— 读**之前**发射的 MFMA 一样算。**
+按这条重新看 base 剩下的两个"裸"家族,两个都是假警报:`RD:v103`(初始化读,前面有 4 条 MFMA)
+与 `TR:v87`(GEMM2 dt=0 预读,被故意停在 softmax/pack 那段很长的 VALU 阴影里)。
+⇒ r17 §5 让"按家族归属低尾再逐个挂 thunk"的处方**到此收敛**:低尾里已经没有真正暴露的家族了。
+
+### 5. 下一步(按信息量排序,不再是覆盖轴)
+
+1. ★★★ **PMC 定分叉**(§1 末):`SQ_INSTS_VALU_TRANS_F32` / `SQ_VALU_MFMA_BUSY_CYCLES` /
+   `SQ_BUSY_CYCLES` / `SQ_WAIT_ANY` on b4。把 6339 cyc/trip 唯一分给 trans / wait / 发射串行。
+   在这个数出来之前,任何"再搬一次 MFMA"的臂都是在 0.9% 的老矿脉上继续刮。
+2. ★★ 若判为 trans/发射:**目标改成砍指令条数**,而且优先砍 `v_exp_f32` 之外的 VALU
+   (512 条 exp 是 `BLOCK_Q x BLOCK_KV / 64 / 4` 的算术下界,删不掉;512 条 `v_cvt_pk_bf16` +
+   256 条 `v_pk_mul` 已是 packed 形式)。真正可动的是 864 条 LDS/atomic 与 573 条 wait/nop/寻址,
+   r16 §5 的「dS 写侧预 swizzle」正好减 LDS 条数,与本轮正交。
+3. ★ 若判为 pipe-bound:那就只剩**每 trip 的 MFMA 条数**。160/head-step 是这套 tiling 的算术下界,
+   唯一的结构性冗余是 **GEMM3 对整条带做收缩(掩掉的零 tile 也算)** —— 只在对角 q-block 上有量。
+
+---
+
+## r19 — PMC 判决 §5.1 的分叉,并把 r18 的两个机器数改掉
+
+### 1. ★★★ `v_exp_f32` 在 gfx950 上是**半速(8 cyc 发射)**,不是四分之一速
+
+b4 单次 dispatch:`SQ_INSTS_VALU_TRANS_F32` = 67,252,224 → 508.7 exp/trip ≈ 512 ✓(算术下界对上)。
+把 `SQ_ACTIVE_INST_VALU` 按类建模(quad-cycle 单位):
+MFMA 1280×1 + EXP 512×**2** + PACK 576×1 + VALU 330×1 + SHUT 8×1 = **3,218**,实测 **3,246**(差 0.9%)。
+四分之一速会预测 4,246,全速会预测 2,710 —— 只有半速对得上。
+⇒ **推翻 r18 的「exp 占发射预算 37%、kernel 是 issue-bound」。** exp 实际只占 ~16%。
+
+### 2. ★★★ r18 的「76% roofline」和 1402 MHz sclk 是错的;真实 MFMA duty ≈ 52–57%
+
+`rocm-smi` 在这台机器上读不准(用 `_r3_bwd.py` 采样时 kernel 早已因 JIT 缓存跑完,采到 158 MHz 空闲值)。
+★ **改用 `GRBM_GUI_ACTIVE ÷ 8 XCD ÷ dispatch 时长** 反推时钟**:40,318,962 / 8 = 5,039,870 cyc / 2.764 ms
+⇒ **~1823 MHz(profiling 下)**,未 profiling 约 2.0 GHz。MFMA 管线深度实测 16.00 cyc/inst 确认,
+`MFMA_BUSY`/trip = 20,626 cyc,trip ≈ 36,350 cyc ⇒ **duty ≈ 52–57%,还有 ~1.75× 余量。**
+三分账(b4):ACTIVE_INST_ANY 51.93% / WAIT_INST_ANY 30.80% / WAIT_ANY 17.18%;
+`WAIT_INST_LDS` = WAVE_CYCLES 的 8.06% = WAIT_ANY 的 46.9%。
+每 trip 总发射 18,876 cyc < MFMA 管线 20,480;非 MFMA 发射 13,756 < 15,360 影子
+⇒ **完美调度装得下,那 ~15,870 cyc 的管线空转是延迟/会合,不是发射带宽。**
+
+### 3. ❌ r16 §5 的「dS 写侧预 swizzle」——**按构造关闭**(这次是读源码确认,不是推导)
+
+dS 的 LDS 布局本来就是 `[kv][qp]` 且带 `qp ^= 8*(kv&7)` 置换,**目的正是**让一个 lane 打包的 8 个
+q-连续 dS 值变成一段连续 → 一条 `ds_write_b128`(见 `_g3s_wbase`)。改存 `[q][kv]` 好让 `_g3_tr` 用普通
+`ds_read_b128`,每条现有写要拆成 8 条 strided `ds_write_b16`(96 → **768 条 LDS 写/trip**),或 ~1536 次
+跨 lane 转置。**减 32 条读要付 672 条写。** 该臂到此关闭,不要再开。
+
+### 4. ❌ 消掉零 slack 全排空**本身**不值钱(`g2_hoist`:机制落地、分数为零)
+
+r18 §3 的诊断「softmax→GEMM2 交接处 6 次/trip 的 `PpUUUUPPPP | lgkmcnt(0) | MTMTTT`,**Mback = 0.0**」
+是真的。把 GEMM2 的 TR 环读从 exp 链**之后**提到**之前**(同样的读、同样的顺序、同样的操作数):
+ISA 上该家族整族消失,同样 6 个 segment 的 drain 变成 `EMEMEME|ME`,**Mback 0.0 → 6.0**、Mfwd 2→4,
+指令 3997→3994,寄存器头逐位相同、spill 0。实测 raw **1.0157 vs 零点 1.0170**,校正 1.0070 vs 1.0117。
+⇒ ★ **修正 r18 §3 的结论:「零 slack 全排空」不是一个可以按图索骥去消的成本项。**
+r18 认为 `g1_pf` 赢在"消掉全排空"——本轮直接做了这件事,拿到 0。静态 gap/coverage 代理**再次**
+失效,黑名单继续有效:裸 wait 条数、Mback 直方图、指令/wait 条数,没有一个能预测 wall。
+
+### 5. ❌ `g2d=2` 在宽带 a16 D=64 上重新定价:仍然负(−0.55% 校正)
+
+r18 的立论是「老结论成于 `g1_pf` 把预取挪走之前,槽位竞争前提已变」,值得一试。
+ISA 全面更优:3997→3958 指令、`s_waitcnt` 264→227、vgpr/agpr 495/239→493/237、spill 0、
+MFMA/PACK/EXP/LDS_TR/atomic 逐条相同。实测 raw 1.0097 / 校正 1.0062(零点 1.0170 / 1.0117),
+**raw 与校正同向为负**,是本轮唯一两个统计量一致判负的臂。⇒ `g2d` 轴定价完毕,不要再开。
+
+### 6. ❌ `g2_hs` 的剂量响应**不是单调的**:r5 在档位 1 的赢不延伸
+
+ISA 筛(零寄存器代价,三档 vgpr 495 / agpr 239 / spill 0 全同):暴露小段(fence 后、32 条 LDS_TR)
+MFMA 18 → 26 → 34,大段 142 → 134 → 126,MFMA 总数守恒。看起来是"把 MFMA 从有富余的大段搬进
+饥饿的小段",机制与 r5 的赢完全同源。实测(校正):
+
+| g1_pf \ g2_hs | 1 | 2 | 3 |
+|---|---|---|---|
+| 1 | 1.0117(零点) | — | 1.0195 |
+| 3 | **1.0183** | 1.0080 | 1.0059 |
+
+`g1_pf=3` 一行**单调下降**。`(1,3)` 那个 1.0195 是单次、且依赖全轮最大的一次 guard 校正(−0.94%),
+没有采信。我曾用 `G1_PF_AT = DT - G1_PF` 落在被 `tail_sink` 交接走的 d-tile 上来解释 (3,3) 的反叠加,
+并预测 `G2_HS < G1_PF` 的 `(3,2)` 会叠加 —— **`(3,2)` 实测 1.0080,该机制解释被证伪。**
+
+### 7. ★★★ 方法论:guard 几何均值校正**被跨 session 独立复测验证**,而 raw 分数把配置排反了
+
+同一天 7 次 bench,guard 几何均值(三个 guard 形状代码逐字节相同、本该恒等于 1.000)读数:
++0.52% / +0.35% / +0.87% / −0.26% / −0.94% / −0.20% / +0.15% —— **摆幅 1.8%**,
+远大于 harness 宣称的 0.3% 分辨率。三个独立形状**同向**偏移 ⇒ 是 per-session 的 A/B 槽位偏置,不是 per-cell 噪声。
+
+验证:拿校正值去对编排器在**不同 session** 对同一棵树的独立复测:
+
+| 配置 | 本轮 guard 校正值 | 编排器独立复测 |
+|---|---|---|
+| `g1_pf=3, g2_hs=1` | 1.0183 | 1.0195 (r5) |
+| `g1_pf=1, g2_hs=1` | 1.0117 | 1.0143 (r6) |
+
+两者都在 **0.26%** 内吻合;而 raw 分数(1.0158 / 1.0170)把这两个配置**排反了**。
+⇒ ★ **决定"留什么在盘上"要用校正值,不要用 raw** —— 编排器复测的期望值 E[raw] = 真值,
+而真值的最佳估计是校正值。★ 同时:**单次 bench 的校正值自身带 ±0.5% 噪声**(三个 guard 的 resid
+0.4–2.1%,几何均值 ≈ ±0.5%),所以 <0.8% 的差异必须复测,不能单次下结论。
+⇒ 这也说明 state.json 里 r5 的 +2.01% 是**高估**:`g1_pf` 3 vs 1 的真实差约 +0.65%,不是 0.51% 那个巧合数。
+
+### 8. 下一步(按信息量排序)
+
+1. ★★★ duty 只有 ~56%、且证明"完美调度装得下" ⇒ 瓶颈是**延迟/会合**,而不是发射或 trans。
+   下一个要测的量是 **barrier 会合代价**:8 个 wave 锁在同一 head-step,`s_barrier` 前后的
+   `SQ_WAIT_ANY` 分段归属(按 segment 而不是按 wait 站点),看早到的 wave 等了多久。
+2. ★★ 若会合是主项,唯一的结构杠杆是**解开 head-step 的 barrier 锁步**(让相邻 head-step 重叠),
+   而不是继续在段内搬 MFMA —— 段内搬运的轴(g2_hs / g2_hh / g2d / g1_pf)本轮已全部定价完毕。
+3. ★ 所有 <0.8% 的候选一律要求**两次独立 session 的校正值**同向,否则不采信。
+
+## ★★★ r20(bwd D=64,a16 dQ 路,occ=1 4-wave):barrier 轴**双向定价**完毕 —— 边际 barrier 只值 0.10%/个,r19 减法探针的 3.8% 里有 2/3 是"允许 wave 漂移"
+
+本轮四臂全部判负,盘上留回原树(md5 与基线逐字节相同)。但两个方向的定价第一次把
+"会合代价"和"barrier 指令代价"分开了,这直接改掉 r19 §8 的下一步描述。
+
+### 1. ★★★ 加法方向:纯加 8 个 barrier(`HS_WAR_BAR` 在 D64 打开),b1 −0.8%
+
+`HS_WAR_BAR = G3_DEFER and ...` 在宽带 a16 D=64 上 `G3_DEFER=False`,所以这个 head-step
+首部的 WAR barrier 是关的(WAR 边已被上一 head-step 的 `[lgkmcnt(0) drain, barrier]` 清掉)。
+把它强行打开 = **只加 barrier、不动任何别的结构**,ISA 证实:
+
+| | 基线 | +HS_WAR_BAR |
+|---|---|---|
+| hot-loop `s_barrier` | 16 | **24** |
+| vgpr / agpr / arch / spill | 495 / 239 / 256 / 0 | 495 / 239 / 256 / 0 |
+| lds | 86016 | 86016 |
+| instr / mfma / setprio | 4040 / 1280 / 32 | 3996 / 1280 / 32 |
+
+实测:b1 1.0160 / 1.0151(零点 1.0238)= **−0.78% / −0.87%**;b2 1.0128(零点 1.0145)= −0.17%。
+⇒ ★ **边际 barrier ≈ 0.10%/个(b1)、0.02%/个(b2)**,16 个 barrier 的全账 ≈ 1.6%(b1)/ 0.35%(b2)。
+附带发现:加 barrier 让 instr 反而 **少 44 条**、`s_nop` 少 16 条(它是调度墙,让编译器忘掉状态),
+静态指标全面变好、wall 仍然变差 —— 又一个失效的静态代理(第 6 个)。
+
+### 2. ★★★ 减法方向(合法):`QDO_RING` 把 16 个 barrier 退成 9 个,寄存器**按住不动**,仍然 −1.6%
+
+结构:Q/dO 与 dS 各给第二个 slot,head h 的 dS fence 顺带发布 head h+1 的 tile,
+head 边界那对会合消失(`QDO_TAIL`,源码里本来就有、被写死为 `False`)。ISA 理想:
+
+| | 基线 | qdo_ring |
+|---|---|---|
+| `s_barrier` | 16 | **9** |
+| vgpr / agpr | 495 / 239 | **494 / 238** |
+| arch / spill / setprio / mfma | 256 / 0 / 32 / 1280 | 256 / 0 / 32 / 1280 |
+| lds | 86016 | 135168(仍 1 WG/CU) |
+| instr | 4040 | 4042 |
+
+三形状 SNR 48.7–49.2 dB PASS。实测 wall:b4 **−1.20%** / b2 **−1.63%** / b1 **−1.73%**。
+把 §1 的边际价代进去:退掉 7 个 barrier 本该 **+0.7%**(b1),所以**双 slot 的"提前发布"本身要 ≈ −2.4%**。
+⇒ ★ **更正 2026-08-11 D128 §4(b) 的归因**:那条 −6.0% 当时记成"+26 vgpr 的寄存器代价"。
+本轮寄存器按平(−1 vgpr / −1 agpr / spill 0 / 占用不变)后损失照旧复现 ⇒ 代价不是寄存器,
+而是**发布点搬家**:h+1 的 `ds_write` 突发从 head-step 首部挪进了 GEMM3 转置读突发的中间。
+(与 r17 §3「读的突发化判负 −1.4%」同一族机制:这颗核对 LDS 端口在密集段的争用极敏感。)
+
+### 3. ★★ ❌ 在退役点补一道"零成本"编译器墙(`rocdl.sched_barrier(0)`)不但救不回来,还更差
+
+假设是"退役的会合同时是 `iglp_opt` 交织区的边界"。补墙后:b1 1.0037 / 1.0022、b2 0.9871 / 0.996、
+b4 0.9813 ⇒ 三格一致 **≈ −2.1%**,比不补墙(−1.2…−1.7%)更差(instr 4040→4042,lgkm0 64→59)。
+⇒ ❌ 别再试"用 `sched_barrier(0)` 替代退役的 `s_barrier`":`sched_barrier` 硬件零成本,
+但它**新增一个区边界**,分配器会照它办事;`EXP_IGLP` 的区无论有没有它都在。
+
+### 4. ★★★ 三个计分格的 kernel 级分账(rocprofv3 `--kernel-trace --stats`,首次拿全)
+
+| 格 | dkdv | odo | slotred | lset | odo min→max |
+|---|---|---|---|---|---|
+| b1(未分块) | **91.54%** (avg 1387 µs) | 1.73% (28.1 µs) | 1.02% | 0.31% | 27.1 → 30.3 µs |
+| b2(未分块) | **92.16%** (avg 2757 µs) | 1.75% (56.2 µs) | 0.60% | 0.16% | 55.4 → 57.6 µs |
+| b4(2 chunk) | 77.48% (avg 2720 µs) | **15.88%** (avg 600 µs) | 1.39% | 0.09% | **59.8 → 1527 µs** |
+
+三条硬结论:
+1. ★ **b1/b2 的 odo 是串行的,而且已经贴着 DRAM 字节地板**:b1 要搬 O+dO(134 MB)+ 图零填(67 MB)
+   + delta(2 MB)≈ 203 MB,28.1 µs ⇒ **7.2 TB/s**。⇒ ❌「把 odo 藏起来/压小」这一族在 b1/b2 上
+   由实测关闭(dkdv 外的全部尾巴只有 3.1% / 2.5%),杠杆必须落在 dkdv 体内。
+2. ★★★ **同一个 odo 并发跑时每次调用慢 25×**(59.8 → 1527 µs,字节数完全相同)⇒ 在 occ=1、
+   独占每个 CU 的 body 旁边,"藏"起来的流式 kernel 是按**全价 CU-time** 收费的,并发不免费。
+   这解释了 `_A16_MIN_BAT` 4→8(b4 改走不分块、代价换成 ~107 µs 串行 delta+fold)为什么读 **+0.03%**:
+   并发损伤 ≈ 串行暴露,分块机器在 b4 今天是个平局。
+3. ★ 同一进程内 15 次相同调用,dkdv 的 StdDev = **8.5%**(b1)/ 7.8%(b2),min/max 1263/1627 µs
+   ⇒ 这是硬件侧(功耗/时钟)的摆幅,独立佐证 pitfalls/02 的 min-of-7-passes 尺子设计。
+
+### 5. ★ ISA 门再省一次尺子:`g3_defer=True` 在 D64 宽带上
+
+17 barriers(`HS_WAR_BAR` 被它带开)、instr 4030、lgkm0 64、**`vmcnt(0)` 2→8** ⇒ 不花尺子直接排除。
+`vmcnt(0)` 计数是这颗核最便宜的坏味道指标(gfx950 只有一条 in-order vmcnt)。
+
+### 6. ❌ dQ 图零填改 `cache_modifier=2`(sc1,绕 MALL 写):未分辨/偏负
+
+b4 −0.05% / b1 +0.05% / b2 −0.87%,l70b 1.0037 未触顶,SNR PASS ⇒ 撤回。
+配合 ⑩ 的台阶可解释读数为什么分格反号(**未实测的机制假设,待验**):b1/b2 的 dQ 图是 67/134 MB,
+**装得进 256 MB MALL**;b4 的 268 MB 装不进。若成立,它同时解释了本战役一个稳定现象 ——
+体内调度类的收益一律 **b1 > b2 > b4**(本轮零点 1.0238 / 1.0145 / 1.0027 就是这个梯度)。
+
+### 7. 两个 harness 坑
+
+1. rocprofv3 `-d DIR -o r` 把统计写在 **`DIR/r_kernel_stats.csv`**(没有 run-id 子目录),
+   `DIR/*/…` 这种 glob 一个都匹配不到 —— 用 `find DIR -name "*kernel_stats*"`。
+2. `_r2_snr.py` 钉死在 B=1 / Hq=32,**既不会构出 batch 分块的 a16 计划,也构不出 8 头 GQA 组**
+   ⇒ 本轮新增 `_r9_snr.py <S> <B> <Hq>`(会打印 `chunks=N`),凡改到分块计划的臂都要用它过 gate。
+
+### 8. 下一步(由本轮双向定价指名)
+
+1. ★★★ barrier **个数**这条轴已双向定价:加 8 个 −0.8%、减 7 个(合法)−1.6%,全账 ≈1.6%(b1)。
+   r19 减法探针那 +3.77% 里,只有约 1/3 是 barrier 指令,余下 ≈2% 是**允许 wave 漂移**(探针结果不正确)。
+   ⇒ 真正要打的是**到达时刻的方差(convoy)**,而不是 fence 个数;合法手段是让 4 个 wave 的
+   每 head-step 延迟更齐,而不是拆掉 fence。
+2. ★★ 第一个可测的方差源:对角块 `_if_wave` 的四类 wave(clear/diag/live/dead)工作量不等 ——
+   先用 PMC 或按 wave 的 `SQ_WAIT` 分段确认"最后到的是谁",再决定要不要把四类补齐。
+3. ★ b1/b2 的 91.5–92.2% 都在 dkdv 一个核里,b4 的 odo 虽占 15.9% 但每个字节都是必须的、
+   且膨胀纯粹来自 CU 饥饿 ⇒ 三格的杠杆是同一个:dkdv 体内。
+
+## ★★★ r21(bwd D=64 a16,b4 分块计划):**每 CU 的 WG 深度不是一阶项,每 XCD 同时活着的 (batch,kv-head) 份数才是**
+
+三条臂动的都是"b4 每个 launch 有多少 WG",而 b1/b2/l70b/两个窄带格全部 `_nbc==1`、逐字节不变(天然对照)。
+基线同段 `--cell b4` = **1.0100 / 1.0044**,b2 = 1.0117。配对 `R3_B=4 R3_N=9` kernel-trace(µs):
+
+| 臂 | WG/launch | WG/CU | 每 XCD 同时活的 batch | dkdv avg | dkdv min | slotred avg/max | **b4 尺子** |
+|---|---|---|---|---|---|---|---|
+| `_A16_Q_SPLIT=1`(去掉 slot 折叠) | 512 | 2 | 1 | 2889 | 2553 | **核消失** | 0.9263 / 0.9353 |
+| 基线 `q_split=2`,2 chunk 串行 | 1024 | 4 | 1 | 2793 | 2463 | 54.0 / 972 | 1.0100 / 1.0044 |
+| `q_split=4`(8 WG/CU,fold 4 slot) | 2048 | 8 | 1 | **2716** | 2504 | **316.9 / 972** | 0.9954 / 0.9945 |
+| 2 chunk 各自一条 stream 并发 | 2×1024 | 8 | **2** | **3697** | 2790 | 45.5 / **90** | 0.9853 / 0.9884 |
+
+1. ★★★ **决定性的一行是第四行**:字节、slot 数、q 走法、WG 总数全部与基线逐字节相同,唯一的变化是
+   两个 batch-disjoint 的 chunk 同时驻机 ⇒ **dkdv 体自身 +32%**(avg 2793→3697、min 2463→2790)。
+   一个 XCD 的 L2 只有 4 MB,而常驻窗口(256 个连续 block_id = 16 个 band × q_split,同一 batch/头)
+   的共享操作数 ≈ Q/dO 2 MB + K/V 0.5–2 MB;并发两个 chunk 直接把它翻倍。
+   ⇒ **"多给点 ready work"在 occ=1 的 body 上是负收益**;03 卡"L2 命中的守恒量是 WG 存活时间"在这里
+   的等价表述是:**别让两份 Q/dO 同时活在一个 XCD 上**。
+2. ★★ q 轴双向定价完毕,**再次证实库里"别再扫 Q_SPLIT"**(§r?"离线模拟 makespan 都是 1080"):
+   q=1 −7.3%、q=4 −1.2%。但两次读数给出**新的分解**:q=4 的 **body avg 反而快 2.8%**(窗口里 band 数
+   16→8,足迹更小),输在 **fold 的每-slot 单价超线性**(2 slot 54 µs → 4 slot 317 µs,字节只 2×)。
+   ⇒ q_split 的真实约束不是 makespan,是 **slot workspace 的折叠单价**;把折叠去掉,这 2.8% 就可收。
+3. ★ **辅助核的饥饿是结果不是原因**:并发臂里 slotred max 972→90 µs(有空位就不饿了),wall 却更差;
+   反过来 q=4 臂 fold 更贵、body 更快,wall 也更差。⇒ 给 odo/slotred 定价必须看 **body 的足迹变化**,
+   不能只看这两个核自己的 µs(r20 §3"并发损伤 ≈ 辅助核孤立时长"由此细化:那是 CU 饥饿的量级,不是 wall)。
+4. **管理者点名的 R8-P1/P2 本轮不重走**:`_A16_MIN_BAT` 4→8 已在 r20 读 **+0.03%**、dQ 零填
+   `cache_modifier=2` 已在 r20 读 b4 −0.05%/b1 +0.05%/b2 −0.87% 并撤回。本轮把同一主题换到未定价的
+   q/stream 轴上,并给出了 MIN_BAT=8 为什么必须是 0 的机制:**单个大 launch 的常驻窗口仍然只有一个
+   batch**(`_xcd=block_id%8` + q 最快 + band 次快 + batch 最慢),所以它和分块的 L2 足迹完全一样,
+   chunk 的全部价值只在藏 odo,而 odo 藏不住。
+
+### 下一步(由本轮足迹模型指名,已 sized)
+
+1. ★★★ **把 dK/dV 的 slot 折叠整个删掉**:a16 的 dQ 路早就用 `buffer_atomic_pk_add_bf16` 直写图、
+   每个元素 **32** 份贡献都能过 50 dB;dK/dV 每个元素只有 **q_split 份**(2)贡献,凭同一条先例改成
+   原子 epilogue 即可,零填复用 odo 的 `FILL_IMG`。账:省 134 MB 写 + 134 MB 读 + 67 MB fold 写/iter,
+   删掉一个核以及它**完全暴露在 `st` 尾部的最后一次折叠**(26 次调用里 13 次是这种),
+   并且把 q_split 与 workspace 解耦 ⇒ 上表第三行那 **+2.8% body** 才能收进来。gate 用 `_r9_snr.py`。
+2. ★★ 在**深度不变**的前提下压常驻窗口的足迹:窗口里 2 MB 的 Q/dO 是大头,源码在 `QDESC_R` 旁边
+   自己点名的"rotate the GQA head order by band"就是直攻它;并发臂给出了灵敏度系数(足迹 2× → body 32%)。
+3. ★ 按同一模型给 `_A16_BLOCK_KV` 256→128 定价(窗口里 K/V 那一半减半,band 数翻倍)。
+
+## ★★★ r22(bwd D=64 a16,occ=1 4-wave):r21 点名的 ★★★ 一号杠杆(删 dK/dV slot 折叠)**上尺子判负** —— 原子 epilogue 的代价不在字节,在"暴露的同线 RMW 突发"
+
+本轮两臂全部判负,盘上留回原树(md5 `6102ef3da7cb0d745d2ef4a46cc24f75`,与基线逐字节相同)。
+零点(本 session,cheap ruler,清 cache):b4 1.0071 / 1.0036(mean 1.0054),b1 1.0219 / 1.0121(mean 1.0170)。
+
+### 1. ★★★ `dkdv_atom`:dK/dV 用 `buffer_atomic_pk_add_bf16` 直加零填输出 = b4 −1.2% / b1 −4.8%
+
+完全按 r21「下一步 #1」实现:builder 加 `dkdv_atom`,SRD 去掉 `split_idx*Skv*RD_STRIDE_KV` 这一项,
+`_store` 把每个 `o_pack`(2 dword)换成 2 条 `raw_ptr_buffer_atomic_fadd`(照抄 `_g3_a16` 的先例),
+host 只分配 **1 个零填 slot**、prime 的双次 dispatch 后补零、`_slot_plan=None`,
+`_reduce_dkdv_slots(..., n_slots=1)` 退化成零成本直通(fold 核彻底消失)。gate 全过:
+
+| | 基线 | `dkdv_atom` |
+|---|---|---|
+| vgpr / agpr / arch / spill / lds | 495 / 239 / 256 / 0 / 86016 | **完全相同**(热循环 shuttle 也同为 5) |
+| `_r9_snr.py 2048 1 64`(计分 GQA 组 8) | dq 48.8 / dk **48.9** / dv **49.2** | dq 48.8 / dk **47.7** / dv **47.9** |
+| `_r9_snr.py 2048 4 32`(分块计划) | — | 47.7 / 47.9,PASS |
+| b4(两读) | 1.0071 / 1.0036 | **0.9965 / 0.9894** = mean −1.23% |
+| b1 | 1.0219 / 1.0121 | **0.9707 / 0.9653** = mean −4.82% |
+
+1. ★★★ **账全对,结论全反**:省了 134 MB 写 + 134 MB 读 + 67 MB fold 写、删掉一个核和它暴露的尾部折叠,
+   wall 仍然掉 1.2%(b4)/4.8%(b1)。⇒ **dK/dV 折叠的成本不是它的字节**;r21 §2 那句「把折叠去掉这 2.8%
+   就可收」的前提(折叠贵在字节)本轮被否。
+2. ★★★ **机理:同一条指令,摊开的位置决定它的价钱**。dQ 路每 trip 64 条同款原子活得很好,因为它们被
+   `g3_st_hs`/`g3_st_g2` 摊进 GEMM2 的 MFMA 流里;dK/dV 的 epilogue 是 WG 末尾**完全暴露**的
+   1024 条原子突发(64 KB/WG),而且 `q_split` 的两个 WG(block_id 相邻、同 XCD、同相位)**同时**
+   RMW 同一批 cache line。b1 掉得比 b4 狠 4×,正是因为 b1 只有 1 个 batch、两个 split 相位完全对齐。
+   ⇒ 一般教训:**把 store 换成 atomic 之前先问它是不是暴露段**;原子的先例不能跨"摊开度"移植。
+3. ★★ **顺带证伪 r21 对精度的估算**:r21 说「dQ 每元素 32 份贡献都能过 50 dB,dK/dV 只有 2 份,凭同一
+   先例即可」。实测 bf16 原子加**确实**比 fp32 折叠差 **1.2–1.3 dB**(dk 48.9→47.7、dv 49.2→47.9;
+   dq 48.8 不动,是干净的对照)。机制:`_reduce_dkdv_slots` 是升 fp32 求和后**只舍入一次**,而
+   `0+a` 再 `+b` 的硬件 pk_add_bf16 多一次舍入。虽然仍过 45 dB gate,但这属于"降低中间值精度",
+   **按 16-bit 铁律本身就不该上**;wall 只是又给了一票。⇒ 记账:**这一系(dK/dV 原子 epilogue)双重关闭**。
+
+### 2. ❌ `mfma_tie` 减法(管理者点名的寄存器轴):`mfma_tie=1` = b4 −0.80%,b1 +0.48%(噪声内)
+
+先用 `R1_KW` 做零改动 ISA 勘察,拿到三个读数 —— 并**改掉 goal/管理者指令里的两个机器数**:
+
+| `mfma_tie` | 语义 | vgpr / agpr / arch / spill | ISA |
+|---|---|---|---|
+| 3(**当前部署**,L5241) | dV+dK 两族 accumulator 全 tied | 495 / 239 / 256 / 0 | 与 base **逐字节相同**(md5 `398c4ac2…`) |
+| 1 | 只 tie dV(dK 放开) | **481** / 225 / 256 / 0 | instr 4019,s_nop 108 |
+| 2 | 只 tie dK | **483** / 227 / 256 / 0 | instr 4030,s_nop 98 |
+
+1. ★★★ **「tied-operand 把 GEMM2 accumulator 钉进 AGPR」不是未试的杠杆,它就是现役配置**
+   (`mfma_tie=(3 if D==64 else 2) if a16 else 0` + `mfma_tie_cons=1`)。`grep -c "v_mfma_f32_16x16x32_bf16 a\["`:
+   base 1408 / tie1 704 / tie3 1408。⇒ 这条轴上还能动的只有**减法**。
+2. ★★★ **「accum_offset 256 以上还有 33 个不花 occupancy 的 dword」被证伪**:实测 agpr **239/256**、
+   amax 238、arch 钉死在 256 上限。热循环 MFMA 操作数普查:512 条已是 `dst=a A=a B=v C=a`,
+   热循环 accvgpr shuttle 只有 **5** ⇒ GEMM3 的 accumulator LLVM 自己也放进了 AGPR,
+   再显式 tie 属于 methodology/06 r15 的"零和替换"(那次实测 −0.49%),不值机器时间。
+3. 减法实测:b4 1.0010 / 0.9937(零点 1.0054)= **−0.80%**;b1 1.0219(零点 1.0170)= +0.48%,
+   `resid` 0.67–1.41% 说明 b1 那一读在噪声内。⇒ **省 14 个寄存器在 occ=1 上买不到东西**,
+   与 methodology/06 r16(放掉 72 vgpr+72 agpr = −2.05%)同向。**tie 轴到此双向定价完毕,别再扫。**
+
+### 3. 本轮顺手关掉的三条(都是"读卡/读源码就省下一次 bench")
+
+- `g3_st_w`(dQ 原子交棒粒度 1/2/4):源码注释自己记了结论 ——「pairs match ONE q-half's d-tile sites;
+  going finer puts a vm op in every d-tile, which costs more of GEMM1's exp cover than the spread returns」。
+- `QDESC_R=1`(q 相位对齐):§r?(第 1058 行)已把 `qdesc_r` 2/8/16 定价为 ±0.4% 平,且第 1187 行记了
+  `QDESC_R=1` = **制造最大散射**(QDESC 本来就把并发 band 压在同几个 q block 上,rotate 是为了散开 dQ 原子冲突)。
+- `_A16_ODO_AHEAD`(卡里没有,看着像未定价):**在计分形状上是恒等变换** —— b4 的 `_nbc=2` ⇒
+  `_queued=min(2,2)=2`,b1/b2 的 `_nbc=1` ⇒ `_queued=1`,两档在 nbc≤2 时发射序列相同。别去测。
+- 另:`img = dq.view(-1) if a16_nat` ⇒ D=64 面上**没有** image→dq 的搬运核(`_unpermute_dq_a16` 只走 D=128),
+  这条想象中的 1.3% 不存在。
+
+### 下一步(本轮把 r21 的 #1 换掉,新的 #1 由本轮读数指名)
+
+1. ★★★ **不要删折叠,去修折叠的带宽效率,然后收 q_split=4 那 +2.8% 的 body**。r21 表:2 slot fold
+   54 µs / 4 slot fold **317 µs**(字节只 2×,单价超线性)。4 slot 的账是 536 MB 读 + 134 MB 写 = 670 MB,
+   317 µs ⇒ **2.1 TB/s,离峰值 8 TB/s 差 4 倍** ⇒ `_reduce_dkdv_slots`(L4607-4681)本身是慢核,
+   不是"折叠这件事贵"。把它修到 ~90 µs,q_split=4 就是 +2.8% body − 0.7% fold ≈ **+2.1%**。
+   本轮已证:折叠的**字节**不是问题(删掉字节反而 −1.2%),所以这一手方向是**效率**不是**删除**。
+2. ★★ r21 #2 仍然有效(rotate GQA head order by band 压常驻窗口足迹),但注意它在源码里是
+   "q 反向走"的**使能项**,单独上没有立论;要和 L4016 那条注释一起做。
+3. ★ 若要碰 dK/dV epilogue,方向是**把 store 摊进 MFMA 流**(照 `g3_st_g2` 的做法),
+   而不是换成原子 —— 本轮已经量出"暴露突发"是那 1.2% 的来源。
+
+## ★★★ r23(bwd D=64 a16,b1/b2/b4 计分面):r22 点名的 ★★★ 一号杠杆(修 dK/dV 折叠的带宽)**在核内被证伪** —— 那 2.1 TB/s 是**并发时长**,不是核的速率;同一轮把 batch 分块**双向**定价完毕
+
+r22 的下一步 #1 写的是「4 slot fold = 670 MB / 317 µs = 2.1 TB/s,离峰值 8 TB/s 差 4 倍 ⇒
+`_reduce_dkdv_slots` 本身是慢核,修到 ~90 µs 就能收 q_split=4 的 +2.8% body」。本轮第一件事就是
+把这个核**单独**架起来量(新探针 `_r12_fold.py`:三个计分几何 × 12 个 `(block,uc,vec)` 形状,
+持续负载预热 + min-of-7×25 次发射,同时有 `R12_CHECK=1` 对 fp32 参考逐位核对)。
+
+| 计分几何 | fold 几何 | 部署形状 µs / TB·s⁻¹ | 全扫最好 | 最好 ÷ 部署 |
+|---|---|---|---|---|
+| b1(q_split=**4**,整张) | 4 slot × 4.19 M elem | (128,1,4) 15.39 / **5.45** | (512,2,8) 13.63 / **6.16** | **+12.9%** |
+| b2(q_split=2,整张) | 2 slot × 8.39 M elem | (128,1,4) 18.12 / **5.55** | (512,2,8) 16.37 / **6.15** | **+10.7%** |
+| b4(q_split=2,每 chunk 一条 strided sub) | span=1024 / rstride=2048 | (128,1,4) 18.64 / 5.40 | (128,1,8) 18.55 / 5.43 | +0.5% |
+
+1. ★★★ **核的真实速率是 5.4–6.2 TB/s,不是 2.1 TB/s**;而这台机器(1400 W 功率封顶、sclk 2070)
+   实测 HBM 流地板本来就是 **5.95–6.2 TB/s**(methodology/03),**不是 8 TB/s**。⇒ 折叠核在部署形状上
+   已经跑在机器流速的 **88–93%**,而最宽 tile 就落在流地板上。r21 表里那个 317 µs 是 b4 **并发**读数:fold 在 side stream 上
+   与 occ=1 的 body 抢 CU(同表 slotred max 972 µs 就是同一现象),被当成了核的效率。
+   ★ **一般教训:任何从 trace 里读出来的辅助核时长,若它与 body 并发,就不能除以字节当带宽用;
+   要给辅助核定价必须把它单独架起来发射**(r21 §3 已经说过"饥饿是结果不是原因",本轮把它变成了硬数)。
+2. ★★ 这条杠杆按尺子的真实价钱:fold 孤立时长 = b1 15.4 µs / wall 1.22 ms = **1.26%**、b2 18.1/2.48 ms = 0.73%,
+   最宽 tile 省下的 1.76 µs / 1.75 µs ⇒ **b1 0.14% / b2 0.07% wall**(与本轮盘上两条改动的配对读数
+   b1 +0.68% / b2 +0.19% 相符:另一半来自下面 §3 那条 dispatch,0.40% / 0.19%)。
+   所以**下一个该动的不是折叠核内部,而是 q_split 这条轴本身**(见下一步 #1):
+   r22 的账里唯一还站得住的是"q=4 的 body 快 2.8%",而它当年输的那 317 µs **根本不存在**。
+3. ★ 管理者点名的 B 臂(让一个 WG 走多行,把 `sub` 的 rows×span 摊成一条线性走法)**用上表省下了一次实现**:
+   b4 的 chunk 只有 span=1024 元素,TILE 上限就是 1024,而它在这个上限上离全扫最好只差 **0.5%**
+   ⇒ 摊平 rows×span 的全部收益 ≈ **0.02% 的 b4 格**。⇒ 排"让 WG 走更多数据"这类改写之前,
+   先用单独架起来的全形状扫描看**同 span 下最好与部署的差**,差不到 2% 就不必写代码。
+4. 留在盘上的那一半:`_SLOTRED_CFGS` 由"够窄就行"改成**最宽优先**(`(512,2,8)` 领头,并按
+   "TILE 能整除 span 且 WG 数 ≥ `_NUM_CU`"选),b1/b2/l70b 拿到 (512,2,8)、b4 的 chunk 落到 (128,1,8);
+   12 个形状全部与 fp32 参考逐位相同(0 mismatch),所以这是纯减法。
+
+### 1. ★★ `_A16_MIN_BAT`(batch 分块)**双向定价完毕**:b4 上是 0,b2 上是 **−2.6%**
+
+r20 记过 `4→8`(= b4 不分块)= +0.03%;本轮用 4 读复测 **0.9831/1.0060/1.0053/0.9968 = 均值 0.9978**
+对分块基线 4 读 **0.9925/1.0129/0.9952/1.0014 = 均值 1.0005** ⇒ −0.27%,**同号地确认这条常数在 b4 上是 0**。
+新的一半是反方向:`4→2`(= 把 b2 也分块,窗口格与 b1 天然不变,因为 `_dq_a16_for` 要求 `window_left<0`
+且 B=1 无法分块)⇒ b2 **0.9830 / 0.9865** 对基线 1.0138/1.0082 = **−2.6%**。trace 给出机制:
+
+| 臂 | body 数 × µs | 合计 body | 暴露辅助 | launch gap |
+|---|---|---|---|---|
+| b4 分块(部署) | 2557 + 2552 | **5109** | ~100 µs(1.9% wall) | 0 |
+| b4 不分块 | 5145(单发) | 5145 | 140 µs(2.6% wall) | 0.00% |
+| b2 不分块(部署) | ~2440(单发) | ~2440 | ~95 µs(3.8% wall) | 0 |
+| b2 分块 | 1350 + 1324 / 1382 + 1334 | **2674 / 2716** | odo 侧 902 µs 并发 | **999 µs / 11.9%** |
+
+1. ★★★ **每多一次 body launch 的"抽干代价"按这一 chunk 覆盖机器的份数放大,不是常数**:
+   b4 的 chunk 是 2048 WG(8/CU)⇒ 两段 body 合计 **比单发还少 36 µs**(抽干≈0);
+   b2 的 chunk 是 1024 WG(4/CU)⇒ 两段合计 **比单发多 230–280 µs**(+10%),
+   而它藏掉的 odo 只有 ~25 µs。⇒ 判据不是"batch 够不够分",是**分完之后每 CU 还剩几个 WG**;
+   `_A16_CHUNK_WGS=512` 这条门槛比实测拐点低 2–4 倍,谁把它当"可以分"的依据都会踩这一脚。
+2. ★★ b2 分块还额外冒出 **999 µs 的 launch gap(11.9%)**:side stream 的 odo 被拉成 902 µs、
+   fold 前出现 453–526 µs 的空窗 ⇒ event 依赖在 chunk 太小的时候**真的会堵队列**,
+   而同样的 event 结构在 b4 上 gap 恒为 0。⇒ **流/event 计划的正确性只能按 gap 验,不能按设计意图信**。
+3. ★ **"side stream 上的流式辅助核几乎免费"这条本轮第一次被直接量出来**:b4 的 body0 = 2557 µs
+   (身下压着 1359 µs 的 odo+fold),body1 = 2552 µs(独占)⇒ 差 **0.2%**。
+   ⇒ 在 occ=1 的 body 旁边跑纯流式核,代价不在带宽争用,只在它自己能不能被完全遮住。
+
+### 2. ★ 记账口径纠正:「odo = backward 的 14.95%」是**核时长之和**的份额,不是 wall 的份额
+
+R8 留下的这个数被后续几轮当成"有 15% 可拿"。本轮按 rocprofv3 timeline 逐 dispatch 算 gap 与暴露段:
+b1 的暴露辅助 = **3.9% wall**(odo ~30 µs + lset 5.7 µs + 尾部 fold ~10 µs,wall 1.22 ms),
+b4(部署分块)= **1.9% wall**,b4 不分块 = 2.6%。而 odo 自己在 b4 不分块时 103 µs 里搬 ~805 MB
+(O + dO 读 + 图零填写)⇒ 表观 7.8 TB/s,**已经在流速之上**(nt 写 + 无读的零填路径)。
+⇒ **辅助核这一家在 wall 上的总可取量是 2–4%,不是 15%**;要继续拿必须按"暴露 vs 被遮"而不是按核时长排。
+
+### 3. ★ 白捡的一个 dispatch:`torch.zeros(1)` 占位参数 = 每次 backward 一个 fill 核
+
+`_cu_placeholder` 每次调用 `torch.zeros(1, int32)` 造一个**永远不会被读**的 `cu_seqlens` 占位
+(只在 `const_expr(varlen)` 下才读,dense 面恒 False)。torch profiler 把它记成
+`aten::zeros/zero_/fill_` 2.0 µs,kernel trace 里是 body 之前一条 **4.6–5.6 µs** 的
+`vectorized_elementwise_kernel`。改成 per-device 缓存后这条 dispatch 消失,b1(1.22 ms)上是 **~0.4% wall**。
+⇒ ★ **launcher 里任何"给个空张量占位"的写法都是一次完整的核发射**;occ=1 的核在 b1 这种短 wall 上
+这一条就够看见。查法:`torch.profiler` 的 op 表里找与 kernel 名对不上的 `fill_`/`zero_`。
+
+### 4. 尺子本身:b4 这条臂的单 session 单读摆幅是 **2.0%**,`cur` 腿比 `ref` 腿噪
+
+同 session 4 读:`ratio` 0.9925–1.0129(2.0%),而各读自报 `resid` 只有 0.49–0.67%;
+分解到两腿:`cur` 5.0255–5.1020(1.5%)、`ref` 5.0594–5.0903(0.6%)。
+⇒ pitfalls/02 的"单格 0.35%"**在 b4 + a16(side stream + event)这条臂上不成立**;
+**b4 的臂至少要 4 读取均值**,2 读只能判 >2% 的东西。b1 相对安稳(resid 0.69%)。
+
+### 5. 工程细节:部署副本是只读的,ABBA 同 session 配对不能靠"跑中间改常数"
+
+想在一次 `remote.sh` 里交替两个常数值取 ABBA,结果 4 次改写全部 `PermissionError`
+(容器里的 repo 挂载为只读),4 个读数其实是同一条臂 —— **幸好这恰好变成了上面那张噪声表**。
+⇒ 跨臂配对只能靠"本地改 → rsync → 一次 bench",所以**同 session 配对在这套 harness 上只对
+"一条臂 + 它自己的 ref 腿"成立**;两条臂之间永远是跨 session,必须按 0.8% 门槛和两次同号来判。
+
+### 下一步(由本轮读数指名)
+
+1. ★★★ **重新给 `q_split=4` 在 b2/b4 上定价** —— r22/r21 把它判负的那笔账(fold 317 µs)已被本轮证伪:
+   真实代价是 b1 34–37 µs / b2 16–19 µs 这一档,而收益是 r21 量到的 **body avg +2.8%**(常驻窗口里
+   band 数 16→8、足迹更小)。现在 fold 还拿到了最宽 tile。这是库里目前唯一"收益已量出、代价刚被改小"的轴。
+2. ★★ **把 `lset`(5.7 µs、与 B 无关)并进 `odo`**:两个核都是按行读 LSE/O/dO、各写一份 per-row fp32,
+   b1 上这一条就是 0.47% wall,且不动任何数值路径。它是"暴露辅助 2–4%"里最便宜的一刀。
+3. ★★ b1 的暴露辅助(3.9%)想用 b4 那招藏起来就要把 body 按 q 轴切两发,而 §1 的抽干律直接给出报价:
+   b1 的 body 是 2048 WG,切两发正好落到**在 b2 上亏了 2.6% 的那个 1024 WG/发**的几何。
+   ⇒ 要走这条路必须先改的是"切完还剩几个 WG",也就是 `_A16_BLOCK_KV` 256→128 把 band 数翻倍(r21 下一步 #3),
+   两件事得一起做才有意义,单独切 b1 的 body 按现有数据是负的。
+4. ★ 折叠核内部若还要动,剩下的量是最宽 tile 的 **6.15–6.16 TB/s** 与流地板 6.2 之间那一点;
+   再往上要换的是"读 q_split 条远流"的排布(每 slot 间隔 Skv 个元素),不是 tile 形状 —— 它折到 wall 上
+   是 0.0X% 量级,排序上应该排在 #1–#3 之后。

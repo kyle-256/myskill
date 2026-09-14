@@ -30,12 +30,31 @@ spill 0、SNR 逐位不变。在 mx8tw 的 NT 核上它把 **arch VGPR 246 → 1
    两组(GEMM2a 的 P pack、dO ring A)= **−3.4% / −2.6%**,还各胖 12 dword(钉的副本与 VGPR 原件共存)。
    **只钉 MFMA 直接消费的值**——VALU 与 `ds_read` 不能 source AGPR,钉地址/softmax 侧的 pack 反而
    每次使用多一条 `v_accvgpr_read`。
+   ⚠️ **前提(pitfalls/13 §r15 实测补充)**:上面的 +0.79%/+0.53% 还要求「被钉的值不与其他 AGPR
+   常驻值争位」。第二场 campaign 在 gpt-oss D=64 bwd 上把 V pack 组(32 dword)原样 tied-pin,
+   agpr 不是涨到 255 而是 **223 → 219**——分配器把 GEMM3 的 B 操作数挤出了 `a`,
+   是零和**替换**而非**填空**(热循环 B=a 的 MFMA 112→256,shuttle 反升),实测 **−0.49%**。
+   ⇒ 钉完先看 agpr 计数是否真的**涨**了;涨不上去就是在做替换,别钉。
+   ⚠️ **反向也不成立(pitfalls/13 §r16)**:同一 body 上 `g3_kreg=False` 一次**释放 72 vgpr + 72 agpr**
+   (479→407 / 223→151,spill 仍 0),实测 **−2.05%**。occ 不变时**寄存器余量本身换不到任何东西**;
+   「省寄存器」不能单独当作立臂的理由,必须先说清省下来的余量要买哪个具体收益。
 3. ⚠⚠ **空 asm 的 pin 必须 TIED,且 asm-MFMA 必须自带 hazard 保护。** 未绑定的 `"=a,v"` 能编译、能跑、
    ISA 好看(spill 36→0)、快 4.5%——因为它**不生成任何拷贝**,输出 AGPR 未初始化,等于**悄悄删掉了操作数**;
    只有 SNR gate 抓得到(NaN / det false)。另:tied `"=a,v,v,0,v,v"` 的 scaled asm-MFMA 在 NT=4 上
    **逐位正确且 +0.42%**,在 NT=2 上 **dk 稳定错 −0.9~−1.4 dB**——不透明 asm 把累加器 def-use 藏过了
    hazard recognizer,只有四条独立累加器链才有足够距离。⇒ **一个 tile 几何上的 bit-identical checksum
    不是寄存器类改动的正确性证明**;换寄存器类必须在最小 NT 上过 SNR。
+4. ⚠⚠⚠ **输出从 AGPR 挪进 arch VGPR,约束要补 `&`(early-clobber)。**(2026-09-11 r39,mxfp4 dense
+   NT 累加器/片段互换,静默数值错) `"={a[b:b+3]}"` 一直不加 `&` 也没事,是因为 asm 的入参**全是 arch
+   VGPR 或 SGPR**,跨寄存器文件撞不上。同一个输出一旦落到 arch VGPR,不加 `&` 就是在承诺"读完全部输入
+   之后才写",RA 于是**合法地**把某个 `"v"` 入参(`ds_read` base / voffset / soffset)安排进刚挪进来的
+   累加器区间,循环中途覆盖掉。⇒ 症状是**部分形状对、部分形状错**(10 个形状 3 过 7 塌到 0.03~1.77 dB),
+   且与 tile 数相关而与 K/KI 无关(同 K 同 KI:32768×4096 过、1024×2048 塌)——因为撞不撞只取决于 RA
+   这一次把哪个入参放哪。ISA 门**全绿**(opcode 计数、`s_nop` 拍数、spill、`accum_offset` 都不变),
+   查不出来。补 `&` 后 12/12 逐位相同、ISA 一个字节没变。
+   ⚠ **`&` 与 tied(`"0"`/`"1"` 匹配约束)互斥**:tied 输出天生与入参共寄存器 ⇒ 挪之前先确认该路径上
+   累加器不是 tied 的(本核靠"有硬件循环 ⇒ 累加器是 `v_accvgpr_write` 清零而非 tied 传入"保证,已加
+   `assert`)。**口诀:寄存器类改动出现"部分形状对部分错",先查 `&`,别去查 hazard/`s_nop`。**
 
 下面的 raw-asm 路线是更早工具链才需要的兜底:
 
@@ -297,6 +316,18 @@ vs 拆分后 0.99553 ⇒ **prologue 侧已无剩余**,不要再为"隐藏 tile �
 - 症状:`=&v` early-clobber 输出太多(如 2-set ping-pong / register double-buffer 的 +6 或 +96 个 `=&v`)触发贪心 RA 病态卡死(compile >130s 不返回)。
 - 解法:把内联汇编的 `=&v` 输出换成 ISA 里显式 `v[pb:pb+3]` 物理寄存器字面量,`pb = PINBASE + 组偏移`。
 - 对齐约束:PIN 下 scale VGPR 基址须对齐 —— `PINSC=1`(scale 在前)用 `PINBASE`,否则用 `PINBASE + 4*ntmp`;不对齐触发 SNR21 bug。
+
+### ★★ tied-operand accumulator pin:先查它是不是**已经部署**,再查 agpr 有没有真的上去(hd64 bwd r22)
+
+- meta hd64 flash-bwd 的 a16 D=64 面上,`mfma_tie=3` + `mfma_tie_cons=1` **就是现役配置**
+  (`v_mfma..._bf16 a[` 计数 base 1408 / 只 tie dV 704),所以"把 GEMM2 accumulator tied-pin 进 AGPR"
+  在那颗核上不是待试杠杆。**接到这类指令先用 `R1_KW` 做零改动 ISA 勘察**,一次 build 就能分清
+  "未试"和"已部署"。
+- 同时证伪"accum_offset 256 以上还有余量"这种纸面推断:实测 agpr **239/256**、amax 238、arch 钉在 256,
+  热循环 accvgpr shuttle 只有 5 ⇒ 未 tie 的 GEMM3 accumulator LLVM 自己也放进了 AGPR,显式 tie 是零和替换。
+- 减法方向同样无收益:减掉一族 tie(vgpr 495→481、spill 仍 0)实测 b4 **−0.80%**,与本卡 r16
+  "放掉 72 vgpr+72 agpr = −2.05%" 同向。⇒ **occ=1 下"省寄存器"和"多占 AGPR"都不是收益来源,
+  唯一的判据仍是 shuttle 流量。**
 
 ---
 来源: flydsl-fp8-gemm-tuning/SKILL.md, 10-grouped-wgrad-4wave-3buf.md, gemm-optimization/SKILL.md, agpr_rawasm_progress.md, agpr_phase5_mono.md, 11-upstream-agpr-pin-moot.md, diag_4w_vs_8w.md, flydsl-fp8-gemm-results/SKILL.md, 03-emit-knobs.md, 10-8wave-scvgpr.md

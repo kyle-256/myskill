@@ -82,6 +82,13 @@
 
 - ❌ **别再试**：盲目 trim 单个 VGPR/SGPR 想抠占用率，却不检查是否跨量子边界。不跨 8(VGPR)/16(SGPR)/512B|1280B(LDS) 的边界 = 零收益，纯浪费调优时间。
 
+- ★ **在排「压 VGPR 换占用」的预算之前，先花 70s 用死 LDS 直接给占用定价**：加一块用不到的 LDS 把
+  `group_segment_fixed_size` 抬过下一个台阶（ISA 里核实数值），常驻 CTA 数就腰斩，而**指令流一字未改**。
+  这条臂量到的就是「占用 N→N/2 的纯价」，是 trim 寄存器所能买到收益的**上界**。
+  实测反例：sparse-MLA decode producer 44800→82048 B（occ 腰斩）在 seq96 只值 **0.1–0.2%**
+  ⇒ 那一族候选（含带 spill 的 `waves_per_eu` 强压，实测 −4.9%）整体不必做。详见 pitfalls/12。
+  **比先去改代码再回头解释「为什么 trim 了却没快」便宜一个数量级。**
+
 - **CDNA3/CDNA4 越界 GPR/LDS 访问不 fault**——sizing/预算 bug 会伪装成数值 bug：
   - 越界 **source 读** → 读到 register 0
   - 越界 **destination 写** → 丢写（multi-dest VMEM/atomic 以 EXEC=0 发射）
@@ -196,6 +203,34 @@ operand frag + scale + 地址一个都放不下（需要 4×254 = 1016 ≫ 512 �
 - ❌ **别再试上游 AGPR-pin commit 救 mxfp4**：上游 ROCm/FlyDSL AGPR-pin commit（**#714 aeb5afc**，作用于 fp8 4wave AGPR 原地累加、消 accvgpr-shuffle +5~13%）对 **mxfp4 4-wave 无帮助**。WHY：mxfp4 走 bareasm whole-loop，accs 已用 `=a` tied 原地累加、更彻底，accvgpr-shuffle 问题根本不存在。实测 **agpr1（5407/5322）≈ agpr0（5390/5348）** 噪声内相等。上游针对 SSA-lowered 路径，bareasm 无此路径。
 
 - ❌ **别再试 `amdgpu-mfma-vgpr-form=false` 在生产 4-wave**：对生产 4-wave 内核**零收益**，ISA 逐字节相同（accvgpr_write=1 / read=256 / agpr=256 / vgpr=432 / scratch=0）。WHY：AGPR 累加是 FlyDSL intrinsic 层既成的，**与编译 flag 无关**——本容器 external codegen 下 `maxnreg`/`waves_per_eu`/`amdgpu-mfma-vgpr-form` 全无效（见 methodology/03），累加器本就在 AGPR 里，循环内 **0 条 accvgpr shuffle**（256 条 `v_accvgpr_read` 全在 epilogue、只发生一次）。探针"8164/512 per-MFMA accvgpr shuffle 是头号瓶颈"是**误诊**（来自旧版/8wave/agpr=False 变体）。
+
+## mxfp8 dense NT(带 scale)上 4-wave 不等于 fp8:算力地板反而低 11.9%
+
+- 场景: gfx950 / mxfp8 dense NT / BM=BN=256 / `v_mfma_scale_f32_16x16x128_f8f6f4` / per-1x32 E8M0。
+  4-wave 骨架**完整落地并逐位正确**(barrier/K-iter 8.04→1.00、setprio 190→0、agpr=256、spill=0、
+  ds_read/WG/iter 192→128 KB、MFMA 条数逐条相等 1536x4=768x8),隔离尺 l1f/qkvf 仍 **−31.1%/−30.7%**。
+- ★★ **把稳态 global prefetch 摘掉做归因**(改 LDS 内容错、指令流对): 4-wave 从 −31% 回到 **+0.2%(平)**,
+  即 **100% 的差距是单 wave/SIMD 盖不住的 `s_waitcnt vmcnt(0)`**;而同样摘掉 prefetch 的 8-wave 骨架
+  **+12.1%/+9.9%** —— 两边算力地板 721.6 us vs 807.3 us,**4-wave 地板比 8-wave 差 11.9%**。
+  结论: 本核 4-wave 的天花板 ≈ 今天的 8-wave 实测值,prefetch 修好也只到平手。
+- ★ 所以本卡"fp8 下 4w≈8w(±2.5%)"**不适用于带 scale 的 mxfp8**:scaled-MFMA 每条要多喂 2 个 scale
+  操作数、A/B frag 各 64 VGPR,4-wave 单 wave 版 vgpr=484(arch+acc),没有第二个 wave 盖自己的等待。
+- ★★ 附带量到的真杠杆:**8-wave 生产核自身还有 12.1%/9.9% 卡在 global-load 路径上**(bang vs base),
+  这是比换几何更值钱的下一步 —— 8-wave 用 4 个半片缓冲做 **k+2** 预取,4-wave 只做了 k+1。
+
+## inline-asm MFMA 写 AGPR → VALU 读:hazard recognizer 看不见,必须自带 wait state
+
+- ★★★ 用 `llvm.inline_asm` + tied `"=a,v,v,0,v,v"` 把累加器钉进 AGPR 时,**编译器不知道 asm 里是 MFMA**,
+  不会在"MFMA 写 AGPR → `v_accvgpr_read` 读同一 AGPR"之间插 s_nop(ISA 要求 **18** 个 wait state)。
+  症状极具迷惑性: 64 个累加器里**恰好 2 个** quad 错(被调度到最后发射的那两条),错法是"最后一次
+  K 迭代的贡献丢失",SNR 仍有 37~45 dB,像 scale 寻址 bug。
+- 定位手法(10 分钟): 单 tile + flat scale(全 127)先排除 scale 寻址 → 只留一个 K 片非零(`--keep-ki`)
+  扫哪一次迭代丢 → 丢的是**尾迭代**就直接看 asm 的 wait state,不用读 ISA 寄存器分配。
+- 修法: 把 wait state 放进 asm 串尾(`s_nop 15` + `s_nop 1` = 18),**只给尾迭代的 MFMA 加**;
+  给每条 MFMA 都加会把矩阵核喂空(每条多 32 拍)。
+- ⚠ `gemm_helper._asm_mma_scale_do` 把 `cbsz:/blgp:` 写在 `op_sel` **之前**,gfx950 汇编器直接
+  `error: not a valid operand.`;该路径生产未用(`asm_mma=False`)所以一直没暴露。正确顺序:
+  `... op_sel:[..] op_sel_hi:[..] cbsz:N blgp:N`,且 0 时建议整个省略。
 
 ---
 来源: 01-architecture.md, gemm-optimization/SKILL.md, lds-optimization/SKILL.md, prefetch-data-load/SKILL.md, kernel-trace-analysis/SKILL.md, programming-model.md, agpr_phase5_lds.md, project_mxfp4_vgprform_deadend.md, diag_4w_vs_8w.md, 09-8wave-ceiling.md, gfx942/overview.md, gfx950/overview.md, flydsl-fp8-gemm-results/SKILL.md, flydsl-kernel-authoring/SKILL.md, gemm/overview.md, project_mxfp4_epilogue_store.md, 03-nn-dgrad-kernel.md, 05-dead-ends.md, 04-ceiling-analysis.md, 10-8wave-scvgpr.md, agpr_phase5_ldsr.md, agpr_phase5_mono.md, agpr_rawasm_progress.md, remote-sync/SKILL.md, 11-upstream-agpr-pin-moot.md

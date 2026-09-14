@@ -224,3 +224,66 @@ N 只能取 `min_pool(该 pool 填充之后发出的 load 数) - 一个 issue gr
    半 N 体只发 3 组,同样推导给出的 4/2 两个值都 racy(见 pitfalls/05)。正确解不是"给它另找一个
    计数",而是**别让那个体少发 g2s**:保留 b1 的 g2s、只删它的 MFMA/store,该体就直接继承满体的
    graded 表,dgrad 组 +0.5pp。
+
+## ★★★★★ 把 GPU `Memory access fault` 归因到 kernel：用 host sync，别用 `AMD_SERIALIZE_KERNEL`
+
+2026-09-12 GLM-5.2 部署崩溃，十几轮 server 换来的方法。
+
+### 第一步：先判断"肇事 kernel ≠ 有 bug 的 kernel"
+
+指纹（看到这一组就别再找 faulting kernel）：
+
+- 故障地址**页对齐**、每 rank 不同
+- **同参数成功几千次、偶发崩一次**
+- 隔离环境换遍形状/并发/内存压力**都复现不出来**
+- 给可疑缓冲区加保护带、把可疑的表初始化掉 —— **都无效**
+
+⇒ 是某个 kernel 往**映射内的别人家缓冲区**越界写（自己不崩），后面读到脏数据的算子才崩。
+**改找越界写，别找崩溃点。**
+
+### 第二步：归因只认 host sync
+
+`AMD_SERIALIZE_KERNEL=3` **实测在 MI355X + flydsl 这套里没生效**（加了它崩溃点反而更靠后，
+墙钟也没变长）。据它得出的"最后一个 launch 就是肇事者"两次把我带偏。
+
+```python
+_run_compiled(fn, *args)
+if not torch.cuda.is_current_stream_capturing():   # capture 期间 sync 非法
+    torch.cuda.synchronize()
+    print(f"[probe] {label} ok", flush=True)
+```
+
+**sync 返回 = 该 kernel 干净退出，是事实不是排序推断。**
+崩溃前最后一条「有发射行、缺配对 `ok`」的才是嫌疑人。一轮就推翻了 SERIALIZE 的结论。
+★ `is_current_stream_capturing()` 判断不能漏：capture 期 sync 会让 server 在 warmup 直接退出。
+
+### 第三步：找越界写用金丝雀，但要知道它抓不到什么
+
+```python
+buf = torch.empty(n + GUARD, ...); buf[n:].fill_(POISON)
+... run ...; torch.cuda.synchronize()
+(buf[n:] != POISON).sum()   # >0 = 这个缓冲区被越界写
+```
+
+- **必须同时打印"检查了几个缓冲区"**。我第一版只挂上 2 个（另外 3 个的分配语句在两条
+  路径里**文本完全相同**，`str.replace(...,1)` 改到了不走的那条），不打计数的话
+  "0 越界"就是假阴性。
+- **只能抓近距离越界**。野值索引（几 MB~GB 量级）会整个跳过尾巴，必须在邻域内散布多块毒值。
+- `PYTORCH_NO_HIP_MEMORY_CACHING=1` 单卡**没用**：hipMalloc 按页对齐，小越界仍在同页内。
+
+### ★★★★★ 「探针没输出」有三种原因，下结论前必须自检
+
+| 表象 | 真因 | 自检 |
+|---|---|---|
+| 插桩 0 条 | 代码路径没走（模型走 `op_*` 分解路径，不是 `forward`） | 在**无条件**位置打安装横幅 |
+| 整块没执行 | env 名撞了框架命名空间（`SGL_` 被 sglang env 注册表当废弃别名吞掉） | 直接查 `/proc/<pid>/environ` |
+| 只有横幅没有 op 行 | 包装了模型**根本不实例化**的类（GLM-5.2 DSA 跑的是 `DeepseekV2*` 不是 `Glm4Moe*`） | 横幅里打包装了几个方法 + 运行时计数 |
+
+**判据写成"计数远大于 0"，不是"没看到报错"。**
+
+### 两条取证纪律
+
+- **取崩溃前尾部一律全量输出**（`awk 'NR>=n-20 && NR<n'`），**不加 grep 过滤** ——
+  我 grep 掉了 `[flydsl-launch]` 行，于是"最后一条是量化 kernel"只是"最后一条没被我滤掉的"。
+- **调试插桩会污染性能测量**：清理前后同树差 **2.8%**，四个桶均匀慢 2-3% 就是 host 开销的指纹
+  （保护带分配、每次 launch 建闭包、env 查询）。**计分前必须全清。**

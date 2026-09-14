@@ -111,3 +111,100 @@
 本地只剩一个 ssh 驱动进程,**真正的 rocprofv3 在容器里**。只枚举本地 PID 和本地 `/proc/*/cmdline`
 (哪怕按 campaign 目录名 grep)**看不到它们** —— 那批孤儿就是这样活了 33 小时,
 并在此期间占着 GPU、让后续所有 profiling 挂死、还让另一场 campaign 报 `all pool GPUs busy`。
+
+---
+
+## ★★ rocprofv3 的 CSV 是**每硬件 block 一行、每行都已是 dispatch 全量**——要取均值,不是求和
+
+踩证(2026-09-11,n02-29 / kyle_attn / gfx950,MXFP4 dense NT campaign):
+用 `rocprofv3 --pmc SQ_WAVE_CYCLES ...` 做 K-differencing 解每-tile 固定成本,
+第一版 parser 按"同一个 dispatch 的多行 = 分片,累加"来聚合,解出来的数**大 ~112 倍**,
+而且固定项出现**负值**(物理上不可能)。原因:这台机器上 rocprofv3 给一次 dispatch 吐
+**每个硬件 block 一行**(SE/CU 分组),而**每一行携带的已经是整个 dispatch 的聚合值**,
+不是该 block 的分片。求和 = 把同一个数乘以行数。
+
+⇒ 聚合规则:**按 `Kernel_Name` + dispatch 过滤后取行的算术均值**。
+⇒ 自校验的办法(强烈推荐,比事后怀疑便宜):在同一次解算里放一个**你解析上已知答案的
+counter**。这里用 `SQ_INSTS_MFMA`——它只随 k-block 数变、每-tile 固定项**必须为 0**。
+均值口径下解出 FIXED = 0.0、PER-PHASE = 512(与 emit 的 128 cell × 4 完全对上),
+求和口径下则是一堆脏数。**没有这种"已知零"的探针就不要相信 PMC 解出来的分解。**
+
+### 配套方法:K-differencing 解"每-tile 固定成本 vs 每-k-block 边际成本"
+
+固定 M、N(从而**固定 tile 数**),只改 K,跑两个 KI 值,解
+`C = tiles * (F + KI * P)`。因为 tile 数不变,`F` 就是每-tile 的一次性成本
+(prologue + head + peel + 该 tile 的 dispatch 摊销),`P` 是每个 k-block 的边际成本。
+比"扫 grid 大小"干净,因为不动 tile 数就不动 XCD 分布和尾波形状。
+
+### gfx950 上能用的 SQ 等待类 counter 只有三个
+
+`SQ_WAIT_ANY` / `SQ_WAIT_INST_ANY` / `SQ_WAIT_INST_LDS`(外加 `SQ_ACTIVE_INST_*`、
+`SQ_BUSY_CYCLES`、`SQ_WAVE_CYCLES`、`SQ_INSTS_*`)。`SQ_LEVEL_WAVES` **恒读 0**,别拿它算
+occupancy。想区分"等 barrier/waitcnt" vs "等发射槽",只能靠
+`SQ_WAIT_ANY`(含 waitcnt/barrier)与 `SQ_WAIT_INST_ANY`(等指令发射)两者相减去推。
+
+## ★ 补充(2026-09-11):rocprofv3 `--kernel-trace` 在**单 GPU 的 MoE stage2 driver 上一样挂死**
+
+原卡把"rocprofv3 挂死"记在**4-rank 跨 rank 自旋** workload 上。本轮把 GEMM2 单独摘出来、
+只用一张卡、只开 `--kernel-trace`(最轻的模式),仍然:
+12 s 后打印 `rocprofv3 caught signal 6`,然后**不退出**;`timeout 600` 发的 SIGTERM 被无视,
+22 min 后进程仍 100% CPU。只能按 PID 手工 kill(本次 4 个:驱动 python、rocprofv3、两个子进程)。
+
+⇒ 结论要扩大:**这台机器上 rocprofv3 对 flydsl/aiter 的 MoE kernel 就是不可用**,
+与 rank 数、与是否有跨 rank 自旋无关。替代:torch profiler(探针 `--profile N`)或
+`probe_isa.py` 从 flydsl runtime cache 的 code object metadata 读静态资源。
+⚠ 另外:排队时 `rocm-smi` 看到 GPU3 100% 是**别的租户**的 —— 别把它当自己的信号。
+
+### ⚠ rocprofv3 挂死是**会话级**的,不是装坏了 —— 先查占用再放弃 (GLM-5.2 EP4 r1)
+
+`rocprofv3 --kernel-trace --stats --output-format csv -d DIR -o NAME -- python app.py`
+在容器 `kyle_sglang` (smci355-ccs-aus-n02-29) 里 99% CPU 自旋、GPU 全程 idle、
+>6 min 无任何输出文件。换 graph-free 驱动一样挂,换成 trivial 的 `a @ a` bf16 matmul 也挂
+⇒ 当时判断成"这个容器里 rocprofv3 整体不可用"。
+
+**这个判断是错的。** 同一个容器、同一个 rocprofv3 1.1.0
+(`git_revision fc0010cf`),**同一天 14:27–14:28 另一场 sparse-MLA campaign 正常产出了
+`/tmp/smla/pmc/r_counter_collection.csv` 等真实 counter 数据**;只有 16:2x 我那几次调用挂住。
+
+⇒ 根因是**会话/占用级**而非安装级。PMC counter 采集要求对硬件计数器的独占访问,
+同容器里只要还有一个活着或残留的 rocprof 会话(或邻居在同一张卡上采集),
+新会话就会静默地无限等锁 —— 表现完全是"自旋无输出",没有任何报错提示你去找锁。
+
+**进容器要 profile 时的正确顺序**:
+1. 先 `ps -eo pid,etime,args | grep "[r]ocprof"` 查残留会话,有就按 pid 清掉
+   (用 bracket trick,`pkill -f rocprof` 会连自己的 wrapper 一起杀,见 `pitfalls/02`)。
+2. 确认自己被指派的卡上没有别人在采集(本机 2/3/6/7 是别人的)。
+3. 拿 trivial matmul 试一次,10 s 内没输出就回到第 1 步,别在真 workload 上耗 10 分钟。
+4. 真拿不到再退到下面的替代方案 —— **但不要把"我这次挂了"记成"这台机器不能 profile"**。
+
+替代方案(GLM-5.2 EP4 r1 实际用的,PMC 缺位时仍足够定位):
+- 逐 kernel GPU 时间:`torch.profiler` + `ProfilerActivity.CUDA`,按 kernel name 聚合
+  (注意 `methodology/03` 的"同名多形状必须求和不能取中位数")。
+- 带宽/固定开销拆账:`methodology/03` 的 `t = F + n·P` 拟合 —— 本轮用 7 个 token 档
+  拟合 `us = 21.49 + 3.1122×sort_blocks`,截距 21.49 µs 独立复现了 profiler 的
+  22.63 µs aux 合计,两路互证后才敢用。
+进容器第一件事先拿 trivial matmul 试一次 rocprofv3,别在真 workload 上耗 10 分钟才发现是环境坏的。
+
+### ★★ kernel trace 的**时长**不是该 kernel 的**边际代价**——要定价"少一次 dispatch 值多少",用重复启动法
+(2026-09-11 GLM-5.2 EP4 r5 实测,gfx950/MI355X,CUDA graph replay)
+
+上一条那个 `t = F + n·P` 的截距 21.49 µs,本轮拆到了 kernel 级:b64 的 6 个核里 4 个小核
+(p0v2 4.56 / p23 4.87 / quant1 6.35 / quant2 5.47 µs)合计 21.3 µs,**与截距逐位对上**。
+但这 4.5-6 µs **不是工作量**:
+- p0v2 的 T 从 576 翻到 1152(b64→b128),时长 4.56→4.72 µs,**翻倍工作量 +3.5%**;
+- 把它的 grid 从 258 降到 65、把 mesh 的 store→load HBM 往返删掉、把串行化 topk_ids 的
+  mask 载入移出关键路径,**三次改动对时长的影响都是 0±0.1 µs**;
+- 用字节数反推 quant 核:`t ≈ 4.9 µs + bytes/4.5 TBps`(quant1 10.5 MB/6.35 µs vs
+  quant2 3.6 MB/5.47 µs 两点定出来的),即**约 4.9 µs 与字节数无关**。
+
+⚠ **但"时长 4.5 µs"≠"删掉它能省 4.5 µs"**。定价要用**重复启动法**:把 p0v2 原地多启动一次
+(3 行 dispatch 改动),b64 189.2→191.7 µs、b128 223.3→225.9 µs ⇒ **一次 kernel 边界的边际
+代价 = 2.5 µs**,只有 rocprof 报出的时长的 ~55%。差额是 dispatch/drain 与相邻核重叠的部分,
+rocprof 把它算进了时长里。⇒ 任何"合并 kernel 省一个核的时间"的估算,**先用重复启动法拿到边际
+价,再决定要不要动手**;按 rocprof 时长估会把收益高估约 2 倍。
+
+配套负结果(同轮,值得记住机制):让 p23 在 LDS 里自建 mesh+histogram 从而整核删掉 p0v2,
+**功能正确**(rel_l2 不变)但净亏 —— p23 4.87→10.67 µs。原因是 p23 有 E=258 个 block,
+每个 block 都要重建 E×T 的 mesh 才能独立推出同一份 prefix sum;**这份复制税(5.8 µs)
+超过它省下的 2.5 µs 边界**。⇒ "把生产者核折进消费者核"只在消费者**不需要全局视图**时才划算;
+需要全局 prefix sum 的,复制税按 O(E×T)×blocks 记,先算再写。

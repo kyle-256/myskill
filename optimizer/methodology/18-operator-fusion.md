@@ -80,5 +80,178 @@
 - ⇒ **正确口径永远是 融合-total vs 非融合-total**(§2),单算子 TF 比 plain GEMM 是伪目标。**别立"把 gap 打到 0 / 追 parity"的项**;要立就立"融合-total 净赚多少"。
 - ⚠️ 写 goal 时**禁"天花板/不可达"口径**(用户红线):给"结构上多一趟 HBM 流量 + roofline floor + occ 实测已顶"这三条**根因 + 数据**,而不是"到头了"。
 
+## 10. ★★★ 另一类融合:**换并行轴**去掉 topk 倍冗余(MoE quant+sort,2026-09-11 GLM-5.2 EP4 r6,+1.46%)
+
+前 9 节讲的都是"把相邻算子折进 epilogue"。这一节是**同一个 kernel 内换并行轴**,
+适用签名:**一个 kernel 的两个输出用不同的索引空间寻址**。
+
+- **发现**:`fused_mx_quant_moe_sort_kernel` 按 **sorted row** 并行,但 stage1 里
+  fp4 payload 写在 `token_id` 偏移、只有 e8m0 scale 写在 `sorted_row` 偏移
+  ⇒ 一个 token 路由到 topk 个专家就被**重量化 topk 次、把同一份 payload 重写 topk 次**。
+  GLM-5.2 EP4 b64:64 token 展开成 1760 行 = **27× 冗余**(10.8M 次转换 + 5.4 MB 重复 store,
+  真实需求 393K 次 + 196 KB)。判据:读 kernel 时**逐个输出看它的地址用哪个索引**,
+  两个索引空间不同就一定有冗余或一定有 gather。
+- **⚠ 先别高兴:把冗余算掉本身可能一分不值。** token-major 重写第一版 rocprof
+  **7.12 → 7.12 µs,一模一样**;bench 反而 −0.5%。因为这个 kernel 从来不是 work-bound。
+  拆开定价(把子阶段逐个置零、只读时间,`rel_l2` 变 NaN 无所谓)b64:
+  | 子阶段 | 代价 |
+  |---|---|
+  | 纯量化(冗余已消) | **比基线快 3.38 µs** ← 真实收益在这 |
+  | 扫 `sorted_ids` 找本 token 的行 | +1.72 µs |
+  | e8m0 byte scatter(swizzle) | +1.92 µs |
+  三项净额 ≈ 0。**"消冗余"只是把预算腾出来,新引入的两个阶段会全额吃掉它**;
+  这两项都不是新算法必需的开销,是**实现细节**,必须单独打掉:
+  1. **扫描:动态 `scf.for`(按 `num_valid` 定界)= 每趟一次串行全局 load。**
+     7 趟 ≈ 4 µs。改成**按静态分配长度展开的 dwordx4 扫描 + 钳位尾部索引**
+     (重读几行是幂等的,因为"把 row 写进它的 slot"可重复执行)⇒ 所有 load 一次发射。
+  2. **scatter:每个 slot 一趟、只有 `scale_n_local` 个 lane 活。** 改成
+     `(slot 组, 列)` 二维摊到整个 block(`slots_per_pass = block/scale_n_local` 恒为 4),
+     并把 `rows[]`/`sorted_weights` 的 load **全部提到循环外一次发射**。
+  修完 **7.12 → 4.28 µs**,四个 bucket 全正,配对 A/B **+1.46%**(3/3 同号、零重叠)。
+- **★ 别用"拆成两个 kernel"去消冗余**:同一轮先试了仓库里现成的 HIP split 路径
+  (`per_1x32_mx_quant_hip` + `mxfp4_moe_sort_hip`),**两个核 3.48 + 5.04 = 8.52 µs,
+  比融合的 7.12 还多**,分数只 +0.34%(b8 反而 +2.7 µs)。这台机器上一次 launch 的
+  边际价 ≈ 2.5 µs,而 `mxfp4_moe_sort_hip` 那 5 µs 几乎全是"先读 `sorted_ids` 再按它
+  gather scale byte"的二级依赖链。**融合版把 scale 留在 LDS,直接消掉这条链**——
+  这才是"融合"在这里的真实价值,不是省那趟 HBM。
+- **并行度旋钮的方向可能与直觉相反**:给 token 再切列(`nsplit` 个 block 协作一个 token)
+  能把 grid 从 64 抬到 384,但**每个 block 都要重扫一遍 `sorted_ids`** ⇒ 扫描代价正比于
+  `nsplit`。实测 nsplit ∈ {1,2,3,4,6} 分数 **1.0579 / 1.0571 / 1.0563 / 1.0552 / 1.0521
+  单调**,最优是 **nsplit=1 + block=768**(一个 token 一个 block、量化和扫描各一趟)。
+  ⇒ 凡是"每个 block 都要读一遍某个全局表"的结构,**先算 `grid × 表长`,别只看 CU 占用**。
+- **下一档杠杆(r6 未做,r7 已做见 §11)**:让排序核在 p23 里顺手写一张
+  `inv[token*topk + slot] = sorted_row` 的逆表,扫描退化成 topk 次直读(估省 ~1.7 µs);
+  再往上是把量化折进 p0v2、把 scale scatter 折进 p23,整个 quant1 launch 消失(~4.3 µs)。
+
+## 11. ★★★ 逆表是**共享产物**,不是单个消费者的私器(GLM-5.2 EP4 r7,+1.62%)
+
+§10 末尾那条"写逆表"的预测在 r7 落地了,但**定价口径和受益者都和预测的不一样**——
+两条都是可复用的判据。
+
+- **落法(零改管道)**:`num_valid_ids` 本来就是个多字段元数据张量(`[0]`=padded 行数、
+  `[1]`=token 数)且**已经**同时接到排序核和量化核上。把它**超额分配**成
+  `2 + M*topk`,逆表就藏在两个标量后面,`has_row_inv = numel() >= 2 + M*topk`
+  由消费者自己判定 ⇒ **不动任何函数签名的 5 元组返回契约**。
+  ⇒ 判据:要在两个 kernel 间传一张新表时,**先找现成的元数据张量搭车**,
+  别急着改返回契约(改契约会牵动所有共用该排序入口的模型)。
+- **种 sentinel 不需要新 launch**:p0v2 的 Phase 2 里每个 assignment 恰好被**一个**
+  专家 block 认领(`is_mine`),且它手上的 `flat` 就是 `token*topk+slot`
+  ⇒ 在那儿写 `-1` 就把全表播种完了,一次 store、零额外 kernel;p23 随后覆盖本地专家的项。
+- **顺手把零权重语义搬到生产侧**:p23 写逆表时路由权重**已在寄存器里**,
+  把"权重为 0"编进 payload 的高位(`ROW_INV_ZERO_WEIGHT`)⇒ 消费者再也不用为了
+  判零而 load 一次 `sorted_weights`(那是一条 **row-dependent** 的二级依赖)。
+- **⚠ skill 说 X,实测 Y(定价口径)**:§10 估"省 ~1.7 µs",那是**rocprof duration 口径**。
+  实测 duration **4.28 → 4.18 µs(只降 0.1)**,但 bench **+0.61%**(b64 墙钟 −1.2 µs,
+  3/3 读数零重叠)。同轮 stage2 换法 duration **4.98 → 4.64(降 0.34)**、墙钟却 **−1.9 µs**。
+  ⇒ **这类小核的 duration 几乎不反映它的边际墙钟成本**;缩短**依赖链深度**的改动
+  在 duration 上看不见、在分数上看得见。别用 rocprof duration 给依赖链改动定价,用分数。
+- **★★ 最大的复用点在"另一个消费者"**:逆表原本是为 stage1 的 token-major 核写的,
+  但 **stage2 的量化核(row-major HIP)受益更大**(+0.89% vs +0.61%)。
+  stage2 每个输入行 = 一个 (token, slot),本来"无冗余",所以 r6 判它不必换轴——
+  **但它仍要回答同一个映射问题**,而 HIP 版是按 sorted row 走的:
+  `num_valid_ids[0]` → `sorted_ids[i]` → 输入行 → activation load = **3 级串行依赖**;
+  换成 block 直接认领输入行 + 一次逆表读,**依赖链只剩 1 级且与 activation load 重叠**。
+  ⇒ 判据:**"无冗余"不等于"无收益"**。看一个核该不该改,别只问它算了多少冗余功,
+  要问**它的第一条 load 前面压了几级串行依赖**。
+- **同一张表还能省掉一次重扫**:p0v2 的 Phase 3 原本重扫一遍 `topk_ids` 来数本专家的
+  assignment,而 Phase 2 的 `is_mine` 已经算出了这件事 ⇒ 把计数并进 scatter 那趟
+  (`init=[cnt]` 的循环里带状态),+0.08%(3 读数)。**凡是"第二趟重新推导第一趟已知量"
+  都值得并回去**,即使收益贴着噪声。
+- **⚠ 并行度旋钮:§10 的结论对,但理由要换**。§10 说 nsplit=1 最优是因为
+  "每个 block 都要重扫 `sorted_ids`,扫描代价正比 nsplit"。逆表把扫描消灭后
+  这个理由不存在了,于是 r7 重测:grid 64 → 256(nsplit=4)**duration 只降 ~0.2 µs、
+  分数落在噪声内**,已回退。⇒ 这些核**不是 CU 饥饿,是 launch/延迟主导**;
+  结论仍是 nsplit=1,但今后别再用"扫描成本"当理由。
+- **下一档杠杆**:把量化折进 p0v2 + scale scatter 折进 p23,使 quant1 的 launch 整体消失。
+  按本轮实测的边际价(单个小核墙钟 ≈ 1.2–1.9 µs)定价 ≈ +1%。
+  已知两处待解:(a) `P0V2_BLOCK=512` 不整除 `6144/8=768`,需要 2 block/token 的掩码分工;
+  (b) b64 时 p23 的 mesh 扫描只有 ~16/512 线程活,byte scatter 前要先把
+  (row, token) 对经 LDS 摊到整个 block。
+  → **r8 实测该预测为负,见 §12。**
+
 ---
-来源: project_gptoss_fused_mlp_delta0_campaign.md, project_fused_mlp_padnk_campaign.md, project_fused_mlp_epilogue_5pct_ceiling.md, project_swiglu_epilogue_dword_merge_idea.md, project_attn_a16_port_to_on_main.md, project_gptoss_wgrad_deepk_nb8_collapse.md, 07-epilogue-addressing-transpose.md
+
+## 12) ❌ 实测负:把 stage1 量化折进 p0v2 + scale scatter 折进 p23(GLM-5.2 EP4, r8)
+
+§11 结尾预测 +1%,**实测 −0.57%**(最好变体 1.07050,baseline 均值 1.07613,7 读数)。
+已完整实现并过了正确性门禁(逐 bucket `rel_l2` 0.00028–0.00084,与 baseline 同档)。
+两半的定价差了一个数量级,这才是这张卡的价值:
+
+- **载荷量化折进 p0v2 ≈ 免费**。p0v2 本来就以 `E=257` 个 block × 512 线程启动,
+  而 `M×cols/8` 个 chunk(b64: 49152)只要 96 个 block 就装下 ⇒ 用**扁平 chunk 号
+  `g = bid*512 + tid`** 直接铺,`512 % 4 == 0 且 768 % 4 == 0` 保证 MX 组不跨 block,
+  **不需要 §11 说的"2 block/token 掩码分工"**。把 load 放在 Phase-1 clear 的 barrier 之后、
+  Phase-2 scatter 之前消费,延迟被 mesh 扫描盖住:p0v2 duration 仅 **4.47 → 4.98 µs**,
+  却顶掉了 quant1 的 786 KB 读 + 393 KB 写。
+- **swizzled scale scatter 折进 p23 是全部的亏损**:p23 **4.18 → 6.71~6.90 µs(+2.5~2.7)**,
+  抵掉了省下的整个 quant1 launch。三种线程映射都试了,结论一致:
+  | p23 scatter 映射 | score |
+  |---|---|
+  | 1 线程 = 1 行 × 48 列(12 次 load + 48 次 byte store) | **1.07050** |
+  | 同上但 E8M0 先整表进 LDS(把 HBM 往返挪到 sort 之前) | 1.06959 |
+  | 1 wave = 1 条 64 B swizzle line(row 在 lane 内变化,全线合并) | 1.05785 |
+  ⇒ (a) **LDS 预存没用** ⇒ 这 2.5 µs **不是 HBM 往返延迟**,是 byte-scatter 本身;
+  (b) **合并写更慢** ⇒ 这些核**由动态循环的 trip count 主导,不由 transaction 数主导**:
+  line-major 让 shared expert 走 24 趟依赖循环,反而比 1 趟 × 48 条散 store 慢 1.3%。
+  判据:**给 512 线程的小核排布工作时,先把 trip count 压到 1,再谈合并。**
+- **为什么 scatter 搬到哪都要 ~2.5 µs**:EP4 下 b64 只有 ~208 个真实 sorted row,
+  但它们散在 65 个本地专家里(shared 专家独占 64 行连续,其余 64 个专家各 2–3 行)。
+  一条 64 B 的 swizzle line = **32 个连续 sorted row × 2 列**,routed 专家每条 line 只填得进
+  2–3 个字节 ⇒ **稀疏度是结构性的,换 kernel 换映射都消不掉**。
+- **⚠⚠ rocprof duration 在这一轮是直接误导的**,不只是"测不出来":
+  baseline eager 合计 190.9 µs vs 折叠后 186.9 µs(**duration 说省了 4.0 µs**),
+  同一棵树的 graph 分数却是 **182.41 → 182.65 µs(慢了)**。
+  §11 那条"别用 duration 给依赖链改动定价"要升级成:**小核的 duration 连符号都不保证**。
+  本轮所有结论都只用 4-bucket score 定的。
+
+**下一档(未试,按本轮数据的优先级)**:
+1. 只折载荷、scale scatter 留在独立核(改成读 p0v2 发布的 token-major E8M0,不再重读
+   activation):p0v2 那半已证明近乎免费,quant1 的 1.2 MB 收缩到 52 KB。
+   但注意 quant1 的 4 µs 里带宽只占 0.19 µs,**它是 launch/延迟主导**,估价只有 +0.3%。
+2. 把 scatter 的稀疏度打掉:让 p23 的 **zero-fill block**(`k4_grid = E + n_zero`,
+   b64 时有几百个闲 block)也参与 scatter。难点是它们不知道 row→token,
+   需要 p23 的 sort block 先把逆表落 HBM,而两者之间没有 grid 同步。
+
+---
+来源: project_gptoss_fused_mlp_delta0_campaign.md, project_fused_mlp_padnk_campaign.md, project_fused_mlp_epilogue_5pct_ceiling.md, project_swiglu_epilogue_dword_merge_idea.md, project_attn_a16_port_to_on_main.md, project_gptoss_wgrad_deepk_nb8_collapse.md, 07-epilogue-addressing-transpose.md, campaign 20260911_155754 r6/r7
+
+## 10. ★★ 另一种融合:合并**小核**(省的是 launch,不是 HBM 往返)
+
+前面几节讲的都是"把 elementwise 折进 GEMM 的 epilogue,省中间张量的 HBM 往返"。
+还有一类完全不同的融合:**把两个相邻的小核(元数据/排序/计数类)合成一个**,
+省的是 **launch + 关键路径上的那段固定延迟**。判据和上面那套完全不同:
+
+- **先定价,再动手。定价方法 = 把那个核再启动一次(必须幂等)**,量 wall 的增量。
+  这比 rocprof duration 靠谱得多:MoE 排序的 p0v2 duration 4.87us,但重复启动只加
+  **2.29us**(b64)⇒ 有一半 duration 本来就被前后核重叠吃掉,**真正能回收的是 2.3us**。
+  如果这个数低于你打算付出的复杂度,直接不做。
+  ⚠️ 挑一个**天然对照桶**:本例 b8/b16 走的是 oneshot 路径、根本没有 p0v2,
+  重复启动后这两桶一格不动 ⇒ 证明测到的就是那个核,不是漂移。
+- **别指望"把核内的活砍短"能赚**。同批减法探针实测:mesh 清零、sentinel 填充置零
+  **各 +0.03%(噪声内)**。几百个 block × 512 线程的元数据核是**固定延迟主导**,
+  只有整核消失才有钱。
+- **合核的数据结构不要照搬"单核 oneshot"的做法**。把 `E × T` 的 mesh 整个搬进 LDS
+  会在 T 一大就爆(258×2048 = 528 KB/block),这是历史上合核失败的直接原因。
+  正解:每个 block 只保留**全 E 的直方图**(E 个 i32 计数器)+ **自己那一行** mesh(T 字节),
+  前者用 LDS 原子 `ds_add` 构建(T*topk 次原子摊到一个 block 的 512 线程上 ≈ 免费)。
+  FlyDSL 写法:`llvm.atomicrmw(llvm.AtomicBinOp.add,
+  fx.to_llvm_ptr(lds_ptr + fx.Int64(idx)), val, llvm.AtomicOrdering.monotonic,
+  syncscope="workgroup")`;**不取返回值**,会降成无返回的 `ds_add`,不 stall。
+  需要按字节写而 LDS 数组是 i32 时,若**每个字节只有一个写者**,用 `ds_or` 把字节
+  OR 进清零过的 word,可以逐位复现原来的 uint8 布局(输出不变 ⇒ 下游 SNR 不变)。
+- **★ 合核会把"跨核天然有序"降级成"核内竞态"**。原来靠 kernel A → kernel B 的隐式屏障
+  保证的"A 播种默认值、B 覆盖真值",合进一个核后 `gpu.barrier()` **未必对 global store 排序**。
+  别赌屏障语义,**改成让两段写的地址集合不相交**(本例:只给被 mask 掉的专家写 −1,
+  本地专家的条目全部交给后面的 scatter 写)。
+- **验收**:合核改的是"谁在什么时候写",最容易悄悄改掉**输出顺序**。如果下游有原子累加,
+  顺序一变数值就变(实测另一处 grid 维序交换让 rel_l2 从 0.0003 跳到 0.0017,逼近 0.002 门)。
+  ⇒ 目标应该是**输出逐位相同**,并且用一份纯 Python 参考把**所有 T 分档 × 有无 mask**
+  全对拍一遍 —— 合核往往会顺手暴露旁边那条从没被测过的路径。
+
+### ⚠️ 定价之前,先在依赖链上确认这两个核**相邻**
+
+(2026-09-12 a4w4 r12)定价本身便宜又准:a4w4 那两个 `token_major_quant_sort` 分别值
+**+2.44us**(quant1,b64)和 **+2.20us**(quant2,b64),各自都够一次合并的本。但它们**不相邻** ——
+quant2 的输入就是 stage1 GEMM 的输出,中间隔着整个 gemm1 ⇒ 合并它们等价于 quant↔GEMM 融合,
+不属于"合并小核"这条路(本战役还明令禁止)。唯一合法的相邻对是 (sort, quant1),而 r8 已量出 −0.52%。
+⇒ **"每个核值 2.3us"和"这两个核能合"是两件事**:先画依赖链找出真正相邻的对,再花时间定价。
