@@ -1,6 +1,10 @@
 # Crusoe 集群接入 · spur 调度 · 节点 dockerd 容器 dev box
 
 > 类别: 连接 · 主题标签: crusoe, spur, slurm, docker, dockerd, sbatch, srun, account, rocm-primus, flydsl, venv, ssh, gpt-oss, bench
+> ⚠ **2026-09-15:§3b 推翻了本文的申请命令** —— `--exclusive` 不给 GPU(实测 CPUS=1/GRES=N/A),
+> 必须 `--gpus-per-node=8 -c 236`;`SLURM_JOB_GPUS` 恒为空不可作证据;`/shared_nfs` 只在计算节点挂;
+> 拿到 `gpu:8/node` 也不等于卡是空的(两台里两台都有非 slurm 容器占卡)。**先读 §3b 再照本文其余部分操作。**
+>
 > 状态: 2026-07-20 首次搭建，端到端跑通(容器起 + torch 2.10/8GPU + flydsl 0.2.2 + dq bench 1100TF + turbo csrc build)。2026-07-22 复用保存的 tar `docker load` 直接起(§4b 一条龙,3-4min,免重装 flydsl)再次实测通。✅=已实测。
 > **★怎么找到自己当前的活节点**(节点名每次分配都变,别记死值):
 > ```bash
@@ -410,3 +414,75 @@ sleep infinity
 
 ★ 集群满载时(`sinfo` 里 idle=0)**换 QOS 也没用**,只能排队;先看 `sinfo -h -o '%T %D'` 有没有 idle。
 ★ 一次提 2 个探测 job 挑好节点是可以的,但**挑完立刻 `scancel` 多余的**,别占着共享集群。
+
+---
+
+## ★★★★★ 3b. 2026-09-15 申请节点的正确姿势(以下四条推翻本文旧命令)
+
+### ① `--exclusive` **不给 GPU**,GPU 来自 `--gpus-per-node`
+旧模板里的 `--exclusive -N 1` 实测只拿到 **`CPUS=1` / `GRES=N/A`**(job 138720)。
+这个 spur 调度器把 GPU 当 GRES 管,**必须显式申请**:
+
+```bash
+#SBATCH -A amd-agentx -p amd-spur --qos=amd-agentx-2-qos
+#SBATCH -N 1 --gpus-per-node=8 -c 236 -t 1-00:00:00
+```
+改完(job 138738)拿到 **`CPUS=236` / `GRES=gpu:8/node`**,秒落。
+★ **怎么发现的**:`squeue -o '%.10i %.12u %.8C %.16b'` 看别人的作业 —— 凡是真持有 GPU 的
+都显示 `gpu:8/node`,我的那行是 `N/A`。**照抄集群上跑得好的人的资源列,比读文档快。**
+
+### ② ★★★ `SLURM_JOB_GPUS` 在这个集群**恒为空**,不能当证据
+即使 `squeue` 明确显示 `gpu:8/node`,作业内部 `echo $SLURM_JOB_GPUS` 仍是空。
+我曾拿它为空推断"没拿到 GPU" —— **结论碰巧对(当时确实没申请),但推理是错的**,
+差点据此做错下一步。**判据只认 `squeue` 的 `%C`(CPU)和 `%b`(GRES)两列。**
+
+### ③ 调度器工具链的实际形状(省得再试错)
+* **`scontrol` 不存在**(`which scontrol` 为空)⇒ `scontrol show job` 一行不输出,
+  **别把"没输出"当成"作业没问题"**,我就这么跳过去过一次。
+* `spur queue show ...` / `spur nodes show ...` ❌ —— 这俩子命令**直接映射到 `squeue`/`sinfo`**,
+  不吃 `show`。报错是 `unexpected argument 'show'`。
+* `squeue -q <qos>` ❌ 不支持。要按 QOS 过滤:`squeue -o '%.22q ...' | grep <qos名>`
+  (⚠ 别 `grep QOS`,会命中 `QOSGrpNodeLimit` 那些 pending 行)。
+* `sinfo -n <node> -o '%C %m %G'` 的 GRES/CPU 列在本集群返回 `?`,**节点级看不到**,
+  只能从 job 侧(`squeue %b`)看。
+
+### ④ ★★★★★ `/shared_nfs` 在**计算节点挂着,登录节点没挂**
+在 login 上 `ls /shared_nfs` → `No such file or directory`,我据此写过"整个挂载没了"。
+**错。** `srun --overlap` 进节点后它在:`172.27.255.2:/volumes/b2e6868e...  360T  96% /shared_nfs`。
+⇒ **查任何共享路径必须在计算节点上查**;login 只有 `/home`(10T,91% 满)和 `/it-shared`(1T)。
+这是"在错误的位置做检查,然后把「没看到」当成「不存在」"的又一例。
+
+### ⑤ ★★★★★ 拿到 `gpu:8/node` **也不等于 GPU 是空的**
+本集群普遍存在**脱离 slurm 的 docker 容器占卡**。2026-09-15 连查两台,两台都有:
+
+| 节点 | 占卡的容器(非我方) | 实况 |
+|---|---|---|
+| `crsuse2-m2m-252` | `e3sg`(跑 `/nfs/dt/bench_dm_g4_ds.sh`,已 1.5h) | 8 卡 **GFX 100%**、518-939 W |
+| `crsuse2-m2m-098` | `glm52-sglang-v0.5.17-rocm700-mi35x` | 每卡占 **99.7/288 GB**,GFX 7-13%(加载着模型闲置) |
+
+`squeue -w <node>` 都只显示我一个作业 ⇒ **不是 slurm 重复分配,是容器绕过了调度器**。
+⇒ **拿到节点后必须实测 `amd-smi monitor`**,别信调度器说的"独占"。
+⇒ 判归属:`docker top <容器> -eo user,pid,etime,args`,把 `amd-smi process` 报的 PID
+和容器内进程的 ELAPSED 对起来(host `/proc/<pid>` 看不到,它们在容器 PID namespace 里)。
+**不是 `kyle_*` 的容器一律不动。**
+
+### ⑥ 拿到节点先跑的四项自检
+```bash
+srun --overlap --jobid=$J bash -c '
+  which docker                                    # 046 那台没有 docker,踩到就换
+  for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do cat $f; done | sort | uniq -c
+                                                  # 必须全是 auto;045 那台被 perf_determinism 锁 1700MHz,低 21% 且改不了
+  amd-smi monitor | head -10                      # 卡是不是真空(见 ⑤)
+  df -h /mnt/m2m_nobackup /shared_nfs'            # 本地 nvme 28T 是干活的地方,/ 只有 123G
+```
+
+### ⑦ QOS 配额(2026-09-15 实测,GrpTRES node 上限)
+| QOS | node 上限 | 备注 |
+|---|---|---|
+| `amd-agentx-2-qos` | **3** | 我们在 `amd-agentx` 账号下能用的;当日被别人占 2,剩 1 |
+| `amd-primus-qos` | 4 | 当日在用 7(超配/含 pending) |
+| `amd-burst-qos` | 182 | priority **100**(其它 10000)、`PreemptMode=cancel` **不 requeue** |
+| `amd-primus-cicd-qos` | 11 | ★用户令**不要占用** |
+★ `amd-agentx-1/3/4-qos` 绑的是别的 account,我们用不了(报 `not permitted`)。
+★ **分区时限上限 1 天**,顶格 `-t 1-00:00:00`,到期要重交。
+★ 名额满时改 QOS 要先 `scancel` 再交 —— 先交新的会卡 `QOSGrpNodeLimit`(3 个名额都占着)。

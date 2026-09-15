@@ -7,7 +7,10 @@
 > **基本要求 = 代码简洁 + 最大化复用。** 下面是硬门禁,写完/评审时逐条核;细节展开见本卡后续小节与 pitfalls/10。
 
 **1. 简洁(dead code / 冗余 = 打回)**
-- 无死代码:未用的变量 / 函数 / import / 分支 / env 旋钮全删。ruff 抓不到未用函数,自己 `rg '<name>\b'` 全仓搜,**0 命中即删**。
+- 无死代码:未用的变量 / 函数 / import / 分支 / env 旋钮全删。★**「被引用」不等于「有用」**:
+  campaign 交付里常混着从没单独定过价的搭车机制,`rg` 查得到引用但关掉它分数不动。
+  判据见 methodology/16 §收官第四层(逐组件消融:代价 < BASE-to-BASE 漂移 ⇒ 删)。
+ruff 抓不到未用函数,自己 `rg '<name>\b'` 全仓搜,**0 命中即删**。
 - ⚠**flydsl kernel 里 ruff F841「local var assigned but never used」是假阳性,绝不能照删**:被 `@flyc.kernel`/`@flyc.jit` traced 闭包在 trace 时消费的变量(load 索引、tile 常数如 `ROWS_PER_BATCH_LOAD`/`load_col_base`)ruff 看不到 → 删了立刻 F821 undefined 弄坏内核(踩过,dkdv review)。删任何"未用"变量前必 `rg '<name>\b' <file>` 确认闭包内也 0 命中;拿不准就编译验证。同名变量常在 dq/dkdv/odo 多个 builder 里各有一份,盲删会连坏多核。
 - 无冗余:能一行别写三行;有等价现成写法就别重写;删掉实验路径 / 探针 / 注释掉的旧代码。
 - 生产旋钮 hardcode 成生产值,删所有 `PT_*` 实验 env 与调试变体。

@@ -114,3 +114,22 @@
 
 ★ **在负载中采功耗**:`amd-smi metric -p --csv | tail -1 | cut` 返回空,`amd-smi metric -p | grep SOCKET_POWER` 可用。
 python 线程采样器也没用 —— 一次 amd-smi 调用比一个 40 次迭代的窗口还慢 ⇒ 从 shell 对着一个跑 ~20 s 的 `spin.py` 采。
+
+## ★★★★ 远端 `git checkout --` 恢复到的是**远端** HEAD,不是你本地 HEAD(2026-09-14)
+
+在远端跑探针时习惯用 `sed -i` 改文件、跑完 `git checkout -- <file>` 还原。
+**远端那棵树的 git HEAD 长期落后本地**(本例落后 4 个 commit,因为我一直是
+「推文件」而不是「推 commit」)⇒ 这句还原把文件**静默退回到几个 commit 之前**,
+md5 从 `899e3df39b2e` 变成 `78bd5fb6311e`,而 `git status` 显示 clean、看不出任何异常。
+下一次 bench 于是在错误的代码上跑。
+
+⇒ **还原一律用「重推本地文件 + 比对 md5」,不要用远端 git**:
+
+```bash
+gzip -c <file> | base64 -w0 > /tmp/k.b64      # 本地
+# 分片 scp/ssh 过去,远端 base64 -d | gunzip > <file>
+md5sum <file> | cut -c1-12                     # 两边必须一致,每次都比
+```
+
+与 methodology/16 §local-first 同源:**本地是唯一权威,远端全是临时的**。
+远端的 git 只是碰巧存在,**不是你的版本控制**。

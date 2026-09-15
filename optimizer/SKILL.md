@@ -44,6 +44,12 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | **store/LDS-bound** 想减 store | 00-decision-index §B → pitfalls/03,05 |
 | **quant/scale** 慢 | 00-decision-index §C → methodology/11,12 → pitfalls/05 |
 | **测量数字不可信 / DVFS 漂移** | pitfalls/02 → methodology/01 |
+| ★★★**目标是「超过 X」,而 X 是别人给的一组常数**(csv/表格/上一任留下的 REFERENCE) | **★methodology/20 —— 先花一次 run 把 X 在本机量出来再调 kernel**;踩证:为一个 1.1% 的「缺口」连关六条轴全净负,量完分母发现对手自己在本机一行都跑不到那列常数(低 1.0~3.4%),头对头实测其实 12/12 全超 |
+| ★★**配对 A/B 里两臂的 autotune 候选数不同**(例:定价「放开候选表」时用删候选当对照) | **pitfalls/02 §第二类偏置** —— 只改调优开销就能造出 −0.14%;对照必须**加一个与赢家重复的候选**而不是删候选 |
+| ★★**今天的读数能不能信 / 要不要继续做微调** | **pitfalls/02 §尺子地板会漂** —— 空机 A-vs-A −0.009%,有邻居时 −0.098%(单行 −0.9%)⇒ <0.3% 的效应当天不可分辨;每轮都要当天重标 |
+| ★★★**自写 A/B 探针读出好得离谱的数**(几十 %) | **pitfalls/02 §A-vs-A** —— 先把基线当候选跑一遍,读数必须 ≈0;踩证:两臂清缓存次数不对称造出 +54% 假象,加校准后全部反号 |
+| ★★**改一个全局常量,只在目标形状上看到收益** | **pitfalls/02 §全局常量** —— 全局量必须全表定价,无例外(两次踩:mid_sync、TPW_MAX) |
+| ★★**想对标对手 ISA 的某个统计量**(barrier 数/指令数/LDS) | **methodology/03 §FlyDSL ISA dump** —— 先量自己的那个量;踩证:我们 barrier 已是 6、对手才 4,原计划「照抄对手密度」方向正好反了 |
 | ★**周期口径的杠杆全排完了,kernel 还是慢** | **methodology/03 §Power/clock-bound** —— 换能量坐标系;MFMA 原子选择是能量杠杆(单轮 +9.17%),且 `SQ_VALU_MFMA_BUSY_CYCLES` 看不见它 |
 | ★**TF/s 读数低得离谱,尤其只有对手的一半** | **pitfalls/02 §逐次 synchronize** —— 先确认不是把**主机入队时间**算进了 GPU 窗口(踩证:650 vs 真值 1150) |
 | **build 失败 / 同步出错 / undefined symbol** | pitfalls/08 → connection/common/04 |
@@ -52,6 +58,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | **attention(dsv4)** 优化 | pitfalls/12(必读)→ 00-decision-index §D |
 | **autotune/dispatch/MoE 变长** | pitfalls/06 → methodology/13 |
 | 想把 **activation/SwiGLU 融进 GEMM**(fused epilogue)/ 融合核比 plain GEMM 慢想追 parity | **methodology/18**(融合口径 total-vs-total + gated 的 pitch-vs-real + 部署测量)|
+| ★**交付写完了,但说不清每块代码值多少** / 有人问「这么多行都必须吗」 | **methodology/16 §收官第四层** —— 逐组件消融定价;验收标准=**关掉它的代价 < BASE-to-BASE 漂移 ⇒ 删** |
 | 要**跑/盯/救一场 campaign**(起不来、卡住、要 resume、数对不上) | **methodology/16(整卡读)** |
 | 想在**真实 e2e 训练**里验证某 kernel 有没有真跑(别加 print) | **methodology/17**(开 profiler 看 trace)|
 | e2e 跑不起来 / 报 `primus_turbo is not importable` / 卡住不动分不清是编译还是死锁 / 找不到某开关 | **methodology/17 §变体 E** —— 开关可能在**未合入分支**(`git log --all -S`);「不可导入」真因常是 **flydsl 版本**(0.1.1.dev409 无 `expr.typing.Vector`);★★★**编译 vs 死锁判据 = JIT 缓存 2min 新增数 + 8 个 rank 栈顶是否各不相同**,别看 GPU util |
@@ -108,6 +115,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [16-campaign-harness](methodology/16-campaign-harness.md) — **跑自动优化 campaign 必读**:起(launcher 模板/环境红线)、bench 契约(★必须 mirror 部署配置)、盯盘(★轮内唯一活信号=kernel 文件 mtime)、停/续(工作区必须干净)、★坑清单(pgrep 自杀·孤儿 agent 改文件·effort=max 反而超时零产出·换机必重测 base/best·收官 squash 挑错 base+commit 游离·并发 pool 重叠致分数腰斩)、验收(不打扰在跑 campaign 的隔离复测法;★★★★**收官验收面必须大于计分面**=计分面+部署全表按占比加权+兄弟模型三层,本例计分面只占部署时间 39.2%、14% 的回退只在兄弟模型层暴露)
 - [17-e2e-kernel-trace-validation](methodology/17-e2e-kernel-trace-validation.md) — **e2e 训练里验证某 kernel 有没有真跑 = 开 torch profiler 看 trace,别加 print**(print 探针可能在死路);Primus mock 冒烟 + profiler 步骤、trace 落地目录(被 patch 改写)、gzip+json 解析(glob `rank[0]` 字符类坑)、kernel 名→后端对照表、K-pad 铁证(pad-quant kernel 只可能来自 syncv3);MoE 走 ragged 派发不经 PrimusTurboGroupedLinear/公共 grouped_gemm_fp8
 - [19-deployment-step-scoring](methodology/19-deployment-step-scoring.md) — **★★★拿真实部署的一步当分数**:热/冷尺子(同 kernel 30.7us vs 45.1us,排序翻转)、部署权重(56 形状均摊 +10% 而加权 −1%)、被抢时**取最小**(2 次取中位曾把基线记高 15%)、GLM-5.2 四个 decode GEMM 形状与调用数、`trace_step` vs `profile_decode` 的区别、四个运行期坑(spawn 孤儿/`/dev/shm` 攒死/别的容器孤儿/自杀式 pkill)；★★★**尺子必须走部署真正走的那条 kernel**——一个没传的 `num_cu` 让 20 轮 campaign 每一轮的「赢」在真路径上都是「输」(bench −5.2% vs 真训练 −0.84%)；拿真训练当 bench 的四个实现坑(步时间只能从 profiler trace 拿/冷缓存 autotune 落进 profile 窗口给出 2423ms 假值/loss 抖 3.2% 不能当紧门/ProfilerStep 每步发两次)
+- [20-verify-the-denominator](methodology/20-verify-the-denominator.md) — **★★★★★对标类目标:先验分母,再调 kernel**。分母是别人给的常数时,先用**对手自己的 API + 对手自己的调用约定 + 你这套 harness** 量一遍;四个必须动作(①按对手的预处理契约 ②确认它走的是快路不是 fallback ③同进程 ABBA ④每行带 A-vs-A 校准);何时该怀疑分母(缺口极稳 + 全表等幅 + 所有参数轴推不动)
 - [99-misc](methodology/99-misc.md) — 其它零散事实
 
 ---

@@ -78,3 +78,68 @@ CLUSTER_NOP/COMPUTE_BARRIER/P_ANCHOR),而那个 campaign 在 r5 就中止、这�
 
 ---
 来源: pr-merge-gate/SKILL.md, gpu-fleet-tuning/SKILL.md, 14-fused-preshuffle-e2e.md, format-code/SKILL.md, 13-primus-turbo-prod.md, 12-llama-aiter-baseline.md, remote-sync/SKILL.md
+
+## ★★★★★ 编译缓存 key 漏一维 = 两个 build 撞车,静默算错(2026-09-14)
+
+给 MXFP4 GEMM 加了 `scales_prepacked`(调用方直接给已打包的 scale,kernel 跳过 preshuffle)。
+两条路的 launch **语义不同**(一条跑 preshuffle,一条不跑),但 tail-split 的缓存键漏了这一维:
+
+```python
+at_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum, scales_prepacked)  # ✓
+sk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, ksplit, out_fp16, scales_prepacked)             # ✓
+tk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, "tail", ksplit, out_fp16, accum)                # ✗ 漏了
+```
+
+后果:调用方在**同一形状**上先用未打包 scale、再用打包 scale,第二次拿回第一次的 build ⇒
+**对已经打好包的 scale 再 `pre_ab` 一遍** ⇒ rel_err 0.654(SNR **3.65 dB**)。
+代码里上一行明明按 `prepacked=` 取到了正确的闭包,下一行又被撞键的旧 entry 覆盖:
+
+```python
+launch = _get_mxfp4_tail_launch(..., prepacked=scales_prepacked)   # 对的
+entry = _MXFP4_AT_CACHE.get(tk_key)                                 # 撞键
+if entry is None: entry = [launch, None]; _MXFP4_AT_CACHE[tk_key] = entry
+raw, compiled = entry                                               # 拿回别人的
+```
+
+### 为什么找了两天
+症状是「打开 split-K 就错」,于是我一路怀疑 split-K 的 scale 寻址,写了一堆探针,
+还因此加了一道「prepacked 强制 ksplit=1」的门(白挡了一条路)。
+**相关性被当成因果**:split-K 只是让 tail build **首次被选中**的开关,不是错误来源。
+
+### 定位它的三个正交探针(可复用)
+1. 同一份 packed slab 喂给不同 ksplit ⇒ 全对(rel_err ≤0.0023)⇒ **split-K 能正确读 packed**
+2. poison workspace 后比对各 mode 写出的 slab ⇒ **逐位相同 0.00%** ⇒ **布局与 mode 无关**
+3. 同一 mode 下「打包路径」对(0.0005)而「prepacked 路径」错(0.6544)⇒ **数据对、读法错**
+
+⇒ 数据对 + 布局对 + 写对 + 读错 ⇒ **只可能是取到了另一个 build**。
+
+### ★★★★★ 让故障自己说出形状
+把正确性门从 3 个采样格**开到全表**,一眼看出坏的是哪两行:
+
+| 行 | M×N tiles | tiles/256CU | SNR |
+|---|---|---|---|
+| QKV_wgrad | 24×16=384 | **1.5** | **3.656 坏** |
+| FC2_wgrad | 16×56=896 | **3.5** | **3.651 坏** |
+| out_proj_wgrad | 16×16=256 | 1.0 | 55.61 好 |
+| FC1_wgrad | 112×16=1792 | 7.0 | 55.61 好 |
+
+**非整数倍 ⇒ 走 tail split** —— 一步把范围从整个 kernel 缩到一个函数。
+⇒ 定位类 bug,**先花一次 run 把正确性门开到全表,比再扫十个参数值值钱**。
+
+### 推论:哪些维该进 key
+| 那一维影响什么 | 判定 |
+|---|---|
+| **build 语义**(跑不跑某个 pass、参数个数、stub 签名) | **必须进 key**,漏了就是正确性 bug |
+| 只影响**调优排名**(swizzle / 流水深度 / launch mode) | **别按「显然该修」推,必须实测** |
+
+同一天的反例:`_MXFP4_CFG_CACHE` / `_MXFP4_KSPLIT_CACHE` 也漏了 `prepacked`,
+看着是同一个 bug,补上后**实测 9/12 → 7/12**(prepacked 对着真臂自己调,反而比蹭
+重排 build 的 config 差 2.4~5.5%,冷卡调优的解释已被实验排除)⇒ **已撤回**。
+
+### 相关:两个 stub 必须签名不同
+同一天另一处:prepacked 与非 prepacked 的 jit stub 如果**签名相同**,
+第二个会被发回第一个的编译产物(preshuffle 还在里面,写坏调用方的 scale)。
+`launch_mxfp4_fused_prepacked` 必须**少掉 `A_raw`/`B_raw` 两个参数**才算两个 stub。
+⇒ 光靠函数体里一个 traced 分支区分不开。
+
+来源: 2026-09-14 `f9d65d32`;见 [[project_mxfp4_llama_gemm_b200_campaign]]

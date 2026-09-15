@@ -761,3 +761,46 @@ sparse-MLA decode producer 上,「多一次 rsum rendezvous」= **+1.0~4.0%**,�
 ★ **本容器的 `rocprofv3` 边界**:`--pmc` 配 `SQ_*`/`GRBM_*` 稳定可用(~13s/次);
 `--kernel-trace` 与 **`TCC_*`/`TCP_*` 计数器组**会把 KFD 卡住
 (`rocminfo did not return within 60s`,重试撞 300s timeout)⇒ L2 命中率只能算不能量。
+
+## ★★★★★ FlyDSL 自家 ISA 怎么 dump(2026-09-14 实证配方)
+
+对标时只有对手的反汇编、没有自己的 ISA,等于单眼看。FlyDSL 的开关:
+
+```bash
+FLYDSL_DUMP_IR=1 \
+FLYDSL_DEBUG_DUMP_ASM=1 \
+FLYDSL_DUMP_DIR=<dir> \
+FLYDSL_RUNTIME_CACHE_DIR=<一个全新的空目录> \      # ★ 关键
+python your_probe.py
+# -> <dir>/launch_<stub>/21_final_isa.s   (还有 20_llvm_ir.ll)
+```
+
+三个坑,每个都让我白跑一次:
+
+1. ★**不换 `FLYDSL_RUNTIME_CACHE_DIR` 就什么都不会生成**:缓存命中 ⇒ 根本不编译 ⇒
+   dump 目录连建都不建,而脚本还是正常跑完打印 "compiled"。
+2. ★**一个 `.s` 里有多个 kernel**。我的分析脚本取第一个 metadata 块,拿到的是
+   **preshuffle 核**(`kern_0`:LDS 0 / vgpr 52 / wg 128),不是 GEMM
+   (`kernel_gemm_4w_1`:LDS 147456 / vgpr 488 + agpr 256 / wg 256)。
+   ⇒ 按 `.amdhsa_kernel <name>` 切段,或按 `group_segment_fixed_size` 最大的那个挑。
+3. ★**热循环用数字标签**:`1:` … `s_cbranch_scc0 1b`。只认 `.LBB` 形式的正则会报
+   「找不到循环」,而文件里明明有 640 条 mfma。
+
+拿到后按类计数(MFMA / ds_read / buffer_load / s_waitcnt / s_barrier / v_ALU / s_ALU),
+和对手并排。本例结果直接改写了方向:
+
+| | 指令 | MFMA | ds_read | buffer_load | waitcnt | barrier | v_ALU | ds_write | LDS |
+|---|---|---|---|---|---|---|---|---|---|
+| 我们 | **381** | 256 | 64(b128) | 36(dwordx4) | 2 | **6** | **0** | **0** | 147456 |
+| AITER f4gemm 256x256 | 456 | 256 | — | — | 4 | **4** | — | — | 163840 |
+
+⇒ ★**我们的循环比对手更紧**(381 vs 456,67% 是 MFMA,v_ALU/ds_write 全为 0),
+对手**多干 75 条指令却更快** ⇒ **差距在停顿,不在指令数**。
+⇒ ★★**我们的 barrier 已经是 6、对手才 4**。我原本的计划是「照抄对手的 4 barrier 密度」,
+**方向正好反了** —— 这也当场解释了为什么把段数往上加(8/10 个 barrier)全表净负:
+**不是同步不够,是早就过头了**。
+
+⇒ 教训:**「对标对手的某个 ISA 统计量」之前,先量自己的那个量**。
+我差点基于一个想当然的方向(我们同步不足)做一整轮实验。
+
+来源: 2026-09-14 MXFP4 dense GEMM 对标;见 methodology/20 · [[project_mxfp4_llama_gemm_b200_campaign]]
