@@ -2,13 +2,13 @@
 name: flydsl-mi355-optimizer
 description: >-
   MI355X (gfx950) 上优化 FlyDSL fp8/mxfp4/mxfp8 GEMM/attention kernel 的知识库：远程连接/选卡/同步、
-  通用优化与 profiling 方法论、以及大量踩过的坑（tile 尺寸、occupancy、测量噪声、LDS/寄存器、race、
+  通用优化与 profiling 方法论、**推理服务端 e2e 对照（sglang/AgentX）**、以及大量踩过的坑（tile 尺寸、occupancy、测量噪声、LDS/寄存器、race、
   autotune、各种死胡同）。methodology/ 与 pitfalls/ 与机器无关、可原样复用；本机环境细节（容器/盘/venv/节点）
   在 connection/。⚠️ 只操作你被指定的容器/盘/venv，共享集群上严禁碰不属于你的容器/盘。章节卡按需打开，别全量加载。
 when_to_use: >-
   优化/调试/benchmark FlyDSL 或 Primus-Turbo 的 GEMM/attention kernel；连接远端 gfx950 节点跑测；
   诊断性能回退、掉点、race、SNR 崩；查"某个方向是不是已经试过且失败了"；写 autotune dispatch；
-  确认 tile/occupancy/LDS 该怎么选。凡是碰 gfx950 FlyDSL kernel 性能/正确性的活都先翻这里。
+  确认 tile/occupancy/LDS 该怎么选；**起 sglang server 做端到端 A/B、判断两臂能不能比、查 decode 一步的时间去向**。凡是碰 gfx950 FlyDSL kernel 性能/正确性的活都先翻这里。
 user-invocable: true
 ---
 
@@ -26,7 +26,8 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 
 - **🅰️ 动手前第一站 = [00-decision-index](00-decision-index.md)**：**准备试某个杠杆前,先在决策索引 grep 你要做的动作**(如 `grep -i "占用率\|maxnreg\|direct\|atomic\|DMA\|scale_pack\|s_setprio"`)。命中 = 别重踩,点进详卡看根因。这一步治的就是「读了 skill 还去重踩坑」——把查阅强制到**决策的那一刻**,而不是靠开头读一遍的记忆。
 - **章节卡结构**：本文件是导航；每张卡是一个主题章节，卡内用 `## 小节` 分隔子话题。按当前任务打开对应卡（Read），别一次性全读。
-- 三个文件夹：`connection/`（怎么连上远端跑）、`methodology/`（怎么优化/debug/看利用率）、`pitfalls/`（踩过的坑——**最重要**，动手前先查）。顶层 `00-decision-index` 是这些卡里所有 ❌ 死路的**动作索引入口**。
+- 三个文件夹：`connection/`（怎么连上远端跑）、`methodology/`（怎么优化/debug/看利用率）、`pitfalls/`（踩过的坑——**最重要**，动手前先查）。
+- **两条线**：kernel 线（GEMM/attention，绝大多数卡）与**推理服务线**（起 server 跑端到端对照）——后者看 **methodology/21（怎么量）+ 22（推理领域知识：一步由什么构成、有哪些杠杆）+ pitfalls/15（harness 的静默错）**，它们和 17（训练 trace）、19（kernel 级部署打分）不是一层。顶层 `00-decision-index` 是这些卡里所有 ❌ 死路的**动作索引入口**。
 - 死胡同用 `❌ 别再试` 标注；卡尾 `来源:` 可回溯；卡间用 `见 <路径>` 或 `[[memory-name]]` 交叉引用。
 - ★ **上界≠可达铁律**(methodology/03):subtractive/HALF 探针、roofline 峰值率、纸面 op-count 给的都是**上界**,不是可达值——判负/判正前必须 edit→bench 真实现(踩证:HALF_PV +8.7% 假想 → 真 K32-PV −11%)。
 - 硬件默认 **gfx950 (MI355X)**；gfx942 (MI300) 仅作跨代对照。
@@ -47,6 +48,13 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 | ★★★**目标是「超过 X」,而 X 是别人给的一组常数**(csv/表格/上一任留下的 REFERENCE) | **★methodology/20 —— 先花一次 run 把 X 在本机量出来再调 kernel**;踩证:为一个 1.1% 的「缺口」连关六条轴全净负,量完分母发现对手自己在本机一行都跑不到那列常数(低 1.0~3.4%),头对头实测其实 12/12 全超 |
 | ★★**配对 A/B 里两臂的 autotune 候选数不同**(例:定价「放开候选表」时用删候选当对照) | **pitfalls/02 §第二类偏置** —— 只改调优开销就能造出 −0.14%;对照必须**加一个与赢家重复的候选**而不是删候选 |
 | ★★**今天的读数能不能信 / 要不要继续做微调** | **pitfalls/02 §尺子地板会漂** —— 空机 A-vs-A −0.009%,有邻居时 −0.098%(单行 −0.9%)⇒ <0.3% 的效应当天不可分辨;每轮都要当天重标 |
+| ★★★**接手推理侧优化，不知道一步 decode 的钱花在哪** | **methodology/22** —— 实测分块（GEMM 21% 可用 / MoE 那行作废 / 其余未验证）、三条固定开销约束、已被定价的杠杆清单（别重新发明） |
+| ★★★**decode 里某个算子 M 很小（GEMV），想提速** | **methodology/22 §小 M 的 GEMV** —— 一眼判据是 `us/launch` 恒定；修法是**行循环挪进 kernel + 权重常驻寄存器**（1.62×），**别先抬块大小**（撞寄存器，净收益被吃掉）|
+| ★★★**要起 sglang server 做端到端 A/B**（推理侧，不是 kernel 侧） | **methodology/21** —— 先确认口径（榜单 TP8/EP1 c1/c2/c4 ≠ 优化目标 TP4/EP4 c8/c10/c14，一眼判据是 verify 行数=6×并发）；再看改动落在 target 侧还是 draft 侧（决定两臂输出会不会分叉） |
+| ★★★**e2e 读数"正常但两臂差不多" / bench rc 非 0 但错误率看着没问题** | **pitfalls/15** —— 七个不报错只给错数的坑与它们的识别指纹；先查 server 进程的 environ 是不是加载了被测树 |
+| ★★**agentic replay 的吞吐能不能用来判去留** | **methodology/21 §噪声底** —— 同一份代码三次读出 129/306/307 tok/s（**2.4 倍**）；吞吐不可用，延迟分位数分辨率 ~3% |
+| ★★★**要让生产者直接吐出消费者的布局**(quant 直出 packed scale 之类) | **methodology/09 §CPU 重放** —— 先确认是纯置换(pack 函数无算术),再在 CPU 上重放 gather、闭式反解、验双射,**最后**才上 GPU |
+| ★★**新加的 store 只写了 1/N 的输出 / 高地址全零** | **pitfalls/07** —— 两条:①`num_records` 用了宿主字面量(不进编译缓存 key,后一个形状复用前一个的 bound;**先大后小的顺序下完全隐身**)②那个「全局行」变量其实是 tile 内相对行(SRD 已 per-tile rebase) |
 | ★★★**自写 A/B 探针读出好得离谱的数**(几十 %) | **pitfalls/02 §A-vs-A** —— 先把基线当候选跑一遍,读数必须 ≈0;踩证:两臂清缓存次数不对称造出 +54% 假象,加校准后全部反号 |
 | ★★**改一个全局常量,只在目标形状上看到收益** | **pitfalls/02 §全局常量** —— 全局量必须全表定价,无例外(两次踩:mid_sync、TPW_MAX) |
 | ★★**想对标对手 ISA 的某个统计量**(barrier 数/指令数/LDS) | **methodology/03 §FlyDSL ISA dump** —— 先量自己的那个量;踩证:我们 barrier 已是 6、对手才 4,原计划「照抄对手密度」方向正好反了 |
@@ -80,6 +88,7 @@ MI355X (gfx950 / CDNA4) 上 FlyDSL fp8/mxfp4/mxfp8 GEMM 内核优化的沉淀。
 - [common/03-docker-disk-crash-guard](connection/common/03-docker-disk-crash-guard.md) — docker 根盘清理、docker save 暂存坑、大 spill 崩容器防护
 - [common/04-build-git-triton](connection/common/04-build-git-triton.md) — 按需 build/清 flydsl cache、git push、triton 版本
 - [common/05-reference-misc](connection/common/05-reference-misc.md) — 权限/硬件表/MFMA 延迟/LDS 规格/ISA dump 等参考
+- [common/06-inference-server-env](connection/common/06-inference-server-env.md) — **推理线专用**：四层链路怎么逐层验、被测树 ≠ server 加载的树、僵尸 rank、队列 worker 在宿主机
 
 ### connection/gpt_oss/ — 本机环境连接卡（容器 / host 盘 / venv 细节，env-specific；换机器时替换本子目录）
 - [gpt_oss/01-container-image-nodes](connection/gpt_oss/01-container-image-nodes.md) — 容器 flag/saved tar/生产节点现状 + 本机边界(哪个容器/盘是你的、相邻环境严禁碰)

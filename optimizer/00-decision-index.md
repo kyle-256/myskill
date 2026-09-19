@@ -17,6 +17,8 @@
 | **直接开始调 kernel 去补一个「vs 对手」的缺口** | ⚠️**先验分母** | 分母若是别人给的常数,很可能在你这台机器上**对手自己也跑不到**。踩证:为 FC1_wgrad 的 1.1% 缺口连关六条轴(split/tail 模式 −2.6~−45.9%、sync 密度 n=3/4 全表 −0.05/−0.19%、vmcnt 水位 22/28 全表 −0.36/−0.10%、autotune 缓存分键 9/12→7/12、MFMA 均衡 barrier ≈0)**全部净负或噪声**;量完分母:对手本机实测 **12 行全部低于冻结列 1.0~3.4%**,头对头其实 **12/12 全超,最小余量 +2.148%** ⇒ **缺口不存在** | **methodology/20** |
 | 自写 A/B 探针,不带 A-vs-A 校准臂 | ❌**别这么干** | 噪声地板/ABBA/重复跑**都抓不到「两臂待遇不对称」**——那是确定性偏置,每次同向。踩证:清编译缓存的次数 plain 臂 2 次、候选臂 1 次 ⇒ 读出 +54%,加校准后候选全变负 | pitfalls/02 §A-vs-A |
 | 只在目标形状上定价一个**全局常量**就采纳 | ❌实测DEAD | 目标行是你挑出来的极端点。踩证两次:`_MXFP4_MID_SYNC` 目标两行 +0.83% 全表 −0.05%;`TPW_MAX` 4 行子集 +0.26% 全表 −1.2% | pitfalls/02 §全局常量 |
+| ★★★★★ 扫"密度 / 条数 / 深度"型常量时**把端点(0 / 整族关掉)留在搜索面外** | ❌**踩证:三轮都没找到一个 +0.52% 的赢** | `_MXFP4_MID_SYNC` 以 1 引入,之后所有定价都在非零区间:1→2(commit 自述"one and three both cost")、n=3/4(−0.050%/−0.191%)、不对称 (2,0)/(0,2)/(1,3)(−0.415%/−0.007%/−0.124%)⇒ 三轮一致记"2 是最优点"。**n=0 从没测过,实测 +0.52%**(A-B-B-A 括号 0.9872/0.9884 → 0.9930/0.9929,12/12 格同号)。根因:一条屏障同时带来「会合开销(随条数单调涨)」与「限制 wave 漂移的收益(0→1 那一步最大)」两个反向效应 ⇒ **响应非单调,"左右邻居都更差"推不出"当前最优"**。判据:任何条数型常量的搜索面必须含 0 | pitfalls/05 §MID_SYNC=0 |
+| ★★★★ 把"删屏障能赚 X%"的探针结论直接换算成**需要加深 ring 才能合法兑现** | ⚠**先按 waitcnt 把屏障分类**:裸屏障什么都不承担,删了就能发 | r47 删 `s_barrier` 27→15 量到 +0.87~0.99%,然后写下"合法路径 = ring 深度 3",又因 LDS 差 32768 B 把杠杆挂起一整轮。**错在假设每条屏障都承担 WAR**:6 条/迭代里 4 条是 `_mid_sync` 插的裸屏障(无 waitcnt),内存序全在相位边界的 `vmcnt/lgkmcnt + s_barrier` 上 ⇒ 可发布的那一半**根本不需要环深 3**。查法:dump ISA,看每条 `s_barrier` 前面有没有 `s_waitcnt`;没有的那些是免费可删候选 | pitfalls/05 §MID_SYNC=0 · 本表 §r47 |
 | 单跑 geomean≈0 就当「无害可留」 | ❌ | 净零常常是「几个稳定亏 + 一堆噪声」。踩证:+0.012% 的改动跑满三次 ⇒ 4 行稳定回退、目标行全变号 | pitfalls/02 §持平也要重复 |
 | 对标对手 ISA 的某个统计量(barrier/指令数/LDS),但没量过自己的 | ❌ | 方向可能正好反。踩证:计划「照抄 AITER 的 4 barrier」,dump 后发现**我们已经是 6**,往上加全表净负 | methodology/03 §ISA dump |
 | 给编译缓存的 key 漏掉一个**影响 build 语义**的维 | ❌正确性 bug | 两个 build 撞键 ⇒ 静默拿回对方的编译产物。踩证:`tk_key` 漏 `scales_prepacked` ⇒ 对已打包的 scale 再 preshuffle 一遍,SNR **3.65 dB**,我对着「split-K 坏了」查了两天 | pitfalls/10 §cache key |
@@ -740,3 +742,41 @@
 - **`lgkmcnt(0)` 全排空条数、`v_pk_mul` 条数都不是货币**:三条臂把排空砍掉 40%、墙钟 ≈0;
   把 `running_acc*alpha` 整段删掉(非法上界探针)producer **反而 +0.2~4.4%**。
   → 指令级立项前先算带宽账:该核已在随机 gather 的 69~72% stream 地板上。
+
+## 推理服务端 e2e A/B（2026-09-18/19，GLM-5.2 TP4/EP4 AgentX 四臂，14 小时里前 9 小时零有效数据）
+
+> 这一节是**推理线**的动作索引，不是 kernel 线。
+> 做法见 [methodology/21-inference-serving-ab](methodology/21-inference-serving-ab.md)（怎么量）
+> 与 [methodology/22-inference-decode-anatomy](methodology/22-inference-decode-anatomy.md)（一步由什么构成、有哪些杠杆），
+> 坑见 [pitfalls/15-e2e-harness-silent-wrong](pitfalls/15-e2e-harness-silent-wrong.md)，
+> 环境搭建见 [connection/common/06-inference-server-env](connection/common/06-inference-server-env.md)。
+
+| 你准备做的动作 | 判定 | 根因 / 代价 |
+|---|---|---|
+| 照抄 `launch_sglang.sh` / `agentx_bench.sh` 的默认值起矩阵 | ❌**实测踩过** | 默认是**榜单口径** `TP=8 EP=1 CONC=1`，不是优化目标 `TP4/EP4 c8/c10/c14`。★一眼判据：**verify 行数 = 6×并发**，48/60/84 才对。我跑了一个点才被拦下 |
+| 用 `throughput/output/tokens_per_second` 当"吞吐"报数 | ❌**实测DEAD，会得到相反结论** | 那是**整机纯输出速率**，不除 GPU 数也不含输入，而该负载**输出只占 token 总量 0.21%**。榜单两轴是 `per_gpu/total_tput_tps`(Y) 与 `latency/intvty/p90`(X)。同一组数据：mxfp4 用错口径 **+6.09%**，真实两轴 **−2.42% / −3.82%** |
+| 把自己测的 per-GPU 吞吐**绝对值**放到公开 Pareto 图上比 | ❌ | 我读 15,678 而图上同点约 11.8k——**不是快，是 hicache 开/关 + fork vs upstream 的口径差**。Y 轴 99.8% 是输入且其中 ~97% 是前缀缓存命中 ⇒ hicache 一项就值三成 |
+| 用 **600s** 窗口测 agentx（省时间） | ❌**实测DEAD，会得到反号结论** | 前缀缓存要 **~30 分钟**才走完爬坡（`prefix_cache_hit` 99.6%→95.5%、`tput_in` 31k→16k）。同一批代码：600s 给 c1 x +2.03% / c2 x **−6.19%**，3600s 给 c1 x **+4.46%**。★**一眼判据：并发低的点 Y 反而更高**（600s 那批 c1 3274 > c2 2446，而图上 c2 > c1）= 窗口没出爬坡段 |
+| 照抄"hicache 开着必崩"就把它关掉 | ⚠️**镜像特定,不是普遍结论** | 那是某个镜像的 sglang-kernel 缺 `kvcacheio.get_device_accessible_ptr`。`kyle_cam` 的 `/opt/venv` 有 ⇒ **开着跑通了**（`cpu_kv_usage` 6.6%→38%）。换环境要重测。★代价：**hicache-ON 拆机把 HBM 漏在驱动里**（无进程持有、`/sys/class/kfd/kfd/proc/` 空、`docker restart` 无效、`--gpureset` 要 sudo），**等约 20 分钟自己全放**，排点要留出来 |
+| 核对配方时 grep **自己的启动脚本** | ⚠️ 只证明"写的和想写的一致" | 要对**活进程**：`/proc/<pid>/cmdline` + `/proc/<pid>/environ` 逐条对榜单脚本。我这样做才发现自己漏了 hicache 五个 flag 和 `AITER_USE_FLYDSL_MOE_SORTING=1`（干净 aiter 里默认 0，不显式设就走 Opus 后端）。同时把"刻意偏差"列出来核对，多一条就是污染 |
+| 报增益时不查 **base..yours 之间都是谁的 commit** | ❌**把同事的工作算进自己** | 两次实例：`--dsa-decode-backend flydsl` 是同事 PR #31（对公开图必须用 **tilelang**）；base 到 fork base 之间 5 笔别人的 commit，逐个 `git diff --ignore-all-space` 确认零语义后才敢说"只含我们的" |
+| 复现公开图时不做**基线自检** | ⚠️ 少了唯一的可信证据 | 在自己机器上跑**图上那份基线代码**，落点应当贴近图上的点。实测 (253.28, 2155.72) vs 图上 (260, 2.1k) 差 x −2.6% / y +2.7% ⇒ 配方搭对了。没这一步，"我们比图上好"只是口头断言 |
+| 在脚本**跑着**的时候编辑它 | ❌ | bash 边读边执行，字节偏移一变就把乱码当代码跑。实例：`bench rc=0`、结果已写盘，却崩在 `line 103`，**收尾没跑** ⇒ server 占着 8 张卡、锁没删。修法：`cp` 成一次性冻结副本再跑 |
+| NFS 队列重投时**覆盖同名文件** | ❌**新 job 一次没跑** | `rm` 掉 worker 已持有的 `.out` = unlink 它的 fd；worker 跑完把**还没跑的新 job** 直接 `mv` 成 `.done`。指纹：`.rc` 在而 `.out` 空/不存在，`.done` 却是新版本。修法：**永远用新文件名** |
+| 登录节点对容器 root 写过的仓库做 git 写操作 | ❌ | `insufficient permission for adding an object to repository database .git/objects`，而且**报错前一行是 `Auto-merging`**，极易误判成合并冲突。修法：这类共享仓库的 git 写操作统一在容器里做 |
+| 认为 agentic replay 的大幅"噪声"是机器抖动 | ⚠️**归因错了** | 真正来源是**重放到的轨迹长度不同**：ISL p50=108k / p90=384k / p95=503k，极度长尾，少数超长轨迹抬三成。⇒ 两臂要对齐的不只是请求数，还有 **ISL 均值/分位** |
+| 判 decode 侧优化只看 Y（per-GPU 总吞吐） | ⚠️**会低估** | 闭环下 decode 快 ⇒ 窗口内重放更多轨迹 ⇒ 输入也涨，但**X 的杠杆大得多**：#38583 实测 X +17.39% 只带动 Y +4.17%。**看 X（ITV p90）** |
+| 拿 agentic replay 的**输出吞吐**判一个改动的去留 | ❌**实测DEAD** | **同一份代码三次读出 129.24 / 306.30 / 306.84 tok/s（2.4 倍）**。闭环重放 + 固定时间窗把调度抖动放大成轨迹分叉。延迟分位数可用但分辨率仅 ~3%（ITL p50 0.51% / p90 2.17% / TTFT p90 3.53%） |
+| 直接比较「改了 target 侧」的两臂（主干权重 / attention 选 key / indexer top-k） | ❌ 不可比 | 输出 token 变 ⇒ 后续轮次变 ⇒ 请求集分叉。实测 1488 vs 1123 个请求、每请求输出 token 差 **3.2 倍** |
+| 比较「只改 draft/MTP 侧」或「逐位一致的 kernel 改动」的两臂 | ✅**可比** | 投机解码 draft 提议 / target 验证，**被接受的 token 来自 target** ⇒ draft 精度只影响接受率。实测请求数 1490 vs 1483（0.5%）。★**别笼统按「是不是有损量化」判分叉，要看落在哪条路径** |
+| 在 `docker exec ... bash -lc "..."` 的命令串里写注释 | ❌**最贵的一个** | 上一行的 `\` 把注释接成同一条语句 ⇒ **命令在注释处终止**，前面的 `PYTHONPATH` 全丢 ⇒ **server 静默加载镜像自带的 sglang**，三个"成功"的点全作废。修法：环境走 `docker exec -e` |
+| 用 `grep -c ... \|\| echo 0` 取计数 | ❌ | 无匹配时**既打印 0 又 exit 1** ⇒ 变量成 `"0\n0"` ⇒ 所有整数比较报 `integer expression expected`，**守门量静默失效** |
+| `rx "grep -c 'X' f"`（远程封装是 `bash -lc '...'`） | ❌ | 内层单引号提前闭合 ⇒ 判据永假 ⇒ 每点空耗 `200×40s ≈ 2.2h`，**不报错只是慢** |
+| readiness 只看端口应答 | ❌ | 会连上**上一轮正在排空的 server**。指纹：TP4 server **106 秒就 ready**（正常 8~10 分钟）。修法：还要求本轮自己的日志出现 `Load weight begin` |
+| 用 `pgrep -f <脚本名>` 做驱动级互斥 | ❌ 恒真 | 调用方自己的命令行也含那个字符串。**该上锁的是被争抢的资源（server），不是驱动进程** |
+| 停 server 用「杀容器里所有 launch_server」 | ❌ | 被取消的旧臂睡满 3600s 轮询后醒来会杀掉**下一轮**的 server。指纹：`rc=1` 但错误率只有 1.96%，真 fatal 是**覆盖率 91.6% < 95%**。修法：按所有权（带 PID 的锁）杀 |
+| 往别人的 harness 脚本加参数 | ⚠️ 先 grep | 加 `--random-seed` 撞上 9 行之上已有的 `--random-seed 42`，两点各白跑 5 分钟；我还据此下了错误结论并报了出去 |
+| decode 里 M 很小的算子，**在主机侧按行/批分块循环调用同一个 kernel** | ❌**实测DEAD** | 每次 launch 重读整套常量（权重），流量 × 块数。**一眼判据：`us/launch` 恒定、总时间与 launch 数成正比而与行数无关**（实测 8~48 行每次都是 7.4us）。修法：行循环挪进 kernel + 常量提到循环外常驻寄存器（48 行 **1.62×**、逐位一致）。见 methodology/22 |
+| 上条的续篇：**先抬块大小（chunk/M）来减少 launch** | ⚠️**会撞寄存器** | 单次成本 7.81→9.82→13.44 us（M=8/12/16），M=16 用 1.72 倍成本换 2 倍行数 ⇒ 净收益被吃掉。48 行总时间 46.89→39.27→40.33 us，**拐点在 12** |
+| 铺 N 个点之前只做「最简单那个点」的冒烟 | ❌**根子在这** | 120s 冒烟**恰好绕过全部七个** bug（无并发臂、无 flag 臂、无长轮询、无重启循环）。⇒ **冒烟要覆盖矩阵里最复杂的那个点** |
+| 用 `SGLANG_SIMULATE_ACC_*` 的 server 量精度 | ❌**实测DEAD** | 接受率被钉成模拟值，量的是模拟器：GSM8K 读出 **0.111 vs 0.930**。守门量：server environ 里 SIMULATE 计数必须为 0 |
