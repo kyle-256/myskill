@@ -265,3 +265,22 @@ Python(@flyc.kernel/@flyc.jit)
 
 ---
 来源: flydsl-tile-programming/SKILL.md, flydsl-kernel-authoring/SKILL.md, programming-model.md, overview.md, FlyDSL/CLAUDE.md, mxfp8-8wave-devloop/SKILL.md, add-target-atom-op/SKILL.md(ThrVal/ThrBit 静默垃圾结果), SKILL.md(flydsl-fp8-gemm-tuning), 13-primus-turbo-prod.md, SKILL.md(debug-flydsl-kernel), 05-int64-addressing.md, prefetch-data-load/SKILL.md, gemm-optimization/SKILL.md, pr-merge-gate/SKILL.md, remote-sync/SKILL.md, 04-tn-wgrad-kernel.md, 14-fused-preshuffle-e2e.md, 02-nt-fwd-kernel.md, oob-detection/SKILL.md, add-target-atom-op/SKILL.md（"先跑 FileCheck 再跑 1-wave 端到端"一条出自此文件 Step 9）, optimization-directions.md
+
+## ★★★★★ 写「布局置换」类 kernel:先在 CPU 上重放,再上 GPU(2026-09-15)
+
+要让 quant 直接吐 GEMM 的打包 scale 布局,需要 gather 的**反函数**。做法:
+
+1. **先确认它是纯置换**。看 pack 函数的实现 —— `_mxfp4_pack_cell` 的 docstring 写着
+   "Byte-transpose ... each output dword gathers byte g across source rows",**没有算术** ⇒
+   每个输出字节 = 某个输入字节 ⇒ 正向映射一定存在,且生产者只需换地址、零额外开销。
+   (若有算术,这条路直接不通,省得写。)
+2. **在 CPU 上重放 gather**,得到 `dest_byte -> (row, kblk)` 的字典。
+3. **写出闭式正向映射**,对字典逐条校验,并检查**双射**(唯一源数 == 覆盖字节数)。
+4. 覆盖 A/B 两侧、`b_ilv` 两种取值、多个 K —— 本例 11 种配置,零不符才上 GPU。
+
+第 2~3 步是纯 Python,几分钟;跳过它就是在 GPU 上对着一个置换 debug,而置换错了的症状
+(部分覆盖 / 散点缺失)和**缓存串味、坐标口径错**的症状**长得一模一样**,分不开。
+本例正是靠「CPU 已证双射」才敢把 GPU 上的失败往别处查,最后定位到坐标口径和 bound 字面量。
+
+★ 布局规则要放在**双方都已依赖的模块**里(本例 `gemm_helper.py`):gather 在 GEMM、scatter 在
+quant,两个方向没法共用一个函数,**唯一的防漂移手段是逐位对拍当门禁** + 常数只有一处定义。

@@ -1701,3 +1701,104 @@ FC1_wgrad 对真 AITER 头对头其实 **+2.148%**。
 (每个 frag 喂 8 条 MFMA:64 frag × 4 VGPR = 256,累加器 128×128/64 = 256,合计 512 顶满)。
 ⇒ **指令侧无余量,剩下的只能是停顿或结构**。LDS 147456 / 163840 余 16 KB,
 但一个 256×256 fp4 分片就要 32 KB ⇒ **加不了一级 ring**。
+
+## ★★★★★ `_MXFP4_MID_SYNC = 0`:上面那一族"同步密度"轴扫了三轮,**端点 0 从来没进过搜索面** —— 它值 **+0.59%**(2026-09-15 r5 实测)
+
+**结论先行**:把每个 k-phase 里的两条**裸 `s_barrier`**(`_mid_sync` 插的那些,不带任何
+waitcnt)整族删掉,12 格 geomean **0.9872 → 0.9930 / 0.9929**(两次独立 session,互差 0.01%),
+read1 **12/12 格同号为正**(+0.20% ~ +1.27%),read2 11/12。已交付。
+
+**为什么三轮都没找到**:这个常量是以 `_MXFP4_MID_SYNC = 1` 引入的,后续所有定价都在
+**非零区间**里做:`ab597c45` 把 1→2(commit message 自己写着 "one and three both cost")、
+2026-09-14 扫了 n=3 / n=4(−0.050% / −0.191%)、又扫了不对称 (2,0) / (0,2) / (1,3)
+(−0.415% / −0.007% / −0.124%),于是三轮一致地把 **2** 记成最优点。
+实际响应**非单调**:`n=1 −0.15~−0.38% · n=2 基准 · n=3 −0.05% · n=4 −0.19% · n=0 **+0.59%**`。
+⇒ **判据**:给"密度 / 条数 / 深度"型常量定价时,**端点(0 或"整族关掉")必须在搜索面里**;
+"左右邻居都更差 ⇒ 当前是最优"对这类轴**不成立**,因为一条屏障同时带来
+「会合开销(单调随条数涨)」和「限制 wave 漂移的收益(0→1 那一步最大)」两个反向效应。
+
+**为什么是安全的(不是竞态)**:`_mid_sync` 插的屏障**不带 waitcnt**,注释自己写的作用是
+"halve how far the four waves may drift apart inside a phase"。LDS 的 WAR / RAW 全部由
+**相位边界**那组 `s_waitcnt vmcnt(_WLV) lgkmcnt(_ELGK)` + `s_barrier`(`_ipend`)承担,
+删掉裸屏障不改变任何内存序。ISA 逐条核对:`s_barrier` **43 → 27**(正好 16 条 = 4 条/迭代 ×
+4 份 tile body),**其余每一个 opcode 逐位不变** —— `v_mfma` 2560 / `ds_read_b128` 696 /
+`v_cvt_pk_bf16_f32` 512 / `v_accvgpr_read_b32` 384 / `buffer_load_dwordx4` 368 /
+`buffer_store_dwordx2` 256 / `s_waitcnt` 211 / `s_nop` 20 全部不动,
+`vgpr_count 496` / `accum_offset 240` / `spill 0` 不动。稳态循环 383 → 379 条,
+`s_barrier` 6 → 2(留下的 2 条正是 WAR 必需的相位边界)。SNR 55.534 / 54.155 / 55.611
+(基线 55.534 / 54.153 / 55.610)—— 真竞态会毁掉整条 store ≈ −8 dB,这里是 1e-3 dB。
+
+**与 r47 的关系(r47 的定价是对的,处方绕远了)**:r47 用不可发布的探针删掉 `s_barrier`
+27→15 量到 **+0.87% / +0.99%**(out_proj_fwd),然后写下"合法减半的路径 = ring 深度 3",
+并因为 LDS 差 32768 B 而把这条杠杆挂起。**错在假设所有屏障都承担 WAR** ——
+6 条里有 4 条是裸的、什么都不承担,**可发布的那一半根本不需要环深 3**。
+本轮 out_proj_fwd 实测 +0.79% / +0.48%,与 r47 的 0.87~0.99%(更大的超集)自洽。
+⇒ 环深 3 那条(仍被 LDS 容量卡死:A/B 各需 3×32768,合计 196608 > 163840)现在只剩
+**相位边界那 2 条**的份额,别再为它开轮。
+
+### 同一轮里一并关掉的三条(全表实测,别重踩)
+| 轴 | 判定 | 实测 |
+|---|---|---|
+| `_MXFP4_MBLK` 由 `(4,8)` 改 `(4,4)`(blocked-diagonal 的块宽,纯发射序置换、零寄存器代价) | ❌**−0.82%**(0.9872→0.9791) | 动机是"相位尾部 20/32 条 `ds_read` 挤在最后 45 条指令里,窄块能摊开"。(4,4) 确实把 B 的 16 条 refill 从 1 簇(cell 112-127)拆成 2 簇(88-95 / 120-127),**但更慢** ⇒ 簇集本身不是代价。与 pitfalls/05 §1248 记的 grouped 核结论(column-major ±0.15% / diagonal +0.7~1.2% / cyclic ±0.3%)合起来,**cell 发射序这条轴在 dense 上也封板** |
+| `_MXFP4_TPW_MAX` 4 → 8(每个持久 WG 多走一倍 tile,想摊薄 171 条/接缝) | ❌**−0.47%**(全表),7 个持久行 −1.1~−1.7% | **干净的对照**:5 个 `K/256 > _MXFP4_TPW_KBLK` 的非持久行几乎逐位不动(FC1_dgrad 5544.5→5543.9、FC1_wgrad 5536.5→5535.9)⇒ 确实是 TPW 干的。ISA:`vgpr 496 / accum_offset 240 / spill 0` **一个没动**,模块 6172 → 12331 条(≈49 KB → 98 KB)⇒ **不是寄存器悬崖**,是发射/取指侧的足迹代价 |
+| `_MXFP4_TPW_MAX` 4 → 2(反方向,让整个模块塞进 32 KB L1I) | ⚠**+0.16% = 平** | 同一次 run 里 5 个 **TPW 无关**的行也走了 −0.02%~+0.61% ⇒ 那就是当天的噪声带,这一读没有信息量。**双向括号完成:4 就是最优点**,别再开这条轴 |
+
+⚠ **`21_final_isa.s` 里有两个 entry,别把第一个当成 GEMM 的 prologue**:`kern_0`(scale
+preshuffle 桩,`vgpr 52`,682 条指令、其中 437 条 VALU)排在 `kernel_gemm_4w_1`(`vgpr 496`,
+`accum_offset 240`)前面。按"模块里第一段无 MFMA 的长区间 = GEMM prologue"去读,会把
+preshuffle 桩的 437 条 VALU 记到 GEMM 头上(本 campaign 的 goal.md §1.5 就是这么错的,
+把它算成"prologue 发射 ~1078 拍")。GEMM 自己的每-tile 固定区 = **171 条的接缝 × 3 + 18 条的
+peel 入口 × 4**,摊薄下来约 **150 条/tile**,不是 300。查法:先按 `.name:` / `.amdhsa_kernel`
+切分 entry,再做 census。
+
+## GLM-5.2 decode(TP4/EP4, M=48):aiter MXFP4 MoE 与 dense bf16 GEMM 的 caller-side 旋钮全封板
+
+2026-09-18,campaign 20260917_154010 r5。当天 base **177.49**(pool 2933056)。
+四条"从 sglang 调用侧选 tile/config"的路线逐条量完,**全部关闭**,别再开轮。
+
+### ① MoE stage1/stage2 的 tile 根本不在 `fused_moe()` 的 kwarg 面上
+trace 里的 `mfma_moe1_silu_mul_afp4_wfp4` / `mfma_moe2_afp4_wfp4` 来自 FlyDSL
+`aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage.py:313 / 3255`,**不是 asm fmoe**。
+`_flydsl_stage1_wrapper` / `_flydsl_stage2_wrapper` 的每一个性能参数
+(`tile_m / tile_n / tile_k / waves_per_eu / b_nt / k_batch / xcd_swizzle / cu_num_mul / mode`)
+都是 `get_flydsl_kernel_params(kernelName)` 从**核名字**里解析出来的,而 kernelName 由
+`aiter.fused_moe.get_2stage_cfgs` 内部的 token 档位表决定
+(`token<2048 → tile_m=32, kn1=..._t32x128x256_w2, kn2=..._t32x128x{tk}_atomic_bnt2`)。
+`fused_moe_kwargs` 里**没有**任何能改核名的入口 ⇒ 这条路 0 个可调点。
+
+### ② `block_size_M` 是**正确性陷阱**,不是性能旋钮
+`fused_moe(block_size_M=...)` 确实存在(`block_size_M = metadata.block_m if None`),
+但 stage1 的 `compile_mixed_moe_gemm1` 里 **`sort_block_m = max(32, tile_m)` 是编译期常量**
+(tile_m=32 ⇒ 32),而 `_flydsl_stage1_wrapper` 把 `block_size_M` 吞进 `**_kwargs` **从不使用**。
+传 32 以外的值 ⇒ 排序器按新块长写 `sorted_expert_ids`,GEMM 仍按 32 行/条目读 ⇒ **读错行**。
+**不是慢,是错**。上游 `get_block_size_M(48, 9, 257, 2048)` 也恒返回 32,所以"改 block_size_M"
+在这条路上既无收益也不合法。
+
+### ③ `fused_mx_quant_moe_sort` 的 block 尺寸也不在调用侧
+`AITER_USE_FLYDSL_MOE_SORTING=1` 路由到 `flydsl_moe_sorting_fwd`,**签名里没有
+dispatch_policy**(`moe_sorting_dispatch_policy` 只对非-FlyDSL 排序器有效)。
+所有 block/grid 都在 `moe_sorting_flydsl` 内部按 (M, E, topk) host 侧算死。
+顺带排掉一个看着很像 bug 的点:E=257(256 routed + 1 shared)确实比 `K4_BLOCK=256` 多 1,
+会触发 p23 的"thread 0 串行延长前缀和"慢路 —— 但 `_p23_block_size(257, 48)` 命中
+`num_experts<=512 → 512` 分支,**已经是 512 线程块的快路**。别再为这条开轮。
+
+### ④ dense bf16 GEMM 的 tuned 表在 M=48 上"出厂即最优"
+本轮把 dense 线性层探针校准到了 trace(kernel 级逐条对上):
+`fused_qkv_a(2624×6144)` → `t48x64x64` 12.37 µs ×79(trace `hgemm_bf16_48x64x64x4` 13.4)、
+`o_proj(6144×4096)` → `t16x64x64` 13.93 ×79(trace `16x64x64x8` 15.8)、
+`q_b_proj/idx_wq_b(4096×2048)` → `t16x64x128` 7.56 ×(79+22=101,与 trace 的 101 完全一致)。
+合计 **3069 µs/step**,对 5.95 TB/s STREAM 地板 1409 µs ⇒ 只跑到 **2.2~3.6 TB/s**。
+看着有 2.1 ms 的空间,但**扫 BM×BN×BK×split_k 一无所获**:o_proj 上出厂
+`t16x64x64` 就是最快,最好的挑战者 `t16x64x64_sk1` 只 +1.85%(噪声内),
+其余 `t32x64x64_sk1 −12.6% / t48x64x64_sk1 −21.8% / t16x128x64_sk1 −27.3%`,
+且多条 arm `maxdiff 0.03125` 直接失去位识别资格。
+原因:`glm5_bf16_tuned_gemm.csv` **本来就带 M=48 的行**,正是我们这三个形状。
+⇒ 与 00-decision-index 的 "M=48 桶选错" 先例相反,**这里的桶没选错**;
+那 2.1 ms 的差距是核本身的效率,不是 tile 选择能拿到的。
+
+**只剩一个活线索(未验完)**:indexer `weights_proj(32×6144)` 与 `eh_proj(6144×12288)`
+在 M=48 查不到 tuned 行,落到 `libtype=torch` 即 `F.linear`,实测 7.28 µs / 37.0 µs。
+前者搬 393 KB 却要 7.28 µs(22 次/step ≈ 160 µs ≈ 0.8% step),是纯派发浪费。
+但 `skinny` 三个 solidx 全是 **M==1 专用**(M>1 直接
+`custom.cu:58 Row number of activation tensor must be 1` **abort 整个进程**,不是抛异常),
+合成的 FlyDSL 候选名在 N=32 上也全部非法 ⇒ 替代核还没找到,接这条线的人先解决"用什么核"。
